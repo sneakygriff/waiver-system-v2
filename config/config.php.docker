@@ -1,0 +1,24 @@
+<?php
+return [
+  'db' => [
+    'host' => 'db',
+    'port' => 3306,
+    'name' => 'waiver_db',
+    'user' => 'app',
+    'pass' => 'app',
+    'charset' => 'utf8mb4'
+  ],
+  'app' => [
+    'base_url' => 'http://localhost:8080',
+    'timezone' => 'Europe/Bucharest'
+  ],
+  'security' => [
+    'session_name' => 'waiver_admin',
+    'password_algo' => PASSWORD_ARGON2ID,
+    'api_hmac_secret' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET'
+  ],
+  'storage' => [
+    'signatures_path' => __DIR__ . '/../storage/signatures',
+    'artifacts_path'  => __DIR__ . '/../storage/artifacts'
+  ]
+];
