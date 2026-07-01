@@ -19,7 +19,7 @@ class AdminController {
   }
   public function listWaivers(?string $q=null): array {
     $sql='SELECT wi.id, wi.reservation_id, wi.status, wi.created_at, wi.completed_at, wtv.title FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id';
-    if ($q){ $stmt=$this->db->pdo()->prepare($sql.' WHERE wi.reservation_id LIKE ? ORDER BY wi.created_at DESC'); $stmt->execute(['%'.$q.'%']); return $stmt->fetchAll(); }
+    if ($q){ $stmt=$this->db->pdo()->prepare($sql.' WHERE wi.reservation_id LIKE ? ORDER BY wi.created_at DESC LIMIT 200'); $stmt->execute(['%'.$q.'%']); return $stmt->fetchAll(); }
     return $this->db->pdo()->query($sql.' ORDER BY wi.created_at DESC LIMIT 200')->fetchAll();
   }
   public function stats(): array {
@@ -41,16 +41,17 @@ class AdminController {
   public function responsesByGroupToken(?int $days=30, ?string $groupLike=null): array {
     $pdo=$this->db->pdo(); $where='wi.group_token IS NOT NULL'; $p=[];
     if ($days and $days>0){ $where.=' AND wr.signed_at>=UTC_TIMESTAMP()-INTERVAL ? DAY'; $p[]=$days; }
-    if ($groupLike){ $where.=' AND wi.group_token LIKE ?'; $p[]='%'.$groupLike+'%'; }
+    if ($groupLike){ $where.=' AND wi.group_token LIKE ?'; $p[]='%'.$groupLike.'%'; }
     $sql="SELECT wi.group_token, COUNT(wr.id) responses_count, MAX(wr.signed_at) last_signed_at FROM waiver_responses wr JOIN waiver_instances wi ON wi.id=wr.waiver_instance_id WHERE $where GROUP BY wi.group_token ORDER BY last_signed_at DESC LIMIT 1000";
     $st=$pdo->prepare($sql); $st->execute($p); return $st->fetchAll();
   }
   public function listUnlinkedResponses(?int $days=30, ?string $q=null, ?string $group=null, int $limit=500): array {
+    $limit = max(1, min((int)$limit, 5000)); // clamp: negative/zero -> MySQL LIMIT syntax error
     $pdo=$this->db->pdo(); $where='wi.reservation_id IS NULL'; $p=[];
-    if ($days and $days>0){ $where.=' AND wr.signed_at>=UTC_TIMESTAMP()-INTERVAL ? DAY'; $p.append($days) if False else p; $p[]=$days; }
-    if ($group){ $where.=' AND wi.group_token LIKE ?'; $p[]='%'+$group+'%'; }
-    if ($q){ $where.=' AND (wr.signer_full_name LIKE ? OR wi.guest_email LIKE ? OR wtv.title LIKE ?)'; $p+=['%'+$q+'%','%'+$q+'%','%'+$q+'%'] if False else None; $p.append('%'+$q+'%'); $p.append('%'+$q+'%'); $p.append('%'+$q+'%'); }
-    $sql="SELECT wr.id response_id, wr.signed_at, wr.signer_full_name, wi.id instance_id, wi.group_token, wi.guest_name, wi.guest_email, wtv.title template_title FROM waiver_responses wr JOIN waiver_instances wi ON wi.id=wr.waiver_instance_id JOIN waiver_template_versions wtv ON wtv.id=wi.template_version_id WHERE $where ORDER BY wr.signed_at DESC LIMIT ?";
-    $p[]=$limit; $st=$pdo->prepare($sql); $st->execute($p); return $st->fetchAll();
+    if ($days and $days>0){ $where.=' AND wr.signed_at>=UTC_TIMESTAMP()-INTERVAL ? DAY'; $p[]=$days; }
+    if ($group){ $where.=' AND wi.group_token LIKE ?'; $p[]='%'.$group.'%'; }
+    if ($q){ $where.=' AND (wr.signer_full_name LIKE ? OR wi.guest_email LIKE ? OR wtv.title LIKE ?)'; $p[]='%'.$q.'%'; $p[]='%'.$q.'%'; $p[]='%'.$q.'%'; }
+    $sql="SELECT wr.id response_id, wr.signed_at, wr.signer_full_name, wi.id instance_id, wi.group_token, wi.guest_name, wi.guest_email, wtv.title template_title FROM waiver_responses wr JOIN waiver_instances wi ON wi.id=wr.waiver_instance_id JOIN waiver_template_versions wtv ON wtv.id=wi.template_version_id WHERE $where ORDER BY wr.signed_at DESC LIMIT ".(int)$limit;
+    $st=$pdo->prepare($sql); $st->execute($p); return $st->fetchAll();
   }
 }

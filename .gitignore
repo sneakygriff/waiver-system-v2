@@ -1,0 +1,5 @@
+# Local secrets & runtime state — never commit
+config/config.php
+storage/
+vendor/
+.DS_Store
