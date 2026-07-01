@@ -49,10 +49,25 @@ $instance = $data['instance']; $fields = $data['fields'];
       <div class="mb-3"><?php echo $ctl->renderContentForWeb($instance['content_html'], $fields); ?></div>
     <?php else: ?>
       <?php foreach ($fields as $f): ?>
+        <?php if ($f['type']==='gdpr_consent'): ?>
+          <!-- [FK-Tconsent] Optional consent checkbox: rendered on its own,
+               WITHOUT the shared "* = required" label markup above (it is
+               never required, normalizeFields() guarantees $f['required'] is
+               always false for this type) and without a top label, since the
+               consent text itself is the label. -->
+          <div class="mb-3 form-check">
+            <input class="form-check-input" type="checkbox" name="<?=htmlspecialchars($f['key'])?>" id="f_<?=htmlspecialchars($f['key'])?>" value="1">
+            <label class="form-check-label" for="f_<?=htmlspecialchars($f['key'])?>"><?=htmlspecialchars($f['label'])?></label>
+          </div>
+        <?php else: ?>
         <div class="mb-3">
           <label class="form-label"><?=htmlspecialchars($f['label'])?><?=!empty($f['required'])?' *':''?></label>
           <?php if ($f['type']==='text'): ?>
             <input name="<?=htmlspecialchars($f['key'])?>" class="form-control" <?=!empty($f['required'])?'required':''?> maxlength="<?=htmlspecialchars($f['maxLength'] ?? 255)?>">
+          <?php elseif ($f['type']==='date'): ?>
+            <input type="date" name="<?=htmlspecialchars($f['key'])?>" class="form-control" <?=!empty($f['required'])?'required':''?>>
+          <?php elseif ($f['type']==='parental_consent'): ?>
+            <input name="<?=htmlspecialchars($f['key'])?>" class="form-control" <?=!empty($f['required'])?'required':''?> maxlength="<?=htmlspecialchars($f['maxLength'] ?? 255)?>" placeholder="Parent/guardian full name">
           <?php elseif ($f['type']==='textarea'): ?>
             <textarea name="<?=htmlspecialchars($f['key'])?>" class="form-control" <?=!empty($f['required'])?'required':''?>></textarea>
           <?php elseif ($f['type']==='radio'): ?>
@@ -64,6 +79,7 @@ $instance = $data['instance']; $fields = $data['fields'];
             <?php endforeach; ?>
           <?php endif; ?>
         </div>
+        <?php endif; ?>
       <?php endforeach; ?>
       <div class="mb-3">
         <label class="form-label">Signature *</label>

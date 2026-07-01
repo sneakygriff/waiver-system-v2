@@ -48,6 +48,17 @@ try {
     Utils::jsonResponse(empty($res['error']) ? 200 : 400, $res);
   }
 
+  if ($action === 'get_status') {
+    $res = $ctl->getStatus($payload);
+    if (!empty($res['error'])) {
+      // token_unknown is the one 404-shaped case (spec G1c); everything else
+      // (bad/missing identifiers) is a plain validation 400.
+      $status = $res['error'] === 'token_unknown' ? 404 : 400;
+      Utils::jsonResponse($status, $res);
+    }
+    Utils::jsonResponse(200, $res);
+  }
+
   if ($action === 'create_walkin_group') {
     Utils::jsonResponse(200, ['group_token'=>Utils::randomToken(8)]);
   }

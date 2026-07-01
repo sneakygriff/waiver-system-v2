@@ -71,6 +71,86 @@ class WaiverController {
     return ['has_published_version'=>(bool)$row];
   }
 
+  // [FK-T9] Reconciliation support (spec G1c): BookingV2 polls this to catch
+  // any completion whose webhook was lost. One row shape reused for both the
+  // single-token and batch-by-group paths so callers can treat them uniformly:
+  //   {status, completed_at, participant_id, evidence_sha256, answers_hash}
+  // - status: the fork's raw waiver_instances.status ("pending"|"completed"|"void").
+  // - completed_at: ISO-8601 UTC string, or null if not completed.
+  // - evidence_sha256: object-store bytes hash (Gap2). T15 (presigned-PUT
+  //   object storage) has not shipped yet in this fork, so evidence still
+  //   lands on the container FS and no object-bytes hash is computed anywhere
+  //   -> always null until T15 lands. Deliberately NOT the answers hash.
+  // - answers_hash: the fork's existing answers-payload legal-integrity hash,
+  //   i.e. waiver_responses.hash_sha256 (computed in submitGuestForm over
+  //   {template_version_id, instance_id, answers, signed_at, signer_ip, ua}).
+  //   Null until the guest actually submits.
+  private function statusRow(array $row): array {
+    return [
+      'link_token'      => (string)$row['link_token'],
+      'status'          => (string)$row['status'],
+      'completed_at'    => $row['completed_at'] !== null ? gmdate('c', strtotime($row['completed_at'].' UTC')) : null,
+      'participant_id'  => $row['participant_id'] !== null ? (string)$row['participant_id'] : null,
+      'evidence_sha256' => null, // [Gap2] populated once T15 object-store upload lands.
+      'answers_hash'    => isset($row['hash_sha256']) && $row['hash_sha256'] !== null ? (string)$row['hash_sha256'] : null,
+    ];
+  }
+
+  private const STATUS_SELECT = 'SELECT wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wr.hash_sha256
+     FROM waiver_instances wi
+     LEFT JOIN waiver_responses wr ON wr.waiver_instance_id = wi.id';
+
+  public function getStatus(array $payload): array {
+    $linkToken = $payload['link_token'] ?? null;
+    $bookingGroupId = $payload['booking_group_id'] ?? null;
+    $reservationId = $payload['reservation_id'] ?? null;
+
+    if ($linkToken !== null) {
+      if (!is_scalar($linkToken) || (string)$linkToken === '') return ['error'=>'link_token must be a non-empty string'];
+      $linkToken = (string)$linkToken;
+      if (strlen($linkToken) > 128) return ['error'=>'link_token too long (max 128)'];
+      $q = $this->db->pdo()->prepare(self::STATUS_SELECT.' WHERE wi.link_token=? LIMIT 1');
+      $q->execute([$linkToken]);
+      $row = $q->fetch();
+      if (!$row) return ['error'=>'token_unknown'];
+      return $this->statusRow($row);
+    }
+
+    if ($bookingGroupId !== null || $reservationId !== null) {
+      if ($bookingGroupId !== null && (!is_scalar($bookingGroupId) || (string)$bookingGroupId === '')) return ['error'=>'booking_group_id must be a non-empty string'];
+      if ($reservationId !== null && (!is_scalar($reservationId) || (string)$reservationId === '')) return ['error'=>'reservation_id must be a non-empty string'];
+      $bookingGroupId = $bookingGroupId !== null ? (string)$bookingGroupId : null;
+      $reservationId = $reservationId !== null ? (string)$reservationId : null;
+      if ($bookingGroupId !== null && strlen($bookingGroupId) > 64) return ['error'=>'booking_group_id too long (max 64)'];
+      if ($reservationId !== null && strlen($reservationId) > 64) return ['error'=>'reservation_id too long (max 64)'];
+
+      // Bounded batch: this is a reconciliation sweep over one reservation's
+      // participants, never an unbounded scan -> cap defensively.
+      if ($bookingGroupId !== null) {
+        $q = $this->db->pdo()->prepare(self::STATUS_SELECT.' WHERE wi.booking_group_id=? ORDER BY wi.id ASC LIMIT 500');
+        $q->execute([$bookingGroupId]);
+      } else {
+        $q = $this->db->pdo()->prepare(self::STATUS_SELECT.' WHERE wi.reservation_id=? ORDER BY wi.id ASC LIMIT 500');
+        $q->execute([$reservationId]);
+      }
+      $rows = $q->fetchAll();
+      return ['results' => array_map([$this, 'statusRow'], $rows)];
+    }
+
+    return ['error'=>'Provide link_token, or booking_group_id / reservation_id for a batch lookup'];
+  }
+
+  // [FK-Tconsent] Field type for the optional GDPR/marketing consent
+  // checkbox. Deliberately its own type (not reused from radio/text) so the
+  // guest page, PDF renderer, and answer-capture logic can all special-case
+  // it: it is ALWAYS optional (never required, even if a template author
+  // mistakenly sets required=true — normalizeFields() strips that below),
+  // and its checked state is surfaced under the fixed answers_json key
+  // 'waiver_consent_granted' rather than the field's own key (see
+  // buildAnswers()/submitGuestForm()).
+  private const CONSENT_FIELD_TYPE = 'gdpr_consent';
+  private const CONSENT_ANSWER_KEY = 'waiver_consent_granted';
+
   // Decode fields_json defensively: tolerate a non-array/non-list, or field
   // objects missing key/label/type/options, so a malformed template can never
   // fatal the guest page. Fills safe defaults.
@@ -80,11 +160,14 @@ class WaiverController {
     foreach($raw as $f){
       if(!is_array($f) || !isset($f['key']) || !is_scalar($f['key']) || (string)$f['key']==='') continue;
       $key=(string)$f['key'];
+      $type=(isset($f['type'])&&is_scalar($f['type']))?(string)$f['type']:'text';
       $out[]=[
         'key'=>$key,
         'label'=>(isset($f['label'])&&is_scalar($f['label']))?(string)$f['label']:ucwords(str_replace('_',' ',$key)),
-        'type'=>(isset($f['type'])&&is_scalar($f['type']))?(string)$f['type']:'text',
-        'required'=>!empty($f['required']),
+        'type'=>$type,
+        // [FK-Tconsent] Hard-force optional: the consent checkbox must never
+        // be required, regardless of what a template's fields_json declares.
+        'required'=>($type===self::CONSENT_FIELD_TYPE) ? false : !empty($f['required']),
         'options'=>(isset($f['options'])&&is_array($f['options']))?array_values($f['options']):[],
         'maxLength'=>(isset($f['maxLength'])&&is_scalar($f['maxLength']))?(int)$f['maxLength']:255,
       ];
@@ -99,12 +182,118 @@ class WaiverController {
     return ['instance'=>$row,'fields'=>$this->normalizeFields($row['fields_json'])];
   }
 
+  // [FK-T10 / Gap4] SPEC §12.2 age thresholds, enforced at capture time.
+  // Hard reject below this age (no claim, no webhook -- there is no
+  // "signable by a 6-year-old" case).
+  private const AGE_MIN_HARD_REJECT = 7;
+  // Below this age the signer is a minor: require an affirmatively-set
+  // parental/guardian consent field, else reject.
+  private const AGE_PARENTAL_CONSENT_BELOW = 18;
+
+  // [FK-T10] Compute age-in-years as of $asOf (UTC "today") from a Y-m-d DOB
+  // string, using calendar-aware whole-years math (not a naive day-count
+  // divide, which mishandles leap years / partial final year).
+  private function computeAgeYears(\DateTimeImmutable $dob, \DateTimeImmutable $asOf): int {
+    return $dob->diff($asOf)->y;
+  }
+
+  // [FK-T10 / Gap4] Age-gate the submission BEFORE the atomic completion
+  // claim and BEFORE any completion webhook. Looks for the template's DOB
+  // field (the first field of type=date in fields_json) and, if present,
+  // parses+validates it:
+  //   - unparsable/future DOB                       -> reject (invalid_birth_date)
+  //   - age < AGE_MIN_HARD_REJECT                    -> reject (age_below_minimum), no exceptions
+  //   - age < AGE_PARENTAL_CONSENT_BELOW and no       -> reject (minor_parental_consent_missing)
+  //     affirmatively-set parental-consent field
+  //   - otherwise                                    -> pass
+  // No type=date field in the template at all -> age-gating does not apply
+  // to this template (nothing to gate on); pass through.
+  // Returns ['ok'=>true, 'birth_date'=>?string, 'computed_age'=>?int, 'minor'=>?bool,
+  //          'parental_consent_name'=>?string] on pass, or ['ok'=>false,'error'=>string] on reject.
+  private function evaluateAgeGate(array $fields, array $post): array {
+    $dobField = null;
+    foreach ($fields as $f) { if ($f['type'] === 'date') { $dobField = $f; break; } }
+    if ($dobField === null) return ['ok'=>true, 'birth_date'=>null, 'computed_age'=>null, 'minor'=>null, 'parental_consent_name'=>null];
+
+    $raw = $post[$dobField['key']] ?? null;
+    if (!is_scalar($raw) || (string)$raw === '') return ['ok'=>false, 'error'=>'Missing field: '.$dobField['key']];
+    $raw = (string)$raw;
+
+    $dob = \DateTimeImmutable::createFromFormat('!Y-m-d', $raw, new \DateTimeZone('UTC'));
+    // createFromFormat with '!' resets time-of-day but still silently accepts
+    // some loose input; getLastErrors() catches those (e.g. "2024-02-30").
+    $formatErrors = \DateTimeImmutable::getLastErrors();
+    if ($dob === false || ($formatErrors !== false && ($formatErrors['error_count'] > 0 || $formatErrors['warning_count'] > 0))) {
+      return ['ok'=>false, 'error'=>'Invalid date of birth'];
+    }
+
+    $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
+    if ($dob > $now) return ['ok'=>false, 'error'=>'Date of birth cannot be in the future'];
+
+    $age = $this->computeAgeYears($dob, $now);
+    if ($age < self::AGE_MIN_HARD_REJECT) return ['ok'=>false, 'error'=>'age_below_minimum'];
+
+    $minor = $age < self::AGE_PARENTAL_CONSENT_BELOW;
+    $parentalConsentName = null;
+    if ($minor) {
+      // Parental consent is carried in a field of type=parental_consent (any
+      // key), falling back to the conventional 'parental_consent_name' key so
+      // templates that don't declare the type still work. "Affirmatively
+      // set" = a non-empty scalar value (the parent/guardian's name).
+      $consentField = null;
+      foreach ($fields as $f) { if ($f['type'] === 'parental_consent') { $consentField = $f; break; } }
+      $consentKey = $consentField['key'] ?? 'parental_consent_name';
+      $consentVal = $post[$consentKey] ?? null;
+      if (!is_scalar($consentVal) || trim((string)$consentVal) === '') {
+        return ['ok'=>false, 'error'=>'minor_parental_consent_missing'];
+      }
+      $parentalConsentName = trim((string)$consentVal);
+    }
+
+    return [
+      'ok'=>true,
+      'birth_date'=>$dob->format('Y-m-d'),
+      'computed_age'=>$age,
+      'minor'=>$minor,
+      'parental_consent_name'=>$parentalConsentName,
+    ];
+  }
+
   public function submitGuestForm(string $token, array $post): array {
     $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $instance=$q->fetch(); if(!$instance) return ['error'=>'Invalid link']; if($instance['status']==='completed') return ['error'=>'Already completed'];
     $fields=$this->normalizeFields($instance['fields_json']); $answers=[];
-    foreach($fields as $f){ $key=$f['key']; $val=$post[$key]??null; if(!empty($f['required']) && ($val===null || $val==='')) return ['error'=>'Missing field: '.$key]; $answers[$key]=$val; }
+    foreach($fields as $f){
+      $key=$f['key']; $val=$post[$key]??null;
+      // [FK-Tconsent] The consent checkbox is ALWAYS optional (normalizeFields
+      // already forces required=false for it, so the check below is a no-op
+      // for this type, but it's excluded from the generic $answers[$key]=$val
+      // write below): it never lands under its own field key. An HTML
+      // checkbox omits its name from POST entirely when unticked, so "checked"
+      // is exactly "the key is present with a non-empty value" -- there is no
+      // false/unchecked value to observe, which is the desired behavior
+      // (absence = no consent action, never a recorded false).
+      if($f['type']===self::CONSENT_FIELD_TYPE){
+        if($val!==null && $val!=='') $answers[self::CONSENT_ANSWER_KEY]=true;
+        continue;
+      }
+      if(!empty($f['required']) && ($val===null || $val==='')) return ['error'=>'Missing field: '.$key];
+      $answers[$key]=$val;
+    }
     if(isset($post['full_name']) && strlen((string)$post['full_name'])>255) return ['error'=>'Full name is too long (max 255 characters).'];
+
+    // [FK-T10 / Gap4] Age-gate BEFORE the atomic completed-status claim and
+    // BEFORE any completion webhook: a failure here must flip nothing.
+    $ageGate = $this->evaluateAgeGate($fields, $post);
+    if (!$ageGate['ok']) {
+      $this->audit('instance', (int)$instance['id'], 'age_gate_rejected', ['reason'=>$ageGate['error']]);
+      return ['error'=>$ageGate['error']];
+    }
+    if ($ageGate['computed_age'] !== null) {
+      $answers['_computed_age']=$ageGate['computed_age'];
+      $answers['_minor']=$ageGate['minor'];
+      if ($ageGate['parental_consent_name'] !== null) $answers['_parental_consent_name']=$ageGate['parental_consent_name'];
+    }
 
     $sigData=$post['signature_data']??''; if(!preg_match('#^data:image/png;base64,#',$sigData)) return ['error'=>'Missing signature'];
     $png=base64_decode(substr($sigData,22));
@@ -141,6 +330,16 @@ class WaiverController {
       $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, UTC_TIMESTAMP())');
       $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $artifact]);
       $this->audit('response', $instance['id'], 'submitted', $payload);
+
+      // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
+      // after the completed-status claim above succeeded AND the
+      // waiver_responses row + audit are durably committed. This method
+      // swallows ALL of its own errors (never throws into the catch below,
+      // which would wrongly revert a real, completed submission back to
+      // "pending"). A failed delivery is logged (webhook_failed audit row)
+      // and left to the reconciliation sweep (spec G1c) -- never retried by
+      // reverting the instance.
+      $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $artifact, $hash);
     } catch (\Throwable $e) {
       // Roll the claim back so the guest can retry; remove any orphaned files.
       $pdo->prepare('UPDATE waiver_instances SET status="pending", completed_at=NULL, updated_at=UTC_TIMESTAMP() WHERE id=? AND status="completed"')->execute([$instance['id']]);
@@ -150,6 +349,135 @@ class WaiverController {
     }
 
     return ['ok'=>true,'artifact'=>$artifact];
+  }
+
+  // [FK-T8] Number of curl attempts for the outbound completion webhook and
+  // the fixed per-attempt timeout, per spec G1b "first cut" (inline bounded
+  // retry -- the durable webhook_deliveries/bin/webhook_worker.php version is
+  // a later hardening task, not launch-blocking, since the reconciliation
+  // sweep in G1c covers any delivery this exhausts).
+  private const WEBHOOK_MAX_ATTEMPTS = 3;
+  private const WEBHOOK_TIMEOUT_SECONDS = 5;
+  // Backoff between attempts, in microseconds: 250ms after attempt 1, 750ms
+  // after attempt 2. Only 2 sleeps are needed for 3 attempts.
+  private const WEBHOOK_BACKOFF_USEC = [250000, 750000];
+
+  // [FK-T8] POST a signed envelope to BookingV2's completion webhook and
+  // return true iff BookingV2 responded 2xx within the attempt budget. Uses
+  // raw curl (the fork has no HTTP client -- composer.json is dompdf +
+  // phpword only). Never throws: a curl-level error (DNS, connect, timeout)
+  // is treated the same as a bad HTTP status -- just another failed attempt.
+  private function postSignedEnvelope(string $url, string $rawBody, string $keyId, string $secret): bool {
+    for ($attempt = 1; $attempt <= self::WEBHOOK_MAX_ATTEMPTS; $attempt++) {
+      $timestamp = (string)time();
+      $nonce = Utils::randomToken(12); // hex, well within the ^[A-Za-z0-9_-]{1,32}$ nonce charset
+      $canonical = $keyId."\n".$timestamp."\n".$nonce."\n".$rawBody;
+      $signature = Utils::hmacSign($canonical, $secret);
+
+      $ch = curl_init($url);
+      curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $rawBody,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => self::WEBHOOK_TIMEOUT_SECONDS,
+        CURLOPT_CONNECTTIMEOUT => self::WEBHOOK_TIMEOUT_SECONDS,
+        CURLOPT_HTTPHEADER => [
+          'Content-Type: application/json',
+          'X-Waiver-Timestamp: '.$timestamp,
+          'X-Waiver-Nonce: '.$nonce,
+          'X-Waiver-Key-Id: '.$keyId,
+          'X-Waiver-Signature: '.$signature,
+        ],
+      ]);
+      curl_exec($ch);
+      $errno = curl_errno($ch);
+      $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+      curl_close($ch);
+
+      if ($errno === 0 && $status >= 200 && $status < 300) return true;
+
+      if ($attempt < self::WEBHOOK_MAX_ATTEMPTS) {
+        usleep(self::WEBHOOK_BACKOFF_USEC[$attempt - 1]);
+      }
+    }
+    return false;
+  }
+
+  // [FK-T8] Fire the outbound completion webhook (spec G1b) for a
+  // SUCCESSFUL, non-age-gated submitGuestForm completion. Called from inside
+  // submitGuestForm's try block, strictly AFTER the waiver_responses row and
+  // the 'submitted' audit event are written, so this only ever runs once a
+  // real completion has landed. Every failure mode here (missing config,
+  // curl exhaustion, any \Throwable) is caught and logged as a
+  // 'webhook_failed' audit row -- this method must NEVER let an exception
+  // escape and hit submitGuestForm's catch, which would wrongly revert the
+  // just-completed instance back to 'pending'.
+  private function notifyBookingV2Completion(array $instance, array $ageGate, array $answers, ?string $signerFullName, ?string $artifactPath, string $answersHash): void {
+    try {
+      $cb = $this->cfg['callback'] ?? null;
+      if (!is_array($cb) || empty($cb['base_url']) || empty($cb['outbound_secret']) || empty($cb['outbound_key_id'])) {
+        // Not configured (e.g. legacy/self-mint deployments with no
+        // BookingV2 integration) -- nothing to notify, not an error.
+        return;
+      }
+
+      // [Gap2] evidence_sha256 = sha256 of the exact generated-PDF bytes,
+      // computed at upload/generation time -- NOT the answers-payload hash
+      // (that's $answersHash / waiver_responses.hash_sha256, carried through
+      // unchanged as answers_hash below). Object-store move (T15, presigned
+      // PUT) is a later task; for now the artifact is a local file and we
+      // hash exactly those bytes as they exist on disk right now.
+      $evidenceSha256 = null;
+      if ($artifactPath !== null && is_file($artifactPath)) {
+        $bytes = file_get_contents($artifactPath);
+        if ($bytes !== false) $evidenceSha256 = hash('sha256', $bytes);
+      }
+
+      $waiverInstanceId = (int)$instance['id'];
+      $linkToken = (string)$instance['link_token'];
+
+      $body = [
+        'event' => 'waiver.completed',
+        'idempotency_key' => 'wvr-'.$waiverInstanceId.'-'.$linkToken,
+        'waiver_instance_id' => $waiverInstanceId,
+        'link_token' => $linkToken,
+        'reservation_id' => $instance['reservation_id'] !== null ? (string)$instance['reservation_id'] : null,
+        'booking_group_id' => $instance['booking_group_id'] !== null ? (string)$instance['booking_group_id'] : null,
+        'participant_id' => $instance['participant_id'] !== null ? (string)$instance['participant_id'] : null,
+        'customer_id' => $instance['customer_id'] !== null ? (string)$instance['customer_id'] : null,
+        'completed_at' => gmdate('c'),
+        'birth_date' => $ageGate['birth_date'] ?? null,
+        'computed_age' => $ageGate['computed_age'] ?? null,
+        'minor' => $ageGate['minor'] ?? null,
+        'parental_consent_name' => $ageGate['parental_consent_name'] ?? null,
+        'evidence_sha256' => $evidenceSha256,
+        'answers_hash' => $answersHash,
+        'signer_full_name' => $signerFullName,
+      ];
+      // [Gap3] waiver_consent_granted is a Wave-2 field: the fork's current
+      // form has no consent checkbox on most templates, so this key is
+      // included ONLY when the guest actually ticked one (present === true).
+      // Ingestion (BookingV2) treats an absent key as "no consent action" --
+      // never send an explicit false, which would read as a revoke.
+      if (($answers[self::CONSENT_ANSWER_KEY] ?? null) === true) {
+        $body['waiver_consent_granted'] = true;
+      }
+
+      $rawBody = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+      $url = rtrim((string)$cb['base_url'], '/').'/api/waiver/complete';
+
+      $ok = $this->postSignedEnvelope($url, $rawBody, (string)$cb['outbound_key_id'], (string)$cb['outbound_secret']);
+      if (!$ok) {
+        $this->audit('instance', $waiverInstanceId, 'webhook_failed', ['idempotency_key' => $body['idempotency_key']]);
+      }
+    } catch (\Throwable $e) {
+      // Belt-and-suspenders: even an unexpected error here (e.g. a bad
+      // 'callback' config shape) must never escape -- log best-effort and
+      // move on. The completed instance stands regardless.
+      try {
+        $this->audit('instance', (int)$instance['id'], 'webhook_failed', ['reason' => 'exception']);
+      } catch (\Throwable $e2) { /* best-effort only */ }
+    }
   }
 
   public function linkWaiversToReservation(string $reservationId, array $waiverIds=[], ?string $groupToken=null, bool $includePending=false): array {
@@ -190,6 +518,12 @@ class WaiverController {
       $a=$this->parseAttrs($m[1]); $key=$a['key']??''; $type=$a['type']??'text'; $req=!empty($a['required'])?'required':'';
       if($type==='radio'){ $opts=isset($a['options'])?explode('|',$a['options']):['Yes','No']; $out='<span class="d-inline-block">'; foreach($opts as $o){ $out.='<label class="me-3"><input class="form-check-input me-1" type="radio" name="'.htmlspecialchars($key).'" value="'.htmlspecialchars($o).'" '.$req.'>'.htmlspecialchars($o).'</label>'; } return $out.'</span>'; }
       if($type==='textarea'){ return '<textarea name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:100%; min-height:80px; border:1px solid #ccc;"></textarea>'; }
+      if($type==='date'){ return '<input type="date" name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:auto; min-width:180px; padding:2px 6px;" '.$req.'>'; }
+      if($type==='parental_consent'){ return '<input name="'.htmlspecialchars($key).'" placeholder="Parent/guardian full name" class="form-control d-inline-block" style="width:auto; min-width:220px; padding:2px 6px; border:none; border-bottom:1px solid #000;" '.$req.'>'; }
+      // [FK-Tconsent] Optional GDPR/marketing consent checkbox. ALWAYS
+      // unrequired regardless of the placeholder's own `required` attribute
+      // (never honor $req here) -- this checkbox must never block submission.
+      if($type===self::CONSENT_FIELD_TYPE){ return '<div class="form-check d-inline-block"><input class="form-check-input" type="checkbox" name="'.htmlspecialchars($key).'" id="field_'.htmlspecialchars($key).'" value="1"><label class="form-check-label" for="field_'.htmlspecialchars($key).'">'.htmlspecialchars($a['label']??'I consent to be contacted for offers and promotions').'</label></div>'; }
       return '<input name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:auto; min-width:220px; padding:2px 6px; border:none; border-bottom:1px solid #000;" '.$req.'>';
     }, $html);
     $html=preg_replace('#\[signature(?:\s+[^\]]+)?\]#','<div class="mb-2"><label class="form-label">Signature *</label><canvas id="sig" style="border:1px solid #ccc; width:100%; max-width:480px; height:180px"></canvas><input type="hidden" name="signature_data" id="signature_data" required><button type="button" id="clear" class="btn btn-sm btn-outline-secondary mt-2">Clear</button></div>',$html);
@@ -200,6 +534,11 @@ class WaiverController {
       $a=$this->parseAttrs($m[1]); $key=$a['key']??''; $type=$a['type']??'text'; $val=isset($answers[$key])?(string)$answers[$key]:'';
       if($type==='radio'){ $opts=isset($a['options'])?explode('|',$a['options']):['Yes','No']; $out=''; foreach($opts as $o){ $checked=(strcasecmp(trim($val),trim($o))===0); $box=$checked?'&#10003;':'&nbsp;'; $out.='<span class="checkbox">['.$box.']</span> '.htmlspecialchars($o).'&nbsp;&nbsp; '; } return $out; }
       if($type==='textarea'){ $disp=$val!=''?nl2br(htmlspecialchars($val)):'&nbsp;'; return '<div class="inline-line" style="display:block; min-height:60px">'.$disp.'</div>'; }
+      // [FK-Tconsent] The consent checkbox's checked state is NOT stored under
+      // its own field key -- submitGuestForm() remaps it to the fixed
+      // 'waiver_consent_granted' answers_json key (present+true, or absent).
+      // Render from that key, not $val (which would always be empty/'1').
+      if($type===self::CONSENT_FIELD_TYPE){ $checked=!empty($answers[self::CONSENT_ANSWER_KEY]); $box=$checked?'&#10003;':'&nbsp;'; return '<span class="checkbox">['.$box.']</span> '.htmlspecialchars($a['label']??'I consent to be contacted for offers and promotions'); }
       $disp=$val!==''?htmlspecialchars($val):'&nbsp;'; return '<span class="inline-line">'.$disp.'</span>';
     }, $html);
     $html=preg_replace_callback('#\[signature(?:\s+[^\]]+)?\]#', function() use ($answers){ if(!empty($answers['_signature_png_base64'])) return '<img style="max-width:300px;border:1px solid #ccc" src="data:image/png;base64,'.htmlspecialchars($answers['_signature_png_base64']).'">'; return '<span class="inline-line">&nbsp;</span>'; }, $html);

@@ -24,6 +24,14 @@ return [
       'k1' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET'
     ]
   ],
+  // [FK-T8] Outbound completion webhook (fork -> BookingV2). Signed with
+  // WAIVER_CALLBACK_HMAC_SECRET (distinct from api_hmac_secret /
+  // inbound_hmac_keys above -- never share the two directions' secrets).
+  'callback' => [
+    'base_url'       => 'http://host.docker.internal:3000',
+    'outbound_secret' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET',
+    'outbound_key_id' => 'k1'
+  ],
   'storage' => [
     'signatures_path' => __DIR__ . '/../storage/signatures',
     'artifacts_path'  => __DIR__ . '/../storage/artifacts'

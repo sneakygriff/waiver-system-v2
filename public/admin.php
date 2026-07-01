@@ -94,7 +94,7 @@ if ($action === 'import_docx') {
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
   <body class="container py-4">
     <h1>Import from Word (DOCX)</h1>
-    <p class="text-muted">Use placeholders like <code>{{text:full_name!}}</code>, <code>{{radio:consent_photo:Yes|No}}</code>, <code>{{signature}}</code>.</p>
+    <p class="text-muted">Use placeholders like <code>{{text:full_name!}}</code>, <code>{{radio:consent_photo:Yes|No}}</code>, <code>{{signature}}</code>, <code>{{gdpr_consent:marketing_consent}}</code> (always optional; checked state is captured as <code>waiver_consent_granted</code>).</p>
     <?php if (!empty($err)): ?><div class="alert alert-danger"><?=htmlspecialchars($err)?></div><?php endif; ?>
     <form method="post" enctype="multipart/form-data" class="mb-4">
       <input type="hidden" name="csrf" value="<?=htmlspecialchars($csrf)?>">
@@ -149,8 +149,10 @@ if ($action === 'publish') {
   {"key":"full_name","label":"Full name","type":"text","required":true,"maxLength":120},
   {"key":"age_confirm","label":"I am 18+","type":"radio","options":["Yes","No"],"required":true},
   {"key":"medical","label":"Relevant medical conditions","type":"textarea","required":false},
-  {"key":"agree_rules","label":"I agree to the house rules","type":"radio","options":["Yes","No"],"required":true}
+  {"key":"agree_rules","label":"I agree to the house rules","type":"radio","options":["Yes","No"],"required":true},
+  {"key":"marketing_consent","label":"I would like to receive offers and promotions by email (optional)","type":"gdpr_consent"}
 ]</textarea></div>
+    <p class="text-muted">The <code>gdpr_consent</code> field type is always optional (never required, even if you set <code>"required":true</code>) and its checked state is captured under the fixed answers key <code>waiver_consent_granted</code> -- unticked/absent means the key is omitted entirely, never recorded as <code>false</code>.</p>
     <div class="mb-3"><label class="form-label">Content HTML (optional)</label><textarea name="content_html" class="form-control" rows="10"></textarea></div>
     <div class="mb-3"><label class="form-label">Print/PDF CSS (optional)</label><textarea name="print_css" class="form-control" rows="6"></textarea></div>
     <button class="btn btn-primary">Publish</button>

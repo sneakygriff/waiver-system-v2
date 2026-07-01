@@ -26,12 +26,22 @@ class DocxImportService {
       $key=$m[1]; $req=!empty($m[2])?' required':''; $opts=preg_replace('/\s*\/\s*/','|',trim($m[3]));
       return '[field key="'.$key.'" type="radio" options="'.htmlspecialchars($opts, ENT_QUOTES).'"'.$req.']';
     }, $html);
+    // [FK-Tconsent] Optional GDPR/marketing consent checkbox shortcode. Note:
+    // no `!` (required) variant is supported here -- this field type is
+    // ALWAYS optional (enforced again downstream in
+    // WaiverController::normalizeFields regardless of what lands in
+    // fields_json), so a trailing "!" is silently ignored rather than parsed.
+    $html = preg_replace_callback('/\{\{\s*gdpr_consent\s*:\s*([a-zA-Z0-9_\-]+)\s*\}\}/', function($m){
+      $key=$m[1]; return '[field key="'.$key.'" type="gdpr_consent"]';
+    }, $html);
 
     $fields=[];
     if (preg_match_all('/\[field\s+([^\]]+)\]/', $html, $mm)) {
       foreach ($mm[1] as $attr) {
         $a=$this->parseAttributes($attr); if (!isset($a['key'])) continue;
-        $key=$a['key']; $type=$a['type']??'text'; $required=isset($a['required']);
+        $key=$a['key']; $type=$a['type']??'text';
+        // [FK-Tconsent] Never required, regardless of the source markup.
+        $required=($type==='gdpr_consent') ? false : isset($a['required']);
         $f=['key'=>$key,'label'=>ucwords(str_replace('_',' ',$key)),'type'=>$type,'required'=>$required];
         if ($type==='radio' && isset($a['options'])) $f['options']=explode('|',$a['options']);
         $fields[$key]=$f;
