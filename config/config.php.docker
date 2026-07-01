@@ -30,7 +30,10 @@ return [
   'callback' => [
     'base_url'       => 'http://host.docker.internal:3000',
     'outbound_secret' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET',
-    'outbound_key_id' => 'k1'
+    'outbound_key_id' => 'k1',
+    // [FK-T15] Evidence-upload relay endpoint (BookingV2 POST /api/waiver/evidence).
+    // null = derive from base_url above ("<base_url>/api/waiver/evidence").
+    'evidence_url' => null,
   ],
   'storage' => [
     'signatures_path' => __DIR__ . '/../storage/signatures',

@@ -429,13 +429,23 @@ class WaiverController {
       $pdf=new PdfService($this->cfg['storage']['artifacts_path']); $basename=date('Ymd').'_'.$instance['id'].'_'.substr($hash,0,8);
       $artifact=$pdf->generate($filledHtml, $basename);
 
-      // [FK-erase] Persist the on-disk signature file path alongside pdf_path
-      // so erase_waiver can find and delete it later -- previously $sigFile
-      // was written to disk but never recorded anywhere in the DB, leaving
-      // erasure with no way to locate the signature PNG file (only the
-      // signature_png LONGBLOB column was traceable).
+      // [FK-T15] Evidence now lives durably in BookingV2's object store (Vercel
+      // Blob), not on this container's FS. Upload the PDF + signature PNG
+      // bytes to the BookingV2 evidence relay BEFORE persisting waiver_responses,
+      // so pdf_path/signature_path can be left NULL (nothing durable to point
+      // at locally going forward) and evidence_sha256/evidence_object_key are
+      // ready to hand to notifyBookingV2Completion. Upload failures are
+      // swallowed here (logged, non-blocking) -- see uploadEvidence() doc.
+      $evidence = $this->uploadEvidence($instance, $artifact, $sigFile);
+
+      // [FK-erase] pdf_path/signature_path columns are kept for backward
+      // compatibility with any pre-T15 rows / the erase_waiver file-cleanup
+      // path, but new rows no longer persist a local path: evidence is
+      // transient on this container (generated here, uploaded, then removed
+      // below) and the durable copy is BookingV2's object store, addressed by
+      // evidence_object_key on the completion webhook.
       $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, UTC_TIMESTAMP())');
-      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $artifact, $sigFile]);
+      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, null, null]);
       $this->audit('response', $instance['id'], 'submitted', $payload);
 
       // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
@@ -446,7 +456,7 @@ class WaiverController {
       // "pending"). A failed delivery is logged (webhook_failed audit row)
       // and left to the reconciliation sweep (spec G1c) -- never retried by
       // reverting the instance.
-      $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $artifact, $hash);
+      $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $hash);
     } catch (\Throwable $e) {
       // Roll the claim back so the guest can retry; remove any orphaned files.
       $pdo->prepare('UPDATE waiver_instances SET status="pending", completed_at=NULL, updated_at=UTC_TIMESTAMP() WHERE id=? AND status="completed"')->execute([$instance['id']]);
@@ -454,6 +464,14 @@ class WaiverController {
       if($artifact && is_file($artifact)) @unlink($artifact);
       return ['error'=>'Could not save waiver, please try again.'];
     }
+
+    // [FK-T15] Stop long-term local-FS persistence: evidence was generated
+    // transiently to produce the bytes uploaded above -- remove both files
+    // now that the durable copy (if the upload succeeded) lives in BookingV2
+    // Blob. Best-effort: a stray leftover file here is not itself a
+    // correctness problem (nothing references it), just housekeeping.
+    if(is_file($sigFile)) @unlink($sigFile);
+    if($artifact && is_file($artifact)) @unlink($artifact);
 
     return ['ok'=>true,'artifact'=>$artifact];
   }
@@ -475,6 +493,17 @@ class WaiverController {
   // phpword only). Never throws: a curl-level error (DNS, connect, timeout)
   // is treated the same as a bad HTTP status -- just another failed attempt.
   private function postSignedEnvelope(string $url, string $rawBody, string $keyId, string $secret): bool {
+    return $this->postSignedEnvelopeWithResponse($url, $rawBody, $keyId, $secret)['ok'];
+  }
+
+  // [FK-T15] Same bounded-retry signed-envelope POST as postSignedEnvelope,
+  // but also returns the final response body -- needed by uploadEvidence() to
+  // read back the blob key BookingV2's relay assigns. Returns
+  // ['ok'=>bool, 'body'=>?string, 'status'=>?int] and never throws (a
+  // curl-level error is just another failed attempt, same as
+  // postSignedEnvelope).
+  private function postSignedEnvelopeWithResponse(string $url, string $rawBody, string $keyId, string $secret): array {
+    $lastBody = null; $lastStatus = null;
     for ($attempt = 1; $attempt <= self::WEBHOOK_MAX_ATTEMPTS; $attempt++) {
       $timestamp = (string)time();
       $nonce = Utils::randomToken(12); // hex, well within the ^[A-Za-z0-9_-]{1,32}$ nonce charset
@@ -496,18 +525,101 @@ class WaiverController {
           'X-Waiver-Signature: '.$signature,
         ],
       ]);
-      curl_exec($ch);
+      $resp = curl_exec($ch);
       $errno = curl_errno($ch);
       $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
       curl_close($ch);
+      $lastBody = is_string($resp) ? $resp : null;
+      $lastStatus = $status;
 
-      if ($errno === 0 && $status >= 200 && $status < 300) return true;
+      if ($errno === 0 && $status >= 200 && $status < 300) {
+        return ['ok'=>true, 'body'=>$lastBody, 'status'=>$status];
+      }
 
       if ($attempt < self::WEBHOOK_MAX_ATTEMPTS) {
         usleep(self::WEBHOOK_BACKOFF_USEC[$attempt - 1]);
       }
     }
-    return false;
+    return ['ok'=>false, 'body'=>$lastBody, 'status'=>$lastStatus];
+  }
+
+  // [FK-T15] Upload the signed PDF + signature PNG bytes to BookingV2's
+  // evidence relay (POST /api/waiver/evidence, authenticated with the SAME
+  // signed-envelope scheme used for the completion webhook -- callback
+  // outbound_secret/outbound_key_id). BookingV2 re-verifies evidence_sha256
+  // over the bytes it receives (409 on mismatch), puts the object to Vercel
+  // Blob (EU), and returns a blob key. This is a durability upgrade only:
+  // the caller (submitGuestForm) must treat any failure here as non-fatal --
+  // never throw, never block/revert completion. On any failure this returns
+  // evidence_sha256/evidence_object_key both null so the completion webhook
+  // still fires (evidence_sha256 absent is a valid, expected shape per Gap2 --
+  // reconciliation/backfill can pick this up later).
+  //
+  // evidence_sha256 is computed over the EXACT bytes placed in the request
+  // body (the PDF bytes) -- per spec Gap2 this must be the hash of the
+  // object-store bytes as uploaded, not the answers-payload hash.
+  private function uploadEvidence(array $instance, ?string $artifactPath, ?string $sigFile): array {
+    $none = ['evidence_sha256'=>null, 'evidence_object_key'=>null];
+    try {
+      $cb = $this->cfg['callback'] ?? null;
+      if (!is_array($cb) || empty($cb['base_url']) || empty($cb['outbound_secret']) || empty($cb['outbound_key_id'])) {
+        // Not configured -- nothing to upload, not an error (mirrors
+        // notifyBookingV2Completion's own "not configured" no-op).
+        return $none;
+      }
+      if ($artifactPath === null || !is_file($artifactPath)) return $none;
+      $pdfBytes = file_get_contents($artifactPath);
+      if ($pdfBytes === false || $pdfBytes === '') return $none;
+
+      $evidenceSha256 = hash('sha256', $pdfBytes);
+
+      $sigBytes = null;
+      if ($sigFile !== null && is_file($sigFile)) {
+        $read = file_get_contents($sigFile);
+        if ($read !== false) $sigBytes = $read;
+      }
+
+      $body = [
+        'waiver_instance_id' => (int)$instance['id'],
+        'link_token' => (string)$instance['link_token'],
+        'evidence_sha256' => $evidenceSha256,
+        'pdf_base64' => base64_encode($pdfBytes),
+        'signature_png_base64' => $sigBytes !== null ? base64_encode($sigBytes) : null,
+      ];
+      $rawBody = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+      $url = !empty($cb['evidence_url'])
+        ? (string)$cb['evidence_url']
+        : rtrim((string)$cb['base_url'], '/').'/api/waiver/evidence';
+
+      $result = $this->postSignedEnvelopeWithResponse($url, $rawBody, (string)$cb['outbound_key_id'], (string)$cb['outbound_secret']);
+      if (!$result['ok']) {
+        $this->audit('instance', (int)$instance['id'], 'evidence_upload_failed', ['status'=>$result['status']]);
+        // Evidence can be back-filled later (reconciliation/manual re-upload)
+        // -- still report the locally-computed hash so the completion
+        // webhook at least carries evidence_sha256 even without a blob key.
+        return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>null];
+      }
+
+      $decoded = json_decode((string)$result['body'], true);
+      $blobKey = (is_array($decoded) && isset($decoded['blob_key']) && is_scalar($decoded['blob_key'])) ? (string)$decoded['blob_key'] : null;
+      if ($blobKey === null) {
+        // 2xx but no usable blob_key in the body -- treat as a failed upload
+        // for wiring purposes (nothing to reference), but keep the hash.
+        $this->audit('instance', (int)$instance['id'], 'evidence_upload_failed', ['reason'=>'missing_blob_key']);
+        return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>null];
+      }
+
+      return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>$blobKey];
+    } catch (\Throwable $e) {
+      // Belt-and-suspenders: never let an unexpected error here escape and
+      // hit submitGuestForm's catch, which would wrongly revert a real
+      // completion back to 'pending'.
+      try {
+        $this->audit('instance', (int)$instance['id'], 'evidence_upload_failed', ['reason'=>'exception']);
+      } catch (\Throwable $e2) { /* best-effort only */ }
+      return $none;
+    }
   }
 
   // [FK-T8] Fire the outbound completion webhook (spec G1b) for a
@@ -519,7 +631,7 @@ class WaiverController {
   // 'webhook_failed' audit row -- this method must NEVER let an exception
   // escape and hit submitGuestForm's catch, which would wrongly revert the
   // just-completed instance back to 'pending'.
-  private function notifyBookingV2Completion(array $instance, array $ageGate, array $answers, ?string $signerFullName, ?string $artifactPath, string $answersHash): void {
+  private function notifyBookingV2Completion(array $instance, array $ageGate, array $answers, ?string $signerFullName, ?string $evidenceSha256, ?string $evidenceObjectKey, string $answersHash): void {
     try {
       $cb = $this->cfg['callback'] ?? null;
       if (!is_array($cb) || empty($cb['base_url']) || empty($cb['outbound_secret']) || empty($cb['outbound_key_id'])) {
@@ -528,18 +640,14 @@ class WaiverController {
         return;
       }
 
-      // [Gap2] evidence_sha256 = sha256 of the exact generated-PDF bytes,
-      // computed at upload/generation time -- NOT the answers-payload hash
-      // (that's $answersHash / waiver_responses.hash_sha256, carried through
-      // unchanged as answers_hash below). Object-store move (T15, presigned
-      // PUT) is a later task; for now the artifact is a local file and we
-      // hash exactly those bytes as they exist on disk right now.
-      $evidenceSha256 = null;
-      if ($artifactPath !== null && is_file($artifactPath)) {
-        $bytes = file_get_contents($artifactPath);
-        if ($bytes !== false) $evidenceSha256 = hash('sha256', $bytes);
-      }
-
+      // [Gap2 / FK-T15] evidence_sha256 = sha256 of the exact object-store
+      // bytes (the generated PDF), computed by uploadEvidence() at upload
+      // time -- NOT the answers-payload hash (that's $answersHash /
+      // waiver_responses.hash_sha256, carried through unchanged as
+      // answers_hash below). evidence_object_key is the Vercel Blob key
+      // BookingV2's evidence relay returned; both are null when the upload
+      // was skipped/failed (evidence can be back-filled later -- never block
+      // completion on this).
       $waiverInstanceId = (int)$instance['id'];
       $linkToken = (string)$instance['link_token'];
 
@@ -558,6 +666,7 @@ class WaiverController {
         'minor' => $ageGate['minor'] ?? null,
         'parental_consent_name' => $ageGate['parental_consent_name'] ?? null,
         'evidence_sha256' => $evidenceSha256,
+        'evidence_object_key' => $evidenceObjectKey,
         'answers_hash' => $answersHash,
         'signer_full_name' => $signerFullName,
       ];
