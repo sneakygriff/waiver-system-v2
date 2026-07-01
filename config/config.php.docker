@@ -15,7 +15,14 @@ return [
   'security' => [
     'session_name' => 'waiver_admin',
     'password_algo' => PASSWORD_ARGON2ID,
-    'api_hmac_secret' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET'
+    'api_hmac_secret' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET',
+    // [FK-T7] Signed-envelope inbound secrets, keyed by key_id (X-Waiver-Key-Id)
+    // to support rotation. This is WAIVER_APP_HMAC_SECRET (BookingV2 -> fork)
+    // per spec G1 -- distinct from the callback secret the fork uses to SIGN
+    // its own outbound webhook (T8), never share the two.
+    'inbound_hmac_keys' => [
+      'k1' => 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET'
+    ]
   ],
   'storage' => [
     'signatures_path' => __DIR__ . '/../storage/signatures',

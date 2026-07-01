@@ -7,13 +7,28 @@ use App\{Database, WaiverController, Utils};
 ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
-// Verify HMAC over the EXACT raw bytes received, before any defaulting — so a
-// caller that honestly signs an empty body isn't rejected, and signing '{}'
-// while sending nothing isn't silently accepted.
+// [FK-T7] Verify the signed envelope (timestamp + nonce + key_id + signature)
+// over the EXACT raw bytes received, before any defaulting or JSON-decoding —
+// so a caller that honestly signs an empty body isn't rejected, and signing
+// '{}' while sending nothing isn't silently accepted. Replaces the old
+// raw-body-only single-header X-Hmac check with replay protection (rules 1-4
+// of spec G1); only after verification passes do we decode the body (rule 5).
 $raw = file_get_contents('php://input'); if ($raw === false) $raw = '';
-$hmac = $_SERVER['HTTP_X_HMAC'] ?? null;
-if (!Utils::hmacValid($raw, $cfg['security']['api_hmac_secret'], $hmac)) {
-  Utils::jsonResponse(401, ['error'=>'invalid hmac']);
+
+try {
+  $db = new Database($cfg['db']);
+  $verify = Utils::verifySignedEnvelope($raw, [
+    'timestamp' => $_SERVER['HTTP_X_WAIVER_TIMESTAMP'] ?? null,
+    'nonce'     => $_SERVER['HTTP_X_WAIVER_NONCE'] ?? null,
+    'keyId'     => $_SERVER['HTTP_X_WAIVER_KEY_ID'] ?? null,
+    'signature' => $_SERVER['HTTP_X_WAIVER_SIGNATURE'] ?? null,
+  ], $cfg['security']['inbound_hmac_keys'], $db->pdo());
+  if (!$verify['ok']) {
+    Utils::jsonResponse($verify['status'], ['error'=>$verify['error']]);
+  }
+} catch (\Throwable $e) {
+  // Never leak a stack trace / server paths to the caller.
+  Utils::jsonResponse(500, ['error'=>'internal server error']);
 }
 
 $payload = json_decode($raw !== '' ? $raw : '{}', true);
@@ -21,11 +36,15 @@ if (!is_array($payload)) $payload = [];
 $action = is_string($payload['action'] ?? null) ? $payload['action'] : '';
 
 try {
-  $db = new Database($cfg['db']);
   $ctl = new WaiverController($cfg, $db);
 
   if ($action === 'create_waiver') {
     $res = $ctl->createInstance($payload);
+    Utils::jsonResponse(empty($res['error']) ? 200 : 400, $res);
+  }
+
+  if ($action === 'has_published_version') {
+    $res = $ctl->hasPublishedVersion($payload['template_id'] ?? null);
     Utils::jsonResponse(empty($res['error']) ? 200 : 400, $res);
   }
 

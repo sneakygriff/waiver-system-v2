@@ -25,21 +25,30 @@ CREATE TABLE IF NOT EXISTS waiver_template_versions (
   created_at DATETIME NOT NULL,
   content_html MEDIUMTEXT NULL,
   print_css TEXT NULL,
+  is_published TINYINT(1) NOT NULL DEFAULT 0,
+  published_at DATETIME NULL,
   UNIQUE (template_id, version),
-  INDEX (template_id)
+  INDEX (template_id),
+  INDEX idx_template_published (template_id, is_published)
 );
 CREATE TABLE IF NOT EXISTS waiver_instances (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   template_version_id BIGINT NOT NULL,
   reservation_id VARCHAR(64) NULL,
+  participant_id VARCHAR(64) NULL,
+  customer_id VARCHAR(64) NULL,
+  booking_group_id VARCHAR(64) NULL,
   guest_name VARCHAR(255) NULL,
   guest_email VARCHAR(255) NULL,
-  link_token CHAR(64) NOT NULL UNIQUE,
+  link_token VARCHAR(128) NOT NULL UNIQUE,
   group_token CHAR(16) NULL,
   status ENUM('pending','completed','void') NOT NULL DEFAULT 'pending',
   created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
   completed_at DATETIME NULL,
-  INDEX (reservation_id), INDEX (status), INDEX (group_token)
+  INDEX (reservation_id), INDEX (status), INDEX (group_token),
+  INDEX idx_participant (participant_id),
+  INDEX idx_customer (customer_id),
+  INDEX idx_booking_group (booking_group_id)
 );
 CREATE TABLE IF NOT EXISTS waiver_responses (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -68,3 +77,12 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at DATETIME NOT NULL,
   INDEX (entity_type, entity_id, created_at)
 );
+CREATE TABLE IF NOT EXISTS webhook_nonces (
+  nonce VARCHAR(64) PRIMARY KEY,
+  expires_at DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version VARCHAR(32) PRIMARY KEY,
+  applied_at DATETIME NOT NULL
+);
+INSERT INTO schema_migrations (version, applied_at) VALUES ('001_init', NOW());

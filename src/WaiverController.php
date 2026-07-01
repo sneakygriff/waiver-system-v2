@@ -10,21 +10,65 @@ class WaiverController {
     $guest_name=$payload['guest_name']??null;
     $guest_email=$payload['guest_email']??null;
     $group_token=$payload['group_token']??null;
+    // [Model A / FK-T6] optional external link_token (BookingV2-minted). When
+    // absent we self-mint (Model B fallback stays intact for legacy callers).
+    $link_token=$payload['link_token']??null;
+    $participant_id=$payload['participant_id']??null;
+    $customer_id=$payload['customer_id']??null;
+    $booking_group_id=$payload['booking_group_id']??null;
     if(!$template_id){ return ['error'=>'template_id is required']; }
     if(!is_scalar($template_id)) return ['error'=>'template_id must be a scalar'];
-    foreach(['reservation_id'=>$reservation_id,'guest_name'=>$guest_name,'guest_email'=>$guest_email,'group_token'=>$group_token] as $k=>$val){ if($val!==null && !is_scalar($val)) return ['error'=>$k.' must be a string']; }
+    foreach(['reservation_id'=>$reservation_id,'guest_name'=>$guest_name,'guest_email'=>$guest_email,'group_token'=>$group_token,'link_token'=>$link_token,'participant_id'=>$participant_id,'customer_id'=>$customer_id,'booking_group_id'=>$booking_group_id] as $k=>$val){ if($val!==null && !is_scalar($val)) return ['error'=>$k.' must be a string']; }
     if($reservation_id!==null && strlen((string)$reservation_id)>64) return ['error'=>'reservation_id too long (max 64)'];
     if($group_token!==null && strlen((string)$group_token)>16) return ['error'=>'group_token too long (max 16)'];
     if($guest_name!==null && strlen((string)$guest_name)>255) return ['error'=>'guest_name too long (max 255)'];
     if($guest_email!==null && strlen((string)$guest_email)>255) return ['error'=>'guest_email too long (max 255)'];
-    $v=$this->db->pdo()->prepare('SELECT id, version, fields_json, title FROM waiver_template_versions WHERE template_id=? ORDER BY version DESC LIMIT 1');
-    $v->execute([$template_id]); $version=$v->fetch(); if(!$version) return ['error'=>'No published version for template'];
-    $token=Utils::randomToken(32);
-    $stmt=$this->db->pdo()->prepare('INSERT INTO waiver_instances (template_version_id, reservation_id, group_token, guest_name, guest_email, link_token, status, created_at, updated_at) VALUES (?,?,?,?,?,?,"pending",UTC_TIMESTAMP(),UTC_TIMESTAMP())');
-    $stmt->execute([$version['id'],$reservation_id,$group_token,$guest_name,$guest_email,$token]);
-    $id=(int)$this->db->pdo()->lastInsertId(); $link=rtrim($this->cfg['app']['base_url'],'/').'/w.php?token='.$token;
-    $this->audit('instance',$id,'created',['reservation_id'=>$reservation_id,'template_version_id'=>$version['id'],'group_token'=>$group_token]);
-    return ['waiver_id'=>$id,'link'=>$link,'group_token'=>$group_token];
+    if($participant_id!==null && strlen((string)$participant_id)>64) return ['error'=>'participant_id too long (max 64)'];
+    if($customer_id!==null && strlen((string)$customer_id)>64) return ['error'=>'customer_id too long (max 64)'];
+    if($booking_group_id!==null && strlen((string)$booking_group_id)>64) return ['error'=>'booking_group_id too long (max 64)'];
+    if($link_token!==null){
+      $link_token=(string)$link_token;
+      if(!preg_match('/^[A-Za-z0-9_-]{16,128}$/',$link_token)) return ['error'=>'link_token has invalid charset or length (expected 16-128 chars of [A-Za-z0-9_-])'];
+    }
+
+    // [Gap1] published-version gate: resolve by is_published=1, never fall back
+    // to the max-drafted version. No published version -> 400 no_published_version.
+    $v=$this->db->pdo()->prepare('SELECT id, version, fields_json, title FROM waiver_template_versions WHERE template_id=? AND is_published=1 ORDER BY version DESC LIMIT 1');
+    $v->execute([$template_id]); $version=$v->fetch(); if(!$version) return ['error'=>'no_published_version'];
+
+    $pdo=$this->db->pdo();
+    $token=$link_token ?? Utils::randomToken(32);
+
+    try {
+      $stmt=$pdo->prepare('INSERT INTO waiver_instances (template_version_id, reservation_id, participant_id, customer_id, booking_group_id, group_token, guest_name, guest_email, link_token, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,"pending",UTC_TIMESTAMP(),UTC_TIMESTAMP())');
+      $stmt->execute([$version['id'],$reservation_id,$participant_id,$customer_id,$booking_group_id,$group_token,$guest_name,$guest_email,$token]);
+    } catch (\PDOException $e) {
+      // [FK-T6] Idempotent create: a duplicate link_token (SQLSTATE 23000) means
+      // a retried request for a token we already registered — look up the
+      // existing row and return the SAME success shape rather than a 500, so a
+      // network-timeout retry from BookingV2 never double-creates or errors.
+      if($e->getCode()==='23000' && $link_token!==null){
+        $existing=$pdo->prepare('SELECT id, group_token FROM waiver_instances WHERE link_token=? LIMIT 1');
+        $existing->execute([$link_token]); $row=$existing->fetch();
+        if($row){
+          $link=rtrim($this->cfg['app']['base_url'],'/').'/w.php?token='.$link_token;
+          return ['waiver_id'=>(int)$row['id'],'link'=>$link,'link_token'=>$link_token,'group_token'=>$row['group_token'],'reused'=>true];
+        }
+      }
+      throw $e;
+    }
+
+    $id=(int)$pdo->lastInsertId(); $link=rtrim($this->cfg['app']['base_url'],'/').'/w.php?token='.$token;
+    $this->audit('instance',$id,'created',['reservation_id'=>$reservation_id,'template_version_id'=>$version['id'],'group_token'=>$group_token,'participant_id'=>$participant_id,'customer_id'=>$customer_id,'booking_group_id'=>$booking_group_id]);
+    return ['waiver_id'=>$id,'link'=>$link,'link_token'=>$token,'group_token'=>$group_token,'reused'=>false];
+  }
+
+  // [FK-T6 / T9 partial] Does template_id have any published version?
+  public function hasPublishedVersion($template_id): array {
+    if($template_id===null || !is_scalar($template_id)) return ['error'=>'template_id is required'];
+    $q=$this->db->pdo()->prepare('SELECT 1 FROM waiver_template_versions WHERE template_id=? AND is_published=1 LIMIT 1');
+    $q->execute([$template_id]); $row=$q->fetch();
+    return ['has_published_version'=>(bool)$row];
   }
 
   // Decode fields_json defensively: tolerate a non-array/non-list, or field
