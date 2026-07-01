@@ -173,6 +173,64 @@ class WaiverController {
     return ['error'=>'Provide link_token, or booking_group_id / reservation_id for a batch lookup'];
   }
 
+  // [FK-void / SPEC D-1 rotate] void_waiver: mark a waiver_instances row
+  // status='void' by link_token so a rotated/superseded token can never be
+  // signed, even if the old signing link is still floating around (email
+  // client cache, browser back button, etc.). Called by BookingV2's
+  // sendWaiverSigningLink re-send/rotate step (fork-client.ts
+  // voidWaiverInstance) as a best-effort compensating action -- this action
+  // itself, though, is a plain synchronous request/response like every other
+  // action here; "best-effort" is a BookingV2-side caller concern, not
+  // something this method needs to know about.
+  //
+  // Idempotent by design (mirrors eraseWaiver's idempotency posture):
+  //   - unknown token            -> {error: 'token_unknown'} (404, matches get_status)
+  //   - already void             -> {ok:true, already_void:true} (no-op, not an error)
+  //   - completed                -> {error: 'already_completed'} (400 -- a
+  //     signed, evidence-bearing instance is never voidable; that would let a
+  //     caller erase the "was this signed" signal without going through the
+  //     real GDPR erase_waiver path)
+  //   - pending                  -> atomic claim to 'void', audited, {ok:true}
+  public function voidWaiver(array $payload): array {
+    $linkToken = $payload['link_token'] ?? null;
+    if ($linkToken === null || !is_scalar($linkToken) || (string)$linkToken === '') {
+      return ['error'=>'link_token must be a non-empty string'];
+    }
+    $linkToken = (string)$linkToken;
+    if (strlen($linkToken) > 128) return ['error'=>'link_token too long (max 128)'];
+
+    $pdo = $this->db->pdo();
+    $q = $pdo->prepare('SELECT id, status FROM waiver_instances WHERE link_token=? LIMIT 1');
+    $q->execute([$linkToken]);
+    $row = $q->fetch();
+    if (!$row) return ['error'=>'token_unknown'];
+
+    if ($row['status'] === 'void') {
+      // Already voided (e.g. a retried rotate call) -- clean no-op, not an error.
+      return ['ok'=>true, 'already_void'=>true];
+    }
+    if ($row['status'] === 'completed') {
+      return ['error'=>'already_completed'];
+    }
+
+    // Atomic claim mirrors submitGuestForm's completed-status claim: only
+    // flip a row that is still 'pending' at the moment of the UPDATE, so a
+    // concurrent sign-in-flight can't be silently voided out from under it.
+    $claim = $pdo->prepare('UPDATE waiver_instances SET status="void", updated_at=UTC_TIMESTAMP() WHERE id=? AND status="pending"');
+    $claim->execute([(int)$row['id']]);
+    if ($claim->rowCount() === 0) {
+      // Lost the race: re-check what it became (completed or void) and report accordingly.
+      $recheck = $pdo->prepare('SELECT status FROM waiver_instances WHERE id=? LIMIT 1');
+      $recheck->execute([(int)$row['id']]);
+      $now = $recheck->fetch();
+      if ($now && $now['status'] === 'void') return ['ok'=>true, 'already_void'=>true];
+      return ['error'=>'already_completed'];
+    }
+
+    $this->audit('instance', (int)$row['id'], 'voided', ['link_token'=>$linkToken]);
+    return ['ok'=>true];
+  }
+
   // [FK-Tconsent] Field type for the optional GDPR/marketing consent
   // checkbox. Deliberately its own type (not reused from radio/text) so the
   // guest page, PDF renderer, and answer-capture logic can all special-case
@@ -211,7 +269,12 @@ class WaiverController {
   public function renderGuestForm(string $token): array {
     $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.title, wtv.description, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $row=$q->fetch();
-    if(!$row) return ['error'=>'Invalid link']; if($row['status']==='completed') return ['error'=>'This waiver has already been completed.'];
+    if(!$row) return ['error'=>'Invalid link'];
+    if($row['status']==='completed') return ['error'=>'This waiver has already been completed.'];
+    // [FK-void] A voided instance (D-1 rotate, or an explicit void) must not
+    // even render a signable form -- distinct message from "completed" so a
+    // guest opening a stale/rotated link understands to use their newest link.
+    if($row['status']==='void') return ['error'=>'This waiver link is no longer valid. Please use the most recent link you were sent.'];
     return ['instance'=>$row,'fields'=>$this->normalizeFields($row['fields_json'])];
   }
 
@@ -294,7 +357,13 @@ class WaiverController {
 
   public function submitGuestForm(string $token, array $post): array {
     $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
-    $q->execute([$token]); $instance=$q->fetch(); if(!$instance) return ['error'=>'Invalid link']; if($instance['status']==='completed') return ['error'=>'Already completed'];
+    $q->execute([$token]); $instance=$q->fetch(); if(!$instance) return ['error'=>'Invalid link'];
+    if($instance['status']==='completed') return ['error'=>'Already completed'];
+    // [FK-void] Reject a voided instance up front with its own message
+    // (distinct from "Already completed") -- also belt-and-suspenders with
+    // the atomic claim below, which already refuses to flip a non-'pending'
+    // row to 'completed' regardless of this early check.
+    if($instance['status']==='void') return ['error'=>'This waiver link is no longer valid.'];
     $fields=$this->normalizeFields($instance['fields_json']); $answers=[];
     foreach($fields as $f){
       $key=$f['key']; $val=$post[$key]??null;
@@ -360,8 +429,13 @@ class WaiverController {
       $pdf=new PdfService($this->cfg['storage']['artifacts_path']); $basename=date('Ymd').'_'.$instance['id'].'_'.substr($hash,0,8);
       $artifact=$pdf->generate($filledHtml, $basename);
 
-      $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, UTC_TIMESTAMP())');
-      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $artifact]);
+      // [FK-erase] Persist the on-disk signature file path alongside pdf_path
+      // so erase_waiver can find and delete it later -- previously $sigFile
+      // was written to disk but never recorded anywhere in the DB, leaving
+      // erasure with no way to locate the signature PNG file (only the
+      // signature_png LONGBLOB column was traceable).
+      $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, UTC_TIMESTAMP())');
+      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $artifact, $sigFile]);
       $this->audit('response', $instance['id'], 'submitted', $payload);
 
       // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
@@ -531,6 +605,126 @@ class WaiverController {
     $in=implode(',',array_fill(0,count($ids),'?')); $upd=$this->db->pdo()->prepare('UPDATE waiver_instances SET reservation_id=?, updated_at=UTC_TIMESTAMP() WHERE id IN ('.$in.')'); $upd->execute(array_merge([$reservationId],$ids));
     foreach($ids as $id){ $this->audit('instance',(int)$id,'linked_to_reservation',['reservation_id'=>$reservationId]); }
     return ['updated'=>count($ids),'ids'=>$ids];
+  }
+
+  // [FK-erase / SPEC G5] GDPR erase_waiver: given a binding (customer_id
+  // and/or booking_group_id and/or link_tokens), hard-delete every matching
+  // waiver_instances row, its waiver_responses row (which hard-deletes the
+  // signature_png LONGBLOB -- the DB is the ONLY durable store of that
+  // blob), and the storage/ PDF + signature files on disk (pdf_path +
+  // signature_path). Idempotent: matching nothing is success, count:0, never
+  // an error -- a second erase call for an already-erased customer/group/
+  // token set must not fail.
+  //
+  // Binding is a UNION of whichever fields are provided (matches Model A's
+  // "given a binding ... DELETE" framing -- any of the three identifies rows
+  // to erase, not an AND of all three). At least one binding field is
+  // required, else 400 (an unbounded erase-everything call is never valid).
+  public function eraseWaiver(array $payload): array {
+    $customerId = $payload['customer_id'] ?? null;
+    $bookingGroupId = $payload['booking_group_id'] ?? null;
+    $linkTokensRaw = $payload['link_tokens'] ?? null;
+
+    if ($customerId !== null && (!is_scalar($customerId) || (string)$customerId === '')) {
+      return ['error'=>'customer_id must be a non-empty string'];
+    }
+    if ($bookingGroupId !== null && (!is_scalar($bookingGroupId) || (string)$bookingGroupId === '')) {
+      return ['error'=>'booking_group_id must be a non-empty string'];
+    }
+    if ($linkTokensRaw !== null && !is_array($linkTokensRaw)) {
+      return ['error'=>'link_tokens must be an array of strings'];
+    }
+
+    $customerId = $customerId !== null ? (string)$customerId : null;
+    if ($customerId !== null && strlen($customerId) > 64) return ['error'=>'customer_id too long (max 64)'];
+    $bookingGroupId = $bookingGroupId !== null ? (string)$bookingGroupId : null;
+    if ($bookingGroupId !== null && strlen($bookingGroupId) > 64) return ['error'=>'booking_group_id too long (max 64)'];
+
+    $linkTokens = [];
+    if (is_array($linkTokensRaw)) {
+      foreach ($linkTokensRaw as $t) {
+        if (!is_scalar($t) || (string)$t === '') return ['error'=>'link_tokens entries must be non-empty strings'];
+        $t = (string)$t;
+        if (strlen($t) > 128) return ['error'=>'link_tokens entry too long (max 128)'];
+        $linkTokens[] = $t;
+      }
+    }
+
+    if ($customerId === null && $bookingGroupId === null && count($linkTokens) === 0) {
+      return ['error'=>'Provide at least one of customer_id, booking_group_id, link_tokens'];
+    }
+
+    $pdo = $this->db->pdo();
+
+    // Resolve the union of matching waiver_instances ids up front (bounded --
+    // this is a targeted per-subject erasure, never an unbounded table scan).
+    $clauses = [];
+    $params = [];
+    if ($customerId !== null) { $clauses[] = 'customer_id = ?'; $params[] = $customerId; }
+    if ($bookingGroupId !== null) { $clauses[] = 'booking_group_id = ?'; $params[] = $bookingGroupId; }
+    if (count($linkTokens) > 0) {
+      $in = implode(',', array_fill(0, count($linkTokens), '?'));
+      $clauses[] = 'link_token IN ('.$in.')';
+      foreach ($linkTokens as $t) { $params[] = $t; }
+    }
+    $sql = 'SELECT id FROM waiver_instances WHERE ('.implode(' OR ', $clauses).') LIMIT 500';
+    $sel = $pdo->prepare($sql); $sel->execute($params);
+    $instanceIds = array_map('intval', array_column($sel->fetchAll(), 'id'));
+
+    if (!$instanceIds) {
+      // Idempotent no-op: nothing bound to this subject (already erased, or
+      // never existed) -- still a clean 200, never a 404/500.
+      $this->auditErasure(0, 0, 0);
+      return ['instances_deleted'=>0, 'responses_deleted'=>0, 'files_deleted'=>0];
+    }
+
+    $in = implode(',', array_fill(0, count($instanceIds), '?'));
+
+    // Fetch file paths BEFORE deleting the rows that reference them.
+    $pathsQ = $pdo->prepare('SELECT pdf_path, signature_path FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
+    $pathsQ->execute($instanceIds);
+    $paths = $pathsQ->fetchAll();
+
+    $filesDeleted = 0;
+    foreach ($paths as $row) {
+      foreach (['pdf_path', 'signature_path'] as $col) {
+        $p = $row[$col] ?? null;
+        if ($p !== null && $p !== '' && is_file($p)) {
+          if (@unlink($p)) $filesDeleted++;
+        }
+      }
+    }
+
+    // Hard-delete waiver_responses FIRST (this is what purges the
+    // signature_png LONGBLOB -- the row delete itself, not the file unlink
+    // above, is what removes that PII from the DB).
+    $delResp = $pdo->prepare('DELETE FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
+    $delResp->execute($instanceIds);
+    $responsesDeleted = $delResp->rowCount();
+
+    $delInst = $pdo->prepare('DELETE FROM waiver_instances WHERE id IN ('.$in.')');
+    $delInst->execute($instanceIds);
+    $instancesDeleted = $delInst->rowCount();
+
+    $this->auditErasure($instancesDeleted, $responsesDeleted, $filesDeleted);
+
+    return [
+      'instances_deleted' => $instancesDeleted,
+      'responses_deleted' => $responsesDeleted,
+      'files_deleted' => $filesDeleted,
+    ];
+  }
+
+  // [FK-erase] Audit row for an erasure MUST contain no PII whatsoever --
+  // not the customer_id/booking_group_id/link_tokens that were erased, not
+  // guest names, nothing that identifies the subject. Counts only. entity_id
+  // is a synthetic 0 (an erasure call spans N instances, not one entity).
+  private function auditErasure(int $instancesDeleted, int $responsesDeleted, int $filesDeleted): void {
+    $this->audit('erasure', 0, 'erase_waiver', [
+      'instances_deleted' => $instancesDeleted,
+      'responses_deleted' => $responsesDeleted,
+      'files_deleted' => $filesDeleted,
+    ]);
   }
 
   public function audit(string $type, int $id, string $event, array $meta=[]): void {

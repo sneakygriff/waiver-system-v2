@@ -48,6 +48,17 @@ try {
     Utils::jsonResponse(empty($res['error']) ? 200 : 400, $res);
   }
 
+  if ($action === 'void_waiver') {
+    $res = $ctl->voidWaiver($payload);
+    if (!empty($res['error'])) {
+      // token_unknown is the one 404-shaped case (matches get_status);
+      // already_completed / missing-link_token are plain validation 400s.
+      $status = $res['error'] === 'token_unknown' ? 404 : 400;
+      Utils::jsonResponse($status, $res);
+    }
+    Utils::jsonResponse(200, $res);
+  }
+
   if ($action === 'get_status') {
     $res = $ctl->getStatus($payload);
     if (!empty($res['error'])) {
@@ -61,6 +72,11 @@ try {
 
   if ($action === 'create_walkin_group') {
     Utils::jsonResponse(200, ['group_token'=>Utils::randomToken(8)]);
+  }
+
+  if ($action === 'erase_waiver') {
+    $res = $ctl->eraseWaiver($payload);
+    Utils::jsonResponse(empty($res['error']) ? 200 : 400, $res);
   }
 
   if ($action === 'link_waivers') {

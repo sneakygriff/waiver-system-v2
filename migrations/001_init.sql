@@ -62,13 +62,14 @@ CREATE TABLE IF NOT EXISTS waiver_responses (
   signer_user_agent TEXT NULL,
   hash_sha256 CHAR(64) NOT NULL,
   pdf_path VARCHAR(512) NULL,
+  signature_path VARCHAR(512) NULL,
   created_at DATETIME NOT NULL,
   INDEX (signed_at),
   INDEX (waiver_instance_id)
 );
 CREATE TABLE IF NOT EXISTS audit_events (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
-  entity_type ENUM('template','instance','response') NOT NULL,
+  entity_type ENUM('template','instance','response','erasure') NOT NULL,
   entity_id BIGINT NOT NULL,
   event VARCHAR(64) NOT NULL,
   meta_json JSON NULL,
