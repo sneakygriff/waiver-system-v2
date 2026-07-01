@@ -71,10 +71,18 @@ class WaiverController {
     return ['has_published_version'=>(bool)$row];
   }
 
-  // [FK-T9] Reconciliation support (spec G1c): BookingV2 polls this to catch
-  // any completion whose webhook was lost. One row shape reused for both the
-  // single-token and batch-by-group paths so callers can treat them uniformly:
-  //   {status, completed_at, participant_id, evidence_sha256, answers_hash}
+  // [FK-T9, extended BK-T14] Reconciliation support (spec G1c): BookingV2
+  // polls this to catch any completion whose webhook was lost, then replays
+  // the SAME ingestion logic used for the webhook (binding check + Gap4
+  // age-gate + Gap3 consent flow-back). That means this row shape MUST carry
+  // every field the webhook body carries (spec G1b), not just a status flag
+  // -- otherwise the reconciliation caller cannot re-run the completion path
+  // and would have to trust an unverified/unbound claim. One row shape reused
+  // for both the single-token and batch-by-group paths:
+  //   {waiver_instance_id, link_token, status, completed_at, participant_id,
+  //    customer_id, booking_group_id, birth_date, computed_age, minor,
+  //    parental_consent_name, waiver_consent_granted, evidence_sha256,
+  //    answers_hash, signer_full_name}
   // - status: the fork's raw waiver_instances.status ("pending"|"completed"|"void").
   // - completed_at: ISO-8601 UTC string, or null if not completed.
   // - evidence_sha256: object-store bytes hash (Gap2). T15 (presigned-PUT
@@ -85,18 +93,43 @@ class WaiverController {
   //   i.e. waiver_responses.hash_sha256 (computed in submitGuestForm over
   //   {template_version_id, instance_id, answers, signed_at, signer_ip, ua}).
   //   Null until the guest actually submits.
+  // - birth_date/computed_age/minor/parental_consent_name/waiver_consent_granted:
+  //   decoded from waiver_responses.answers_json, which submitGuestForm()
+  //   stashes under the fixed '_computed_age'/'_minor'/'_parental_consent_name'
+  //   keys (age-gate) and 'waiver_consent_granted' key (Gap3 consent, Wave-2,
+  //   present only when the guest actually ticked it) -- mirrors exactly what
+  //   notifyBookingV2Completion() puts on the webhook body so the SAME
+  //   ingestion logic can be replayed regardless of which path (webhook or
+  //   reconciliation) delivered the completion. birth_date is not persisted
+  //   verbatim in answers_json (only the derived _computed_age is), so it is
+  //   always null here -- fine, since BookingV2's ingestion only consumes
+  //   computed_age/parental_consent_name for the age-gate re-check.
   private function statusRow(array $row): array {
+    $answers = [];
+    if (isset($row['answers_json']) && $row['answers_json'] !== null) {
+      $decoded = json_decode((string)$row['answers_json'], true);
+      if (is_array($decoded)) $answers = $decoded;
+    }
     return [
-      'link_token'      => (string)$row['link_token'],
-      'status'          => (string)$row['status'],
-      'completed_at'    => $row['completed_at'] !== null ? gmdate('c', strtotime($row['completed_at'].' UTC')) : null,
-      'participant_id'  => $row['participant_id'] !== null ? (string)$row['participant_id'] : null,
-      'evidence_sha256' => null, // [Gap2] populated once T15 object-store upload lands.
-      'answers_hash'    => isset($row['hash_sha256']) && $row['hash_sha256'] !== null ? (string)$row['hash_sha256'] : null,
+      'waiver_instance_id'     => (int)$row['id'],
+      'link_token'             => (string)$row['link_token'],
+      'status'                 => (string)$row['status'],
+      'completed_at'           => $row['completed_at'] !== null ? gmdate('c', strtotime($row['completed_at'].' UTC')) : null,
+      'participant_id'         => $row['participant_id'] !== null ? (string)$row['participant_id'] : null,
+      'customer_id'            => $row['customer_id'] !== null ? (string)$row['customer_id'] : null,
+      'booking_group_id'       => $row['booking_group_id'] !== null ? (string)$row['booking_group_id'] : null,
+      'birth_date'             => null, // not persisted verbatim in answers_json, see doc above.
+      'computed_age'           => isset($answers['_computed_age']) ? (int)$answers['_computed_age'] : null,
+      'minor'                  => isset($answers['_minor']) ? (bool)$answers['_minor'] : null,
+      'parental_consent_name'  => $answers['_parental_consent_name'] ?? null,
+      'waiver_consent_granted' => ($answers[self::CONSENT_ANSWER_KEY] ?? null) === true ? true : null,
+      'evidence_sha256'        => null, // [Gap2] populated once T15 object-store upload lands.
+      'answers_hash'           => isset($row['hash_sha256']) && $row['hash_sha256'] !== null ? (string)$row['hash_sha256'] : null,
+      'signer_full_name'       => $row['signer_full_name'] ?? null,
     ];
   }
 
-  private const STATUS_SELECT = 'SELECT wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wr.hash_sha256
+  private const STATUS_SELECT = 'SELECT wi.id, wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wi.booking_group_id, wr.hash_sha256, wr.answers_json, wr.signer_full_name
      FROM waiver_instances wi
      LEFT JOIN waiver_responses wr ON wr.waiver_instance_id = wi.id';
 
