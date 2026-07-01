@@ -129,6 +129,10 @@ if ($action === 'publish') {
     $desc  = $_POST['description'] ?? '';
     $contentHtml = $_POST['content_html'] ?? null;
     $printCss = $_POST['print_css'] ?? null;
+    $decodedFields = json_decode($fields, true);
+    if (json_last_error() !== JSON_ERROR_NONE) { http_response_code(400); exit('Invalid Fields JSON: '.htmlspecialchars(json_last_error_msg())); }
+    if (!is_array($decodedFields) || array_values($decodedFields) !== $decodedFields) { http_response_code(400); exit('Fields JSON must be a JSON array of field objects.'); }
+    foreach ($decodedFields as $f) { if (!is_array($f) || !isset($f['key']) || !is_scalar($f['key']) || (string)$f['key'] === '') { http_response_code(400); exit('Each field must be an object with a non-empty "key".'); } }
     $admin->publishVersion($tid, $title, $desc, $fields, $_SESSION['admin_id'], $contentHtml, $printCss);
     header('Location: /admin.php'); exit;
   }
@@ -181,6 +185,7 @@ if ($action === 'home') {
 
   <div class="mb-4">
     <form method="post" action="/admin.php?action=create_template" class="d-flex gap-2">
+      <input type="hidden" name="csrf" value="<?=htmlspecialchars($csrf)?>">
       <input class="form-control" name="name" placeholder="New template name" required>
       <button class="btn btn-success">Create</button>
     </form>
@@ -337,6 +342,9 @@ if ($action === 'home') {
 }
 
 if ($action === 'create_template' && $_SERVER['REQUEST_METHOD']==='POST') {
-  $id = $admin->createTemplate($_POST['name'], $_SESSION['admin_id']);
+  if (!hash_equals($_SESSION['csrf'] ?? '', $_POST['csrf'] ?? '')) { http_response_code(403); exit('Invalid CSRF token'); }
+  $name = trim($_POST['name'] ?? '');
+  if ($name === '') { header('Location: /admin.php?err=name_required'); exit; }
+  $admin->createTemplate($name, $_SESSION['admin_id']);
   header('Location: /admin.php'); exit;
 }

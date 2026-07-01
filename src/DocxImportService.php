@@ -10,6 +10,9 @@ class DocxImportService {
     $phpWord = IOFactory::load($docxPath, 'Word2007');
     $writer = new HTML($phpWord);
     ob_start(); $writer->save('php://output'); $rawHtml = ob_get_clean();
+    // PHPWord emits a full <html><head><body> document; keep only the body's inner
+    // content so it isn't nested inside w.php's own document shell.
+    if (preg_match('#<body[^>]*>(.*)</body>#is', $rawHtml, $bm)) { $rawHtml = $bm[1]; }
     $html = preg_replace('/\s+/', ' ', $rawHtml);
 
     $html = preg_replace('/\{\{\s*signature\s*\}\}/i', '[signature]', $html);
@@ -39,7 +42,7 @@ class DocxImportService {
   }
   private function parseAttributes(string $s): array {
     $out=[];
-    $re='/([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"|([a-zA-Z0-9_]+)\s*=\s*\'+"'" + r"([^']*)" + "'" + r'|([a-zA-Z0-9_]+)\s*=\s*([^\s"]+)/';
+    $re='/([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"|([a-zA-Z0-9_]+)\s*=\s*\'([^\']*)\'|([a-zA-Z0-9_]+)\s*=\s*([^\s"]+)/';
     if (preg_match_all($re,$s,$m,PREG_SET_ORDER)) {
       foreach ($m as $mm) {
         if (!empty($mm[1])) $out[$mm[1]]=$mm[2];

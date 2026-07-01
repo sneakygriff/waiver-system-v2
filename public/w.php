@@ -13,6 +13,17 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
   else { $ok = true; $artifact = $res['artifact'] ?? null; }
 }
 
+if (!empty($ok)) {
+  // Submission succeeded and the instance is now 'completed', so re-fetching via
+  // renderGuestForm() would reject it ("already completed"). Render a standalone
+  // thank-you page directly instead of clobbering the success path.
+  ?><!doctype html><html><head><meta charset="utf-8"><title>Waiver complete</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+  <body class="container py-4"><div class="alert alert-success">Thank you! Your waiver is complete.</div></body></html><?php
+  exit;
+}
+
 $data = $ctl->renderGuestForm($token);
 if (!empty($data['error'])) { http_response_code(404); echo htmlspecialchars($data['error']); exit; }
 $instance = $data['instance']; $fields = $data['fields'];

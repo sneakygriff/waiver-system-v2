@@ -11,6 +11,12 @@ class WaiverController {
     $guest_email=$payload['guest_email']??null;
     $group_token=$payload['group_token']??null;
     if(!$template_id){ return ['error'=>'template_id is required']; }
+    if(!is_scalar($template_id)) return ['error'=>'template_id must be a scalar'];
+    foreach(['reservation_id'=>$reservation_id,'guest_name'=>$guest_name,'guest_email'=>$guest_email,'group_token'=>$group_token] as $k=>$val){ if($val!==null && !is_scalar($val)) return ['error'=>$k.' must be a string']; }
+    if($reservation_id!==null && strlen((string)$reservation_id)>64) return ['error'=>'reservation_id too long (max 64)'];
+    if($group_token!==null && strlen((string)$group_token)>16) return ['error'=>'group_token too long (max 16)'];
+    if($guest_name!==null && strlen((string)$guest_name)>255) return ['error'=>'guest_name too long (max 255)'];
+    if($guest_email!==null && strlen((string)$guest_email)>255) return ['error'=>'guest_email too long (max 255)'];
     $v=$this->db->pdo()->prepare('SELECT id, version, fields_json, title FROM waiver_template_versions WHERE template_id=? ORDER BY version DESC LIMIT 1');
     $v->execute([$template_id]); $version=$v->fetch(); if(!$version) return ['error'=>'No published version for template'];
     $token=Utils::randomToken(32);
@@ -21,58 +27,99 @@ class WaiverController {
     return ['waiver_id'=>$id,'link'=>$link,'group_token'=>$group_token];
   }
 
+  // Decode fields_json defensively: tolerate a non-array/non-list, or field
+  // objects missing key/label/type/options, so a malformed template can never
+  // fatal the guest page. Fills safe defaults.
+  private function normalizeFields($fieldsJson): array {
+    $raw=json_decode((string)$fieldsJson, true); if(!is_array($raw)) return [];
+    $out=[];
+    foreach($raw as $f){
+      if(!is_array($f) || !isset($f['key']) || !is_scalar($f['key']) || (string)$f['key']==='') continue;
+      $key=(string)$f['key'];
+      $out[]=[
+        'key'=>$key,
+        'label'=>(isset($f['label'])&&is_scalar($f['label']))?(string)$f['label']:ucwords(str_replace('_',' ',$key)),
+        'type'=>(isset($f['type'])&&is_scalar($f['type']))?(string)$f['type']:'text',
+        'required'=>!empty($f['required']),
+        'options'=>(isset($f['options'])&&is_array($f['options']))?array_values($f['options']):[],
+        'maxLength'=>(isset($f['maxLength'])&&is_scalar($f['maxLength']))?(int)$f['maxLength']:255,
+      ];
+    }
+    return $out;
+  }
+
   public function renderGuestForm(string $token): array {
     $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.title, wtv.description, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $row=$q->fetch();
     if(!$row) return ['error'=>'Invalid link']; if($row['status']==='completed') return ['error'=>'This waiver has already been completed.'];
-    $fields=json_decode($row['fields_json'],true)??[]; return ['instance'=>$row,'fields'=>$fields];
+    return ['instance'=>$row,'fields'=>$this->normalizeFields($row['fields_json'])];
   }
 
   public function submitGuestForm(string $token, array $post): array {
     $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $instance=$q->fetch(); if(!$instance) return ['error'=>'Invalid link']; if($instance['status']==='completed') return ['error'=>'Already completed'];
-    $fields=json_decode($instance['fields_json'], true)??[]; $answers=[];
+    $fields=$this->normalizeFields($instance['fields_json']); $answers=[];
     foreach($fields as $f){ $key=$f['key']; $val=$post[$key]??null; if(!empty($f['required']) && ($val===null || $val==='')) return ['error'=>'Missing field: '.$key]; $answers[$key]=$val; }
+    if(isset($post['full_name']) && strlen((string)$post['full_name'])>255) return ['error'=>'Full name is too long (max 255 characters).'];
 
     $sigData=$post['signature_data']??''; if(!preg_match('#^data:image/png;base64,#',$sigData)) return ['error'=>'Missing signature'];
-    $png=base64_decode(substr($sigData,22)); $sigDir=$this->cfg['storage']['signatures_path']; if(!is_dir($sigDir)) @mkdir($sigDir,0775,true);
-    $sigFile=$sigDir.'/'.Utils::randomToken(16).'.png'; file_put_contents($sigFile,$png);
+    $png=base64_decode(substr($sigData,22));
+    if($png===false || strncmp($png,"\x89PNG\r\n\x1a\n",8)!==0) return ['error'=>'Invalid signature image'];
+    if(strlen($png) > 2*1024*1024) return ['error'=>'Signature image too large'];
 
-    $signedAt=gmdate('c'); $payload=[ 'template_version_id'=>(int)$instance['version_id'], 'instance_id'=>(int)$instance['id'], 'answers'=>$answers, 'signed_at'=>$signedAt, 'signer_ip'=>$_SERVER['REMOTE_ADDR']??null, 'ua'=>$_SERVER['HTTP_USER_AGENT']??null ];
-    $hash=hash('sha256', json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
+    // Atomically claim this instance so two concurrent submits of the same token
+    // cannot both proceed (prevents the duplicate-key race and orphaned files).
+    $pdo=$this->db->pdo();
+    $claim=$pdo->prepare('UPDATE waiver_instances SET status="completed", completed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP() WHERE id=? AND status="pending"');
+    $claim->execute([$instance['id']]);
+    if($claim->rowCount()===0) return ['error'=>'Already completed'];
 
-    $html = '<h1>'.htmlspecialchars($instance['title']).'</h1>';
-    $html .= '<p>Signed at: '.htmlspecialchars($signedAt).'</p>';
-    $html .= '<h3>Answers</h3><ul>';
-    foreach ($answers as $k=>$v){ $html.='<li><strong>'.htmlspecialchars($k).':</strong> '.htmlspecialchars((string)$v).'</li>'; }
-    $html .= '</ul>';
-    $html .= '<h3>Signature</h3><img src="data:image/png;base64,'.base64_encode($png).'" style="max-width:300px;border:1px solid #ccc;" />';
+    $sigDir=$this->cfg['storage']['signatures_path']; if(!is_dir($sigDir)) @mkdir($sigDir,0775,true);
+    $sigFile=$sigDir.'/'.Utils::randomToken(16).'.png'; $artifact=null;
+    try {
+      file_put_contents($sigFile,$png);
+      $signedAt=gmdate('c'); $payload=[ 'template_version_id'=>(int)$instance['version_id'], 'instance_id'=>(int)$instance['id'], 'answers'=>$answers, 'signed_at'=>$signedAt, 'signer_ip'=>$_SERVER['REMOTE_ADDR']??null, 'ua'=>$_SERVER['HTTP_USER_AGENT']??null ];
+      $hash=hash('sha256', json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
 
-    $answers['_signature_png_base64']=base64_encode($png);
-    $filledHtml = !empty($instance['content_html']) ? $this->renderContentForPdf($instance['content_html'], $answers, $instance['print_css'] ?? null) : $html;
+      $html = '<h1>'.htmlspecialchars($instance['title']).'</h1>';
+      $html .= '<p>Signed at: '.htmlspecialchars($signedAt).'</p>';
+      $html .= '<h3>Answers</h3><ul>';
+      foreach ($answers as $k=>$v){ $html.='<li><strong>'.htmlspecialchars($k).':</strong> '.htmlspecialchars((string)$v).'</li>'; }
+      $html .= '</ul>';
+      $html .= '<h3>Signature</h3><img src="data:image/png;base64,'.base64_encode($png).'" style="max-width:300px;border:1px solid #ccc;" />';
 
-    $pdf=new PdfService($this->cfg['storage']['artifacts_path']); $basename=date('Ymd').'_'.$instance['id'].'_'.substr($hash,0,8);
-    $artifact=$pdf->generate($filledHtml, $basename);
+      $answers['_signature_png_base64']=base64_encode($png);
+      $filledHtml = !empty($instance['content_html']) ? $this->renderContentForPdf($instance['content_html'], $answers, $instance['print_css'] ?? null) : $html;
 
-    $this->db->pdo()->beginTransaction();
-    $stmt=$this->db->pdo()->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, UTC_TIMESTAMP())');
-    $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $artifact]);
-    $this->db->pdo()->prepare('UPDATE waiver_instances SET status="completed", completed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP() WHERE id=?')->execute([$instance['id']]);
-    $this->audit('response', $instance['id'], 'submitted', $payload);
-    $this->db->pdo()->commit();
+      $pdf=new PdfService($this->cfg['storage']['artifacts_path']); $basename=date('Ymd').'_'.$instance['id'].'_'.substr($hash,0,8);
+      $artifact=$pdf->generate($filledHtml, $basename);
+
+      $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, UTC_TIMESTAMP())');
+      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $artifact]);
+      $this->audit('response', $instance['id'], 'submitted', $payload);
+    } catch (\Throwable $e) {
+      // Roll the claim back so the guest can retry; remove any orphaned files.
+      $pdo->prepare('UPDATE waiver_instances SET status="pending", completed_at=NULL, updated_at=UTC_TIMESTAMP() WHERE id=? AND status="completed"')->execute([$instance['id']]);
+      if(is_file($sigFile)) @unlink($sigFile);
+      if($artifact && is_file($artifact)) @unlink($artifact);
+      return ['error'=>'Could not save waiver, please try again.'];
+    }
 
     return ['ok'=>true,'artifact'=>$artifact];
   }
 
   public function linkWaiversToReservation(string $reservationId, array $waiverIds=[], ?string $groupToken=null, bool $includePending=false): array {
     if(!$reservationId) return ['error'=>'reservation_id is required'];
+    if(strlen($reservationId)>64) return ['error'=>'reservation_id too long (max 64)'];
     if(empty($waiverIds) && !$groupToken) return ['error'=>'Provide waiver_ids or group_token'];
+    // 'void' instances are NEVER eligible; pending only when include_pending=true.
+    $statusClause=' AND status IN ("completed"'.($includePending?',"pending"':'').')';
     if($groupToken){
-      $sql='SELECT id FROM waiver_instances WHERE group_token=?'; if(!$includePending){ $sql.=' AND status="completed"'; }
+      $sql='SELECT id FROM waiver_instances WHERE group_token=?'.$statusClause;
       $sel=$this->db->pdo()->prepare($sql); $sel->execute([$groupToken]); $ids=array_column($sel->fetchAll(),'id');
     } else {
       $ids=array_values(array_filter(array_map('intval',$waiverIds))); if(!$ids) return ['error'=>'No valid waiver_ids'];
-      $in=implode(',',array_fill(0,count($ids),'?')); $sql='SELECT id FROM waiver_instances WHERE id IN ('.$in.')'; if(!$includePending){ $sql.=' AND status="completed"'; }
+      $in=implode(',',array_fill(0,count($ids),'?')); $sql='SELECT id FROM waiver_instances WHERE id IN ('.$in.')'.$statusClause;
       $sel=$this->db->pdo()->prepare($sql); $sel->execute($ids); $ids=array_column($sel->fetchAll(),'id');
     }
     if(!$ids) return ['updated'=>0,'ids'=>[]];
@@ -88,7 +135,7 @@ class WaiverController {
 
   // -------- Rendering helpers for formatted templates --------
   private function parseAttrs(string $s): array {
-    $out=[]; $re='/([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"|([a-zA-Z0-9_]+)\s*=\s*\'+"'" + r"([^']*)" + "'" + r'|([a-zA-Z0-9_]+)\s*=\s*([^\s"]+)/';
+    $out=[]; $re='/([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"|([a-zA-Z0-9_]+)\s*=\s*\'([^\']*)\'|([a-zA-Z0-9_]+)\s*=\s*([^\s"]+)/';
     if (preg_match_all($re,$s,$m,PREG_SET_ORDER)) {
       foreach ($m as $mm){ if(!empty($mm[1])) $out[$mm[1]]=$mm[2]; elseif(!empty($mm[3])) $out[$mm[3]]=$mm[4]; elseif(!empty($mm[5])) $out[$mm[5]]=$mm[6]; }
     }
@@ -98,7 +145,7 @@ class WaiverController {
     $html=preg_replace_callback('#\[field\s+([^\]]+)\]#', function($m){
       $a=$this->parseAttrs($m[1]); $key=$a['key']??''; $type=$a['type']??'text'; $req=!empty($a['required'])?'required':'';
       if($type==='radio'){ $opts=isset($a['options'])?explode('|',$a['options']):['Yes','No']; $out='<span class="d-inline-block">'; foreach($opts as $o){ $out.='<label class="me-3"><input class="form-check-input me-1" type="radio" name="'.htmlspecialchars($key).'" value="'.htmlspecialchars($o).'" '.$req.'>'.htmlspecialchars($o).'</label>'; } return $out.'</span>'; }
-      if($type==='textarea'){ return '<textarea name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:100%; min-height:80px; border:1px solid #ccc;">'</textarea>'; }
+      if($type==='textarea'){ return '<textarea name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:100%; min-height:80px; border:1px solid #ccc;"></textarea>'; }
       return '<input name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:auto; min-width:220px; padding:2px 6px; border:none; border-bottom:1px solid #000;" '.$req.'>';
     }, $html);
     $html=preg_replace('#\[signature(?:\s+[^\]]+)?\]#','<div class="mb-2"><label class="form-label">Signature *</label><canvas id="sig" style="border:1px solid #ccc; width:100%; max-width:480px; height:180px"></canvas><input type="hidden" name="signature_data" id="signature_data" required><button type="button" id="clear" class="btn btn-sm btn-outline-secondary mt-2">Clear</button></div>',$html);
