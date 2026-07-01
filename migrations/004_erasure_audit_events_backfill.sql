@@ -1,0 +1,64 @@
+-- 004_erasure_audit_events_backfill.sql
+-- [W2 / F1-fork-erasure] GDPR erase_waiver hardening: eraseWaiver() now ALSO
+-- deletes every audit_events row tied to the erased waiver_instances ids
+-- (entity_type IN ('instance','response') AND entity_id IN (...)) inside the
+-- SAME transaction as the waiver_instances/waiver_responses DELETEs -- see
+-- WaiverController::eraseWaiver(). This file is NOT a schema change (no DDL
+-- needed: audit_events already carries INDEX (entity_type, entity_id,
+-- created_at) from 001_init.sql, which is exactly the composite the new
+-- DELETE's WHERE clause uses). It documents the ONE-TIME ops backfill needed
+-- to close the gap for subjects whose erase_waiver call ran BEFORE this fix
+-- landed: their waiver_instances/waiver_responses rows are already gone, but
+-- any audit_events rows referencing those now-nonexistent instance ids
+-- (in particular entity_type='response', event='submitted', whose meta_json
+-- carries the full guest answers payload -- name, DOB, medical fields,
+-- signer_ip/ua) were left behind and still constitute retained PII.
+--
+-- NOTE: this fork has NO migration runner. Hand-apply via:
+--   docker compose exec -T db mysql -u root -prootpw waiver_db < migrations/004_erasure_audit_events_backfill.sql
+--
+-- ============================================================================
+-- STEP 1 (READ-ONLY, run first): identify orphaned audit_events rows, i.e.
+-- entity_type IN ('instance','response') rows whose entity_id no longer
+-- matches any live waiver_instances.id. These are EITHER:
+--   (a) rows left behind by a pre-fix erase_waiver call (the backfill target), or
+--   (b) rows for an instance id that was simply never issued yet (impossible
+--       in practice -- ids are only referenced by audit() calls made from
+--       code paths that already have a real waiver_instances row -- but the
+--       query is still scoped defensively).
+-- Inspect the count/sample before deleting anything:
+--
+--   SELECT entity_type, COUNT(*) AS orphaned_count
+--   FROM audit_events ae
+--   WHERE ae.entity_type IN ('instance','response')
+--     AND NOT EXISTS (SELECT 1 FROM waiver_instances wi WHERE wi.id = ae.entity_id)
+--   GROUP BY entity_type;
+--
+--   -- Sample the actual PII-bearing rows (guest answers) before deleting, if
+--   -- an operator wants to confirm these are genuinely pre-fix erasure
+--   -- leftovers (e.g. their created_at predates the erasure event that should
+--   -- have removed them, or there is a matching entity_type='erasure' audit
+--   -- row with a nearby created_at and no corresponding surviving instance):
+--   SELECT id, entity_type, entity_id, event, created_at
+--   FROM audit_events
+--   WHERE entity_type IN ('instance','response')
+--     AND entity_id NOT IN (SELECT id FROM waiver_instances)
+--   ORDER BY created_at DESC
+--   LIMIT 100;
+--
+-- ============================================================================
+-- STEP 2 (DESTRUCTIVE, run only after reviewing Step 1's output): delete the
+-- confirmed-orphaned rows. Safe to re-run (idempotent -- a second run finds
+-- nothing left to delete).
+--
+--   DELETE ae FROM audit_events ae
+--   WHERE ae.entity_type IN ('instance','response')
+--     AND NOT EXISTS (SELECT 1 FROM waiver_instances wi WHERE wi.id = ae.entity_id);
+--
+-- ============================================================================
+-- This file intentionally issues NO DDL and is not auto-applied; it exists so
+-- `schema_migrations` gets a marker row once an operator has reviewed and run
+-- the backfill above, letting a future audit confirm the backfill happened.
+-- Insert this marker ONLY after actually running the Step 2 DELETE above:
+--
+--   INSERT INTO schema_migrations (version, applied_at) VALUES ('004_erasure_audit_events_backfill', NOW());

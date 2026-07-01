@@ -1,7 +1,17 @@
 <?php
 require __DIR__.'/../vendor/autoload.php';
 $cfg = require __DIR__.'/../config/config.php';
-use App\{Database, Auth, AdminController};
+use App\{Database, Auth, AdminController, Utils};
+
+// [W7] Fail-closed boot sentinel -- see Utils::assertNoPlaceholderSecrets doc.
+// The admin UI is not a signed-envelope endpoint itself, but it shares this
+// same config file and must never come up misconfigured either.
+try {
+  Utils::assertNoPlaceholderSecrets($cfg);
+} catch (\Throwable $e) {
+  http_response_code(500);
+  exit('Server misconfigured: placeholder secret(s) still present. Refusing to start.');
+}
 
 $db = new Database($cfg['db']);
 $action = $_GET['action'] ?? 'home';

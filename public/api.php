@@ -7,6 +7,17 @@ use App\{Database, WaiverController, Utils};
 ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
+// [W7] Fail-closed boot sentinel: refuse to serve ANY request if the loaded
+// config still carries a placeholder secret (see Utils::assertNoPlaceholderSecrets
+// doc). Runs before Database/WaiverController construction and before the
+// signed-envelope check below, so a misconfigured deploy never even reaches
+// the point of accepting/signing a request with a known-public secret.
+try {
+  Utils::assertNoPlaceholderSecrets($cfg);
+} catch (\Throwable $e) {
+  Utils::jsonResponse(500, ['error'=>'internal server error']);
+}
+
 // [FK-T7] Verify the signed envelope (timestamp + nonce + key_id + signature)
 // over the EXACT raw bytes received, before any defaulting or JSON-decoding —
 // so a caller that honestly signs an empty body isn't rejected, and signing

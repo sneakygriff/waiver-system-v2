@@ -3,3 +3,4 @@ config/config.php
 storage/
 vendor/
 .DS_Store
+.phpunit.result.cache

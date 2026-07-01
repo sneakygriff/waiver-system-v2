@@ -191,6 +191,21 @@ class WaiverController {
   //     caller erase the "was this signed" signal without going through the
   //     real GDPR erase_waiver path)
   //   - pending                  -> atomic claim to 'void', audited, {ok:true}
+  //
+  // [W6 / orphaned instances] "Orphaned" here means the instance this call
+  // targets has been concurrently HARD-DELETED by eraseWaiver (fork-client.ts
+  // voidWaiverInstance's own doc calls the pre-GDPR-erase case "a harmless
+  // orphaned pending instance" -- but once GDPR erasure runs, that same row
+  // can vanish out from under an in-flight void call entirely, not just
+  // change status). Two race windows, both handled the same way -- treat a
+  // vanished row as EXACTLY equivalent to "unknown token", never as
+  // "already_completed":
+  //   1. between the initial SELECT and the UPDATE claim below, OR
+  //   2. between the UPDATE claim (0 rows affected) and the re-check SELECT.
+  // Without this, a void racing an erasure would previously fall through the
+  // re-check's `if ($now && ...)` (both false when the row is gone) into the
+  // catch-all `return ['error'=>'already_completed']` -- a misleading 400 for
+  // a token that was never completed at all, just erased.
   public function voidWaiver(array $payload): array {
     $linkToken = $payload['link_token'] ?? null;
     if ($linkToken === null || !is_scalar($linkToken) || (string)$linkToken === '') {
@@ -219,11 +234,22 @@ class WaiverController {
     $claim = $pdo->prepare('UPDATE waiver_instances SET status="void", updated_at=UTC_TIMESTAMP() WHERE id=? AND status="pending"');
     $claim->execute([(int)$row['id']]);
     if ($claim->rowCount() === 0) {
-      // Lost the race: re-check what it became (completed or void) and report accordingly.
+      // Lost the race: re-check what it became (completed, void, or GONE --
+      // erased concurrently) and report accordingly.
       $recheck = $pdo->prepare('SELECT status FROM waiver_instances WHERE id=? LIMIT 1');
       $recheck->execute([(int)$row['id']]);
       $now = $recheck->fetch();
-      if ($now && $now['status'] === 'void') return ['ok'=>true, 'already_void'=>true];
+      if (!$now) {
+        // [W6] The row no longer exists at all: a concurrent eraseWaiver call
+        // deleted it out from under this void (orphaned-instance race). The
+        // GDPR erasure already made the token permanently unusable (the row
+        // is gone, so submitGuestForm/renderGuestForm will 404 it via
+        // "Invalid link" regardless) -- report the same shape a caller would
+        // get by re-querying this token now, i.e. 'token_unknown', never the
+        // misleading 'already_completed'.
+        return ['error'=>'token_unknown'];
+      }
+      if ($now['status'] === 'void') return ['ok'=>true, 'already_void'=>true];
       return ['error'=>'already_completed'];
     }
 
@@ -720,15 +746,36 @@ class WaiverController {
   // and/or booking_group_id and/or link_tokens), hard-delete every matching
   // waiver_instances row, its waiver_responses row (which hard-deletes the
   // signature_png LONGBLOB -- the DB is the ONLY durable store of that
-  // blob), and the storage/ PDF + signature files on disk (pdf_path +
-  // signature_path). Idempotent: matching nothing is success, count:0, never
-  // an error -- a second erase call for an already-erased customer/group/
-  // token set must not fail.
+  // blob), the storage/ PDF + signature files on disk (pdf_path +
+  // signature_path), AND every audit_events row tied to those instances
+  // (see the audit_events DELETE inline below -- the 'submitted' response
+  // event in particular carries the full guest answers payload, which is
+  // PII). Idempotent: matching nothing is success, count:0, never an error
+  // -- a second erase call for an already-erased customer/group/token set
+  // must not fail.
   //
   // Binding is a UNION of whichever fields are provided (matches Model A's
   // "given a binding ... DELETE" framing -- any of the three identifies rows
   // to erase, not an AND of all three). At least one binding field is
   // required, else 400 (an unbounded erase-everything call is never valid).
+  //
+  // [W2] Everything below the id-resolution step runs inside a single DB
+  // transaction: file unlinks are best-effort (filesystem has no rollback),
+  // but ALL the DELETEs (waiver_responses, waiver_instances, audit_events)
+  // must land atomically -- a mid-failure (e.g. a deadlock on the
+  // audit_events DELETE) must never leave a half-erased subject (e.g.
+  // waiver_responses purged but waiver_instances or audit_events still
+  // carrying PII). On any \Throwable the transaction is rolled back and the
+  // error is surfaced to the caller (BookingV2's erasure worker retries the
+  // whole call per its outbox backoff -- see waiver-erasure-worker.ts).
+  //
+  // [W2] The id-resolution SELECT is paginated rather than a single
+  // LIMIT-500 query, so a subject bound to more than 500 waiver_instances
+  // rows (a customer with a long booking history) still gets a COMPLETE
+  // erasure in one call, not a silent partial one that a caller might mistake
+  // for "done".
+  private const ERASE_PAGE_SIZE = 500;
+
   public function eraseWaiver(array $payload): array {
     $customerId = $payload['customer_id'] ?? null;
     $bookingGroupId = $payload['booking_group_id'] ?? null;
@@ -765,8 +812,11 @@ class WaiverController {
 
     $pdo = $this->db->pdo();
 
-    // Resolve the union of matching waiver_instances ids up front (bounded --
-    // this is a targeted per-subject erasure, never an unbounded table scan).
+    // Resolve the FULL union of matching waiver_instances ids up front, one
+    // page at a time (never a single LIMIT-500 query -- see class doc above).
+    // This is still a targeted per-subject lookup (bounded by how many rows
+    // one customer/group/token-set can plausibly bind), just not capped at an
+    // arbitrary page size.
     $clauses = [];
     $params = [];
     if ($customerId !== null) { $clauses[] = 'customer_id = ?'; $params[] = $customerId; }
@@ -776,51 +826,111 @@ class WaiverController {
       $clauses[] = 'link_token IN ('.$in.')';
       foreach ($linkTokens as $t) { $params[] = $t; }
     }
-    $sql = 'SELECT id FROM waiver_instances WHERE ('.implode(' OR ', $clauses).') LIMIT 500';
-    $sel = $pdo->prepare($sql); $sel->execute($params);
-    $instanceIds = array_map('intval', array_column($sel->fetchAll(), 'id'));
+    $whereSql = implode(' OR ', $clauses);
+
+    $instanceIds = [];
+    $lastId = 0;
+    while (true) {
+      // Keyset pagination on id (> lastId) rather than OFFSET, so previously
+      // fetched rows (which are NOT yet deleted -- deletion only happens
+      // after the full id set is known) never shift the window and cause a
+      // skipped/duplicated row.
+      $sql = 'SELECT id FROM waiver_instances WHERE ('.$whereSql.') AND id > ? ORDER BY id ASC LIMIT '.self::ERASE_PAGE_SIZE;
+      $sel = $pdo->prepare($sql);
+      $sel->execute(array_merge($params, [$lastId]));
+      $page = array_map('intval', array_column($sel->fetchAll(), 'id'));
+      if (!$page) break;
+      foreach ($page as $id) { $instanceIds[] = $id; }
+      $lastId = end($page);
+      if (count($page) < self::ERASE_PAGE_SIZE) break;
+    }
 
     if (!$instanceIds) {
       // Idempotent no-op: nothing bound to this subject (already erased, or
       // never existed) -- still a clean 200, never a 404/500.
-      $this->auditErasure(0, 0, 0);
-      return ['instances_deleted'=>0, 'responses_deleted'=>0, 'files_deleted'=>0];
+      $this->auditErasure(0, 0, 0, 0);
+      return ['instances_deleted'=>0, 'responses_deleted'=>0, 'files_deleted'=>0, 'audit_events_deleted'=>0];
     }
 
-    $in = implode(',', array_fill(0, count($instanceIds), '?'));
+    $pdo->beginTransaction();
+    try {
+      $filesDeleted = 0;
+      $responsesDeleted = 0;
+      $instancesDeleted = 0;
+      $auditEventsDeleted = 0;
 
-    // Fetch file paths BEFORE deleting the rows that reference them.
-    $pathsQ = $pdo->prepare('SELECT pdf_path, signature_path FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
-    $pathsQ->execute($instanceIds);
-    $paths = $pathsQ->fetchAll();
+      // Process instance ids in pages inside the SAME transaction (a giant
+      // single IN(...) list is bounded by ERASE_PAGE_SIZE per statement to
+      // stay well under MySQL's max_allowed_packet / placeholder limits even
+      // when a subject binds many thousands of rows).
+      foreach (array_chunk($instanceIds, self::ERASE_PAGE_SIZE) as $chunk) {
+        $in = implode(',', array_fill(0, count($chunk), '?'));
 
-    $filesDeleted = 0;
-    foreach ($paths as $row) {
-      foreach (['pdf_path', 'signature_path'] as $col) {
-        $p = $row[$col] ?? null;
-        if ($p !== null && $p !== '' && is_file($p)) {
-          if (@unlink($p)) $filesDeleted++;
+        // Fetch file paths BEFORE deleting the rows that reference them.
+        $pathsQ = $pdo->prepare('SELECT pdf_path, signature_path FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
+        $pathsQ->execute($chunk);
+        $paths = $pathsQ->fetchAll();
+
+        foreach ($paths as $row) {
+          foreach (['pdf_path', 'signature_path'] as $col) {
+            $p = $row[$col] ?? null;
+            if ($p !== null && $p !== '' && is_file($p)) {
+              if (@unlink($p)) $filesDeleted++;
+            }
+          }
         }
+
+        // Hard-delete waiver_responses FIRST (this is what purges the
+        // signature_png LONGBLOB -- the row delete itself, not the file
+        // unlink above, is what removes that PII from the DB).
+        $delResp = $pdo->prepare('DELETE FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
+        $delResp->execute($chunk);
+        $responsesDeleted += $delResp->rowCount();
+
+        // [W2 / audit_events PII] Delete every audit_events row keyed to
+        // these instances -- entity_type IN ('instance','response') with
+        // entity_id IN (chunk). This is the same instance id for both types
+        // (WaiverController::audit('response', $instance['id'], ...) reuses
+        // the waiver_instances.id, never waiver_responses.id -- see
+        // submitGuestForm's 'submitted' audit call), so one IN-clause on
+        // entity_id covers the 'created'/'voided'/'age_gate_rejected'/
+        // 'submitted'/'webhook_failed'/'evidence_upload_failed'/
+        // 'linked_to_reservation' events alike. The 'submitted' row in
+        // particular carries the full guest answers payload (name, DOB,
+        // medical fields, signer_ip/ua) in meta_json -- retaining it after
+        // erasing waiver_responses would leave that exact PII recoverable
+        // from the audit trail, defeating the erasure.
+        $delAudit = $pdo->prepare("DELETE FROM audit_events WHERE entity_type IN ('instance','response') AND entity_id IN ($in)");
+        $delAudit->execute($chunk);
+        $auditEventsDeleted += $delAudit->rowCount();
+
+        $delInst = $pdo->prepare('DELETE FROM waiver_instances WHERE id IN ('.$in.')');
+        $delInst->execute($chunk);
+        $instancesDeleted += $delInst->rowCount();
       }
+
+      $this->auditErasure($instancesDeleted, $responsesDeleted, $filesDeleted, $auditEventsDeleted);
+
+      $pdo->commit();
+    } catch (\Throwable $e) {
+      // Roll back EVERY DELETE issued above -- a partial erasure (e.g.
+      // waiver_responses gone but waiver_instances/audit_events still
+      // present) is worse than no erasure at all: it would report success
+      // to a caller that has no way to know some PII survived. Files already
+      // unlinked in this failed attempt cannot be un-deleted (filesystem has
+      // no transaction), but that is fail-SAFE for GDPR purposes (erasure ran
+      // ahead, not behind) and the caller's retry will simply find those
+      // paths already gone (is_file() false -> filesDeleted undercounts on
+      // retry, never a correctness issue).
+      if ($pdo->inTransaction()) $pdo->rollBack();
+      throw $e;
     }
-
-    // Hard-delete waiver_responses FIRST (this is what purges the
-    // signature_png LONGBLOB -- the row delete itself, not the file unlink
-    // above, is what removes that PII from the DB).
-    $delResp = $pdo->prepare('DELETE FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
-    $delResp->execute($instanceIds);
-    $responsesDeleted = $delResp->rowCount();
-
-    $delInst = $pdo->prepare('DELETE FROM waiver_instances WHERE id IN ('.$in.')');
-    $delInst->execute($instanceIds);
-    $instancesDeleted = $delInst->rowCount();
-
-    $this->auditErasure($instancesDeleted, $responsesDeleted, $filesDeleted);
 
     return [
       'instances_deleted' => $instancesDeleted,
       'responses_deleted' => $responsesDeleted,
       'files_deleted' => $filesDeleted,
+      'audit_events_deleted' => $auditEventsDeleted,
     ];
   }
 
@@ -828,11 +938,18 @@ class WaiverController {
   // not the customer_id/booking_group_id/link_tokens that were erased, not
   // guest names, nothing that identifies the subject. Counts only. entity_id
   // is a synthetic 0 (an erasure call spans N instances, not one entity).
-  private function auditErasure(int $instancesDeleted, int $responsesDeleted, int $filesDeleted): void {
+  // This row is itself written to audit_events with entity_type='erasure'
+  // (distinct from 'instance'/'response'), so eraseWaiver's own
+  // entity_type IN ('instance','response') cleanup DELETE never removes the
+  // erasure record it is about to write -- the erasure event is the durable
+  // "this subject's waiver PII was erased on this date" record and must
+  // survive the very erasure it documents.
+  private function auditErasure(int $instancesDeleted, int $responsesDeleted, int $filesDeleted, int $auditEventsDeleted = 0): void {
     $this->audit('erasure', 0, 'erase_waiver', [
       'instances_deleted' => $instancesDeleted,
       'responses_deleted' => $responsesDeleted,
       'files_deleted' => $filesDeleted,
+      'audit_events_deleted' => $auditEventsDeleted,
     ]);
   }
 

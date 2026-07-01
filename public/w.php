@@ -1,7 +1,17 @@
 <?php
 require __DIR__.'/../vendor/autoload.php';
 $cfg = require __DIR__.'/../config/config.php';
-use App\{Database, WaiverController};
+use App\{Database, WaiverController, Utils};
+
+// [W7] Fail-closed boot sentinel -- see Utils::assertNoPlaceholderSecrets doc.
+// This guest-facing signing page is the most sensitive of the three (guests
+// submit real signatures/PII here), so it must never come up misconfigured.
+try {
+  Utils::assertNoPlaceholderSecrets($cfg);
+} catch (\Throwable $e) {
+  http_response_code(500);
+  exit('Server misconfigured: placeholder secret(s) still present. Refusing to start.');
+}
 
 $db = new Database($cfg['db']);
 $ctl = new WaiverController($cfg, $db);

@@ -47,3 +47,19 @@ SECRET='CHANGE_ME_TO_A_LONG_RANDOM_SECRET'
 SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -r | awk '{print $1}')
 curl -X POST http://localhost:8080/api.php   -H 'Content-Type: application/json' -H "X-HMAC: $SIG" --data "$BODY"
 ```
+
+## Boot-time secret sentinel
+Every public entrypoint (`api.php`/`admin.php`/`w.php`) refuses to boot if
+`config/config.php` still carries a placeholder `CHANGE_ME_TO_A_LONG_RANDOM_SECRET`
+value for `security.api_hmac_secret`, any `security.inbound_hmac_keys` entry,
+or `callback.outbound_secret` (when `callback.base_url` is configured) — see
+`Utils::assertNoPlaceholderSecrets()`. Make sure you actually replace those
+values after `cp config/config.php.docker config/config.php`, not just edit
+`api_hmac_secret` as the quick-start above shows.
+
+## Tests
+See `tests/README.md` for the phpunit micro-harness (setup, one-time
+`waiver_test` DB creation, and what it covers). Run with:
+```bash
+docker compose exec php vendor/bin/phpunit
+```

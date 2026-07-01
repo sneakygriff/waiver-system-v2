@@ -6,6 +6,75 @@ class Utils {
   // the nonce single-use retention horizon (spec G1: |now-ts|<=300s).
   const ENVELOPE_MAX_SKEW_SECONDS = 300;
 
+  // [W7 / boot sentinel] The distributed config/config.php.docker TEMPLATE
+  // ships every secret as this literal placeholder (README: `cp
+  // config/config.php.docker config/config.php`). config/config.php itself is
+  // gitignored (local/deploy secret material, never committed) -- but nothing
+  // stops a fresh deploy from copying the template and forgetting to actually
+  // replace the placeholders, which would otherwise boot a fork instance that:
+  //   - accepts ANY caller as authentic on the inbound signed-envelope check
+  //     (api_hmac_secret / inbound_hmac_keys -- a publicly-known secret is no
+  //     secret at all), and
+  //   - signs its OWN outbound completion webhook / evidence uploads to
+  //     BookingV2 with a publicly-known secret (callback.outbound_secret),
+  //     which BookingV2 would then also have to accept as authentic.
+  // Fail CLOSED: refuse to boot at all (never silently run insecure) rather
+  // than log-and-continue.
+  const PLACEHOLDER_SECRET = 'CHANGE_ME_TO_A_LONG_RANDOM_SECRET';
+
+  /**
+   * [W7] Boot-time guard: throws if any of the security-critical secrets in
+   * $cfg still equal the distributed placeholder value. Every public
+   * entrypoint (api.php / admin.php / w.php) calls this immediately after
+   * loading config.php and BEFORE constructing Database/WaiverController/etc,
+   * so a misconfigured deploy fails closed with a clear error instead of
+   * quietly accepting forged requests or signing outbound calls with a
+   * secret anyone can read from the public fork repo.
+   *
+   * Checks (all must be replaced): security.api_hmac_secret,
+   * every value in security.inbound_hmac_keys, and callback.outbound_secret
+   * (only when callback.base_url is actually configured -- an unconfigured
+   * callback block, e.g. a legacy/self-mint-only deployment with no
+   * BookingV2 integration at all, has nothing to sign and is not a risk).
+   *
+   * @throws \RuntimeException listing every offending config key, so an
+   *   operator sees exactly what to fix rather than a generic failure.
+   */
+  public static function assertNoPlaceholderSecrets(array $cfg): void {
+    $offenders = [];
+
+    $apiSecret = $cfg['security']['api_hmac_secret'] ?? null;
+    if ($apiSecret === self::PLACEHOLDER_SECRET) {
+      $offenders[] = 'security.api_hmac_secret';
+    }
+
+    $inboundKeys = $cfg['security']['inbound_hmac_keys'] ?? [];
+    if (is_array($inboundKeys)) {
+      foreach ($inboundKeys as $keyId => $secret) {
+        if ($secret === self::PLACEHOLDER_SECRET) {
+          $offenders[] = 'security.inbound_hmac_keys['.$keyId.']';
+        }
+      }
+    }
+
+    $callback = $cfg['callback'] ?? null;
+    if (is_array($callback) && !empty($callback['base_url'])) {
+      $outboundSecret = $callback['outbound_secret'] ?? null;
+      if ($outboundSecret === self::PLACEHOLDER_SECRET) {
+        $offenders[] = 'callback.outbound_secret';
+      }
+    }
+
+    if (!empty($offenders)) {
+      throw new \RuntimeException(
+        'Refusing to boot: placeholder secret(s) still configured ('
+        .implode(', ', $offenders)
+        .'). Replace every CHANGE_ME_TO_A_LONG_RANDOM_SECRET value in config/config.php'
+        .' with a real, unique random secret before starting this app.'
+      );
+    }
+  }
+
   public static function nowUtc(): string { return gmdate('Y-m-d H:i:s'); }
   public static function jsonResponse(int $code, $data) {
     http_response_code($code); header('Content-Type: application/json');
