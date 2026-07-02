@@ -18,7 +18,11 @@ server {
     fastcgi_read_timeout 300;
   }
 
-  # Evidence upload base64-encodes a PDF + a signature PNG in one JSON body;
-  # 10m (the old dev limit) is too tight. 25m leaves generous headroom.
-  client_max_body_size 25m;
+  # Governs INBOUND request bodies to this fork. The largest is the admin DOCX
+  # template import (multipart upload). Keep this in lockstep with the PHP
+  # limits in docker/php/uploads.ini (upload_max_filesize/post_max_size=30M) so
+  # neither layer truncates the other. (The outbound evidence upload — fork ->
+  # BookingV2 — is a request this server MAKES, not one it receives, so it is
+  # unaffected by client_max_body_size.)
+  client_max_body_size 30m;
 }
