@@ -82,7 +82,11 @@ class WaiverController {
   //   {waiver_instance_id, link_token, status, completed_at, participant_id,
   //    customer_id, booking_group_id, birth_date, computed_age, minor,
   //    parental_consent_name, waiver_consent_granted, evidence_sha256,
-  //    answers_hash, signer_full_name}
+  //    answers_hash, signer_full_name, form_version}
+  // - form_version [D14/T5]: waiver_template_versions.version this instance
+  //   was minted against (joined via STATUS_SELECT) -- mirrors the completion
+  //   webhook's form_version field 1:1 so BookingV2's WaiverAcceptance ledger
+  //   write is identical regardless of which path delivered the completion.
   // - status: the fork's raw waiver_instances.status ("pending"|"completed"|"void").
   // - completed_at: ISO-8601 UTC string, or null if not completed.
   // - evidence_sha256: object-store bytes hash (Gap2). T15 (presigned-PUT
@@ -126,11 +130,22 @@ class WaiverController {
       'evidence_sha256'        => null, // [Gap2] populated once T15 object-store upload lands.
       'answers_hash'           => isset($row['hash_sha256']) && $row['hash_sha256'] !== null ? (string)$row['hash_sha256'] : null,
       'signer_full_name'       => $row['signer_full_name'] ?? null,
+      // [waiver-program D14/T5] mirrors the completion webhook's form_version
+      // (see notifyBookingV2Completion) -- reconciliation must be able to
+      // replay the SAME ledger write a lost webhook would have made.
+      'form_version'           => isset($row['form_version']) ? (int)$row['form_version'] : null,
     ];
   }
 
-  private const STATUS_SELECT = 'SELECT wi.id, wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wi.booking_group_id, wr.hash_sha256, wr.answers_json, wr.signer_full_name
+  // [waiver-program D14/T5] wtv.version is joined in too (aliased form_version)
+  // so statusRow() can echo the SAME field the completion webhook carries --
+  // the file-header doc requires the webhook and reconciliation paths to
+  // "converge on identical semantics", so a webhook that's lost and later
+  // picked up by reconciliation must not silently fall back to "assume
+  // current version" when the fork actually knows better.
+  private const STATUS_SELECT = 'SELECT wi.id, wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wi.booking_group_id, wtv.version as form_version, wr.hash_sha256, wr.answers_json, wr.signer_full_name
      FROM waiver_instances wi
+     JOIN waiver_template_versions wtv ON wi.template_version_id = wtv.id
      LEFT JOIN waiver_responses wr ON wr.waiver_instance_id = wi.id';
 
   public function getStatus(array $payload): array {
@@ -382,7 +397,10 @@ class WaiverController {
   }
 
   public function submitGuestForm(string $token, array $post): array {
-    $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
+    // [waiver-program D14/T5] wtv.version (the numeric, per-template-published
+    // version this instance was minted against) is now selected too, so it can
+    // be echoed back on the completion webhook -- see notifyBookingV2Completion.
+    $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.version as form_version, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $instance=$q->fetch(); if(!$instance) return ['error'=>'Invalid link'];
     if($instance['status']==='completed') return ['error'=>'Already completed'];
     // [FK-void] Reject a voided instance up front with its own message
@@ -695,6 +713,16 @@ class WaiverController {
         'evidence_object_key' => $evidenceObjectKey,
         'answers_hash' => $answersHash,
         'signer_full_name' => $signerFullName,
+        // [waiver-program D14/T5] The numeric published-template version this
+        // instance was actually signed against (waiver_template_versions.version,
+        // selected as wtv.version/form_version in submitGuestForm's query above).
+        // BookingV2's WaiverAcceptance ledger records THIS value (what the
+        // customer actually signed), not whatever WaiverConfig.currentFormVersion
+        // happens to be at ingestion time -- see complete-ingest.ts's doc
+        // comment on CompletionFieldsSchema.form_version. Always present and
+        // non-null for a real submission (every waiver_instances row is joined
+        // to a published waiver_template_versions row at createInstance time).
+        'form_version' => isset($instance['form_version']) ? (int)$instance['form_version'] : null,
       ];
       // [Gap3] waiver_consent_granted is a Wave-2 field: the fork's current
       // form has no consent checkbox on most templates, so this key is
