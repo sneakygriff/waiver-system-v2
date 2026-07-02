@@ -1,0 +1,24 @@
+server {
+  # Railway injects PORT; entrypoint renders this via envsubst '${PORT}'.
+  listen ${PORT};
+  server_name _;
+  root /var/www/html/public;
+
+  index index.php;
+
+  location / {
+    try_files $uri $uri/ /index.php?$query_string;
+  }
+
+  location ~ \.php$ {
+    include fastcgi_params;
+    fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    # Single-container: php-fpm listens on 127.0.0.1:9000 (was compose-service "php:9000").
+    fastcgi_pass 127.0.0.1:9000;
+    fastcgi_read_timeout 300;
+  }
+
+  # Evidence upload base64-encodes a PDF + a signature PNG in one JSON body;
+  # 10m (the old dev limit) is too tight. 25m leaves generous headroom.
+  client_max_body_size 25m;
+}

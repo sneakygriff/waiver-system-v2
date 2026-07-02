@@ -1,0 +1,19 @@
+# [railway-prod] Keep the build context lean and secret-free.
+# vendor/ is installed at build time (--no-dev); storage/ is a runtime volume;
+# config/config.php is gitignored local secrets (never bake into the image).
+.git
+.gitignore
+.github
+vendor
+storage
+tests
+phpunit.xml
+phpunit.xml.dist
+.phpunit.result.cache
+docker-compose.yml
+config/config.php
+dev/*.md
+**/*.md
+.DS_Store
+.env
+.env.*
