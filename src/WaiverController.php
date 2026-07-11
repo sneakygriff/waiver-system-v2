@@ -481,15 +481,37 @@ class WaiverController {
       // ready to hand to notifyBookingV2Completion. Upload failures are
       // swallowed here (logged, non-blocking) -- see uploadEvidence() doc.
       $evidence = $this->uploadEvidence($instance, $artifact, $sigFile);
+      // [FK-evidence-keep] One full retry of the relay before giving up: a
+      // transient failure (BookingV2 cold start, brief network blip) that
+      // outlives postSignedEnvelopeWithResponse's inline 3-attempt budget
+      // often clears within a second. Retrying HERE -- before the
+      // waiver_responses insert and the completion webhook below -- means a
+      // successful retry still hands its blob key to
+      // notifyBookingV2Completion, instead of the webhook firing without
+      // one. When the relay is unconfigured or the artifact is unreadable
+      // the retry is a near-instant no-op (uploadEvidence short-circuits),
+      // so this adds latency only in the genuinely-degraded case.
+      if ($evidence['evidence_object_key'] === null) {
+        $evidence = $this->uploadEvidence($instance, $artifact, $sigFile);
+      }
 
-      // [FK-erase] pdf_path/signature_path columns are kept for backward
-      // compatibility with any pre-T15 rows / the erase_waiver file-cleanup
-      // path, but new rows no longer persist a local path: evidence is
-      // transient on this container (generated here, uploaded, then removed
-      // below) and the durable copy is BookingV2's object store, addressed by
-      // evidence_object_key on the completion webhook.
+      // [FK-erase / FK-evidence-keep] pdf_path/signature_path: NULL on the
+      // happy path (relay confirmed durable storage -- the local files are
+      // transient and removed below; the durable copy is BookingV2's object
+      // store, addressed by evidence_object_key on the completion webhook).
+      // But when the relay did NOT confirm (evidence_object_key null), the
+      // files retained below are the ONLY copy of the signed evidence, and
+      // these columns are the ONLY pointer GDPR erasure follows: eraseWaiver
+      // unlinks exactly the paths read from pdf_path/signature_path, and the
+      // evidence_retained_locally audit row written below is itself purged by
+      // the same erasure's audit_events DELETE. Leaving the columns NULL in
+      // the retained case would let a subject's signed PDF (name, DOB,
+      // medical answers, signature) survive erasure orphaned on disk while
+      // the erase reports success. A stale path after manual backfill/removal
+      // is harmless: erase's unlink is is_file()-guarded.
+      $retained = $evidence['evidence_object_key'] === null;
       $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, UTC_TIMESTAMP())');
-      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, null, null]);
+      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $retained ? $artifact : null, $retained ? $sigFile : null]);
       $this->audit('response', $instance['id'], 'submitted', $payload);
 
       // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
@@ -509,13 +531,38 @@ class WaiverController {
       return ['error'=>'Could not save waiver, please try again.'];
     }
 
-    // [FK-T15] Stop long-term local-FS persistence: evidence was generated
-    // transiently to produce the bytes uploaded above -- remove both files
-    // now that the durable copy (if the upload succeeded) lives in BookingV2
-    // Blob. Best-effort: a stray leftover file here is not itself a
-    // correctness problem (nothing references it), just housekeeping.
-    if(is_file($sigFile)) @unlink($sigFile);
-    if($artifact && is_file($artifact)) @unlink($artifact);
+    // [FK-T15 / FK-evidence-keep] Stop long-term local-FS persistence: evidence
+    // was generated transiently to produce the bytes uploaded above -- remove
+    // both files ONLY once the relay has CONFIRMED durable storage (2xx AND a
+    // usable blob key, i.e. evidence_object_key non-null). When the relay
+    // failed, returned no blob key, or was never configured
+    // (CALLBACK_BASE_URL unset), the local PDF is the ONLY copy of a signed
+    // legal document -- deleting it here would destroy the evidence with
+    // nothing durable to point at. Keep both files for reconciliation/manual
+    // re-upload and log a loud marker so operators can find them. In this
+    // retained case the row inserted above carries the file paths in
+    // pdf_path/signature_path, so GDPR erasure (eraseWaiver's column-driven
+    // unlink) still reaches the files. (The signature PNG bytes also live in
+    // waiver_responses.signature_png, but the rendered PDF exists nowhere
+    // else.) Successful-path unlinks stay
+    // best-effort: a stray leftover file is not itself a correctness problem
+    // (nothing references it), just housekeeping.
+    if ($evidence['evidence_object_key'] !== null) {
+      if(is_file($sigFile)) @unlink($sigFile);
+      if($artifact && is_file($artifact)) @unlink($artifact);
+    } else {
+      error_log('[WAIVER-EVIDENCE-RETAINED] evidence relay did not confirm durable storage for waiver_instance_id='.(int)$instance['id']
+        .' -- keeping local files: pdf='.($artifact !== null ? $artifact : '(none)')
+        .' signature='.$sigFile
+        .' (back-fill via reconciliation/manual re-upload, then remove)');
+      // Mirror the relay-failure trail in audit_events (the file's standard
+      // error channel) so the retained paths are queryable, not just grep-able
+      // in container logs. Swallow any failure: this bookkeeping must never
+      // turn a successfully-completed submission into a guest-facing error.
+      try {
+        $this->audit('instance', (int)$instance['id'], 'evidence_retained_locally', ['pdf_path'=>$artifact, 'signature_path'=>$sigFile]);
+      } catch (\Throwable $e) { /* best-effort only */ }
+    }
 
     return ['ok'=>true,'artifact'=>$artifact];
   }
