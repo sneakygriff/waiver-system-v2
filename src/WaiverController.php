@@ -1044,14 +1044,26 @@ class WaiverController {
   public function renderContentForWeb(string $html, array $fields): string {
     $html=preg_replace_callback('#\[field\s+([^\]]+)\]#', function($m){
       $a=$this->parseAttrs($m[1]); $key=$a['key']??''; $type=$a['type']??'text'; $req=!empty($a['required'])?'required':'';
-      if($type==='radio'){ $opts=isset($a['options'])?explode('|',$a['options']):['Yes','No']; $out='<span class="d-inline-block">'; foreach($opts as $o){ $out.='<label class="me-3"><input class="form-check-input me-1" type="radio" name="'.htmlspecialchars($key).'" value="'.htmlspecialchars($o).'" '.$req.'>'.htmlspecialchars($o).'</label>'; } return $out.'</span>'; }
+      // Readability pass (2026-07-13): render choices as STACKED, full-width
+      // rows with a real touch target (guests sign this on a phone at the
+      // venue) instead of cramped inline `me-3` labels. Every element is a
+      // <span> styled via CSS (.wv-* in w.php), never a <div>: a [field]
+      // shortcode normally sits INSIDE a <p> in content_html, and a block
+      // element there is invalid nesting -- the browser auto-closes the
+      // paragraph and the layout breaks. Each input gets an id so the whole
+      // label is tappable via `for`.
+      if($type==='radio'){ $opts=isset($a['options'])?explode('|',$a['options']):['Yes','No']; $out='<span class="wv-choices">'; foreach($opts as $i=>$o){ $id='wv_'.preg_replace('/[^A-Za-z0-9_]/','',$key).'_'.$i; $out.='<span class="wv-choice"><input class="wv-control" type="radio" id="'.htmlspecialchars($id).'" name="'.htmlspecialchars($key).'" value="'.htmlspecialchars($o).'" '.$req.'><label class="wv-choice-label" for="'.htmlspecialchars($id).'">'.htmlspecialchars($o).'</label></span>'; } return $out.'</span>'; }
       if($type==='textarea'){ return '<textarea name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:100%; min-height:80px; border:1px solid #ccc;"></textarea>'; }
       if($type==='date'){ return '<input type="date" name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:auto; min-width:180px; padding:2px 6px;" '.$req.'>'; }
       if($type==='parental_consent'){ return '<input name="'.htmlspecialchars($key).'" placeholder="Parent/guardian full name" class="form-control d-inline-block" style="width:auto; min-width:220px; padding:2px 6px; border:none; border-bottom:1px solid #000;" '.$req.'>'; }
       // [FK-Tconsent] Optional GDPR/marketing consent checkbox. ALWAYS
       // unrequired regardless of the placeholder's own `required` attribute
       // (never honor $req here) -- this checkbox must never block submission.
-      if($type===self::CONSENT_FIELD_TYPE){ return '<div class="form-check d-inline-block"><input class="form-check-input" type="checkbox" name="'.htmlspecialchars($key).'" id="field_'.htmlspecialchars($key).'" value="1"><label class="form-check-label" for="field_'.htmlspecialchars($key).'">'.htmlspecialchars($a['label']??'I consent to be contacted for offers and promotions').'</label></div>'; }
+      // Same .wv-* span treatment as radio above (see that comment): the old
+      // markup emitted a <div> from inside a <p>, which browsers auto-close --
+      // that invalid nesting is why this checkbox rendered detached from its
+      // question. The id stays `field_{key}` (unchanged contract).
+      if($type===self::CONSENT_FIELD_TYPE){ return '<span class="wv-choices"><span class="wv-choice"><input class="wv-control" type="checkbox" name="'.htmlspecialchars($key).'" id="field_'.htmlspecialchars($key).'" value="1"><label class="wv-choice-label" for="field_'.htmlspecialchars($key).'">'.htmlspecialchars($a['label']??'I consent to be contacted for offers and promotions').'</label></span></span>'; }
       return '<input name="'.htmlspecialchars($key).'" class="form-control d-inline-block" style="width:auto; min-width:220px; padding:2px 6px; border:none; border-bottom:1px solid #000;" '.$req.'>';
     }, $html);
     $html=preg_replace('#\[signature(?:\s+[^\]]+)?\]#','<div class="mb-2"><label class="form-label">Signature *</label><canvas id="sig" style="border:1px solid #ccc; width:100%; max-width:480px; height:180px"></canvas><input type="hidden" name="signature_data" id="signature_data" required><button type="button" id="clear" class="btn btn-sm btn-outline-secondary mt-2">Clear</button></div>',$html);

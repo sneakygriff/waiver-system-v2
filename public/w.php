@@ -42,7 +42,23 @@ $instance = $data['instance']; $fields = $data['fields'];
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/signature_pad@4.1.7/dist/signature_pad.umd.min.js"></script>
-<style>#sig { border:1px solid #ccc; width:100%; height:180px; }</style>
+<style>
+#sig { border:1px solid #ccc; width:100%; height:180px; }
+/* Choice rows for radio / consent fields rendered inline from content_html
+   shortcodes (WaiverController::renderContentForWeb). All spans so they stay
+   valid inside a <p>; flex gives each option a full-width, tappable row. */
+.wv-choices { display:block; margin-top:8px; }
+.wv-choice {
+  display:flex; align-items:center; gap:.65rem;
+  min-height:44px; padding:.4rem .7rem; margin:6px 0;
+  border:1px solid #dcdcdc; border-radius:6px; background:#fff;
+  cursor:pointer;
+}
+.wv-choice:hover { border-color:#86b7fe; background:#f8fbff; }
+.wv-choice:focus-within { border-color:#86b7fe; box-shadow:0 0 0 .2rem rgba(13,110,253,.15); }
+.wv-control { width:1.25rem; height:1.25rem; flex:0 0 auto; margin:0; cursor:pointer; }
+.wv-choice-label { margin:0; cursor:pointer; line-height:1.35; }
+</style>
 </head>
 <body class="container py-4">
   <h1 class="mb-2"><?=htmlspecialchars($instance['title'])?></h1>
