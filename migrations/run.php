@@ -72,8 +72,13 @@ declare(strict_types=1);
  * user/pass is decoded. Query params other than `charset` are ignored.)
  *
  * The URL and its credentials are NEVER printed: no target banner, and every
- * error message is passed through a redactor that strips the password always
- * and the user/host/db name when >= 3 chars. See redact().
+ * error message is passed through a redactor that strips the password,
+ * user, host and db name when >= 3 chars (short values are left out of
+ * generic-text matching so redaction cannot mangle unrelated words — e.g. a
+ * password "app" inside "applied"), word-boundary-aware so a short value is
+ * still masked wherever it appears as a genuine token. The full raw URL is
+ * always stripped wholesale, with no length floor, so a short credential
+ * stays masked in that context regardless. See redact().
  *
  * USAGE
  * -----
@@ -122,9 +127,39 @@ $GLOBALS['__redactions'] = [];
 function redact(string $msg): string
 {
     foreach ($GLOBALS['__redactions'] as $label => $secret) {
-        if ($secret !== '') {
-            $msg = str_replace($secret, '<redacted:' . $label . '>', $msg);
+        if ($secret === '') {
+            continue;
         }
+        if ($label === 'url') {
+            // The full raw connection string is matched wholesale — it is not
+            // a "word", so word-boundary matching would be meaningless here:
+            // strip it verbatim wherever it appears, regardless of how short
+            // its component parts are.
+            $msg = str_replace($secret, '<redacted:' . $label . '>', $msg);
+            continue;
+        }
+        // Word-boundary-aware: a short credential (pass/user/host/db) must
+        // still be masked wherever it appears as a genuine token — e.g.
+        // quoted in a MySQL "Access denied for user '<x>'@..." message, or
+        // between `:`/`@`/`/` in a DSN-shaped string — but must NOT swallow
+        // the same characters when they occur mid-word in ordinary log
+        // prose. Without this, a compose-style credential pair like
+        // user=app/password=app corrupts the runner's own vocabulary:
+        // "already applied" becomes "already <redacted:pass>lied" and
+        // "files_applied=0" becomes "files_<redacted:pass>lied=0" (both
+        // observed live — see the F2 report). `\b` anchors on a transition
+        // between a word character (letter/digit/underscore) and a
+        // non-word character, so "app" inside "applied" (no boundary
+        // between the second `p` and `l`) is left alone, while "app" in
+        // "user 'app'@host" (boundaries on both sides) is still replaced.
+        // Known limitation ("where feasible"): `\b` anchors only on the
+        // first/last character of the secret, so a secret that itself
+        // starts or ends with a non-word character (e.g. a password
+        // beginning with `-`) may not get the intended boundary semantics
+        // at that end — the length floor below is the backstop for that.
+        $pattern = '/\b' . preg_quote($secret, '/') . '\b/';
+        $replaced = @preg_replace($pattern, '<redacted:' . $label . '>', $msg);
+        $msg = $replaced ?? $msg;
     }
     return $msg;
 }
@@ -276,10 +311,20 @@ function connect(string $envName): array
     }
 
     // Arm the redactor BEFORE the first thing that can throw with details in it.
-    // The password is always stripped; the rest only when long enough that
-    // stripping it cannot mangle unrelated words.
+    // Every short-credential entry (pass/user/host/db) is stripped only when
+    // long enough (>= 3 chars) that redact()'s word-boundary matching has a
+    // meaningful boundary to anchor on; a value below that floor is left out
+    // of blind matching entirely (1-2 char values are too likely to collide
+    // with ordinary prose even with boundary-awareness — e.g. the standalone
+    // English word "a"). The PASSWORD gets the SAME floor as user/host/db
+    // (previously it had none at all — see redact()'s docblock: a compose
+    // credential pair like user=app/password=app corrupted the runner's own
+    // output). This is defence in depth, not the only guard: 'url' below
+    // covers the full raw connection string unconditionally, so the
+    // password is still masked wherever it is genuinely part of the
+    // credential/DSN context, regardless of its length.
     $GLOBALS['__redactions'] = array_filter([
-        'pass' => $pass,
+        'pass' => strlen($pass) >= 3 ? $pass : '',
         'url'  => $raw,
         'user' => strlen($user) >= 3 ? $user : '',
         'host' => strlen($host) >= 3 ? $host : '',

@@ -669,6 +669,85 @@ final class MigrationRunnerTest extends TestCase
         $this->assertStringContainsString('database connection failed', $r['err'], 'the failure itself must still be reported');
     }
 
+    // -----------------------------------------------------------------------
+    // 15. Short compose-style credentials (user=app / password=app) must not
+    //     mangle ordinary log prose, but must stay masked wherever they ARE
+    //     the credential. F2 report follow_up 1 / this fix's regression
+    //     guard: redact() previously stripped the password with no minimum
+    //     length, so a compose-style password corrupted the runner's own
+    //     vocabulary ("already applied" -> "already <redacted:pass>lied",
+    //     "files_applied=0" -> "files_<redacted:pass>lied=0").
+    // -----------------------------------------------------------------------
+
+    public function testShortAppCredentialsDoNotMangleWordsButStayMaskedAsCredentials(): void
+    {
+        $dir = $this->stageFixture('clean-chain');
+
+        // Reuse the REAL compose account (docker-compose.yml:
+        // MYSQL_USER=app / MYSQL_PASSWORD=app) — that exact 3-char/3-char
+        // pair is F2's live repro. We deliberately do NOT drop/recreate
+        // 'app'@'%': it is the shared application account and may be in
+        // concurrent use elsewhere in this compose stack. Instead grant it
+        // access to this test's own scratch schema and revoke that grant
+        // afterwards — the same pattern
+        // WaiverControllerEraseTest::testEraseWaiverRollsBackOnMidTransactionFailure
+        // already uses for the same shared account, restored even if an
+        // assertion fails mid-test.
+        $this->root->exec('GRANT ALL PRIVILEGES ON `' . $this->schema . "`.* TO 'app'@'%'");
+        $this->root->exec('FLUSH PRIVILEGES');
+        $appUrl = sprintf('mysql://app:app@%s:%d/%s', $this->host, $this->port, $this->schema);
+
+        try {
+            // --- run 1: fresh apply. "APPLIED (2 statement(s))" and the
+            // summary line both contain "app" as a substring of
+            // "applied"/"statement(s)" — exactly what the bug mangled.
+            $first = $this->migrate(['--dir=' . $dir], $appUrl);
+            $this->assertExit(0, $first, 'user=app password=app must apply cleanly, same as any other credential');
+
+            $this->assertStringContainsString('001_init: APPLIED (2 statement(s))', $first['out']);
+            $this->assertStringContainsString('002_alter: APPLIED (1 statement(s))', $first['out']);
+            $this->assertStringContainsString('003_index: APPLIED (1 statement(s))', $first['out']);
+            $this->assertStringContainsString(
+                'summary: files_applied=3 statements_executed=4 already_applied=0',
+                $first['out'],
+                'F2\'s live repro printed this exact line as "files_<redacted:pass>lied=0" before the fix'
+            );
+            $this->assertStringNotContainsString('<redacted:', $first['out'], 'a successful run never needs to print a redaction marker');
+
+            // --- run 2: no-op re-run — F2's repro line, verbatim:
+            // "[migrate] 001_init: already <redacted:pass>lied".
+            $second = $this->migrate(['--dir=' . $dir], $appUrl);
+            $this->assertExit(0, $second, 're-run over an already-applied chain');
+            $this->assertStringContainsString('001_init: already applied', $second['out']);
+            $this->assertStringContainsString('002_alter: already applied', $second['out']);
+            $this->assertStringContainsString('003_index: already applied', $second['out']);
+            $this->assertStringContainsString('summary: files_applied=0 statements_executed=0 already_applied=3', $second['out']);
+            $this->assertStringNotContainsString('<redacted:', $second['out']);
+
+            // --- credential-context check: the SAME short password, when it
+            // truly IS the credential in a failed connection attempt, must
+            // still never reach the log unmasked, and the masking must
+            // actually have fired (not merely "the text happens to be
+            // absent" — assert the positive marker too).
+            $wrongUrl = sprintf('mysql://app:wrong-password-guess@%s:%d/%s', $this->host, $this->port, $this->schema);
+            $failed   = $this->migrate(['--dir=' . $dir], $wrongUrl);
+            $this->assertExit(3, $failed, 'a bad password against a real host is an environment error');
+
+            $combined = $failed['out'] . "\n" . $failed['err'];
+            $this->assertStringNotContainsString('wrong-password-guess', $combined, 'the attempted (wrong) password must never be echoed');
+            $this->assertStringContainsString('database connection failed', $failed['err']);
+            // MySQL's own "Access denied for user 'app'@'host'" text quotes
+            // the username literally — prove the redactor still catches it
+            // there (word-boundary: quote|app|@ are both boundaries) even
+            // though it no longer touches "app" embedded inside "applied".
+            $this->assertStringContainsString('<redacted:user>', $combined, 'the redactor must still engage in a genuine credential context');
+            $this->assertStringNotContainsString("'app'@", $combined, 'the bare quoted username must not survive redaction');
+        } finally {
+            $this->root->exec("REVOKE ALL PRIVILEGES ON `" . $this->schema . "`.* FROM 'app'@'%'");
+            $this->root->exec('FLUSH PRIVILEGES');
+        }
+    }
+
     // =======================================================================
     // Helpers
     // =======================================================================
