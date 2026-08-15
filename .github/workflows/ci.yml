@@ -437,9 +437,58 @@ jobs:
           # expected on a correctly-configured token. So an auth-shaped answer
           # is disambiguated below via a second, more authoritative source --
           # the GitHub Packages REST API -- instead of guessed from either
-          # extreme. Any other answer this probe doesn't recognize FAILS the
-          # job closed with a named cause instead of guessing. The registry's
-          # own message is never echoed — it is external text.
+          # extreme.
+          #
+          # BUT the Packages API's own 404 is NOT, by itself, proof that the
+          # package has never existed (P1, round 3 gate finding -- fixed
+          # round 4). GitHub's REST API deliberately answers 404, not
+          # 401/403, when a token cannot read a resource that DOES exist --
+          # by design, so an unauthorized caller can never learn whether a
+          # resource is absent or merely hidden from it. If this job's own
+          # GHCR_PACKAGES_API_TOKEN has a transient auth problem, the
+          # Packages-API call below would ALSO 404 -- indistinguishable, on
+          # its face, from the genuine first-push bootstrap case -- and
+          # trusting that 404 on faith (the pre-round-4 behaviour) would let a
+          # push through and overwrite an existing tag the instant auth
+          # recovers, which is the exact failure this whole guard exists to
+          # prevent. So before any Packages-API 404 is trusted as absence,
+          # this token's REST auth is proven independently with a
+          # MUST-SUCCEED CANARY CALL, in this same step: `GET
+          # /repos/<this repository>`, a resource this job's token must
+          # always be able to read under the `contents: read` permission
+          # already granted to this job. The canary targets a different
+          # resource from the Packages API on purpose -- the Packages API's
+          # own 404 is exactly the ambiguous signal being disambiguated, so it
+          # can never be asked to vouch for itself.
+          #   * canary != 200 (including unreachable) -> fails the job closed
+          #     immediately, cause=packages-api-auth-unprovable, before the
+          #     package status is even inspected: this token's auth could not
+          #     be proven, so no 404 it returns can be trusted either.
+          #   * canary 200, package 404 -> the package has never existed, so
+          #     no version and no tag could possibly exist yet either. This is
+          #     the one condition under which an auth-shaped registry answer
+          #     is safe to treat as absence -- the bootstrap case, not a
+          #     permissions problem.
+          #   * canary 200, package 200 -> the package exists (some version
+          #     was pushed at some point), so this exact tag cannot be ruled
+          #     out. Falls back to the same fail-closed refusal as before this
+          #     escape existed.
+          #   * canary 200, package anything else (non-2xx/404, or the
+          #     package call itself fails to reach api.github.com) -> also
+          #     fails closed; this escape only ever WIDENS the absence set for
+          #     the one narrow case it can prove, never narrows the
+          #     fail-closed default for every other case.
+          # Neither the underlying GHCR-denied-for-a-missing-package claim NOR
+          # this escape's own ability to call the Packages API and the canary
+          # under the installation token's real live permissions has been
+          # verified against an actual run -- this pipeline has never
+          # executed end to end. The M4 operator runbook's §6e first-run
+          # confirmation is what actually proves (or disproves) this path;
+          # until then this is a documented, fail-closed-compatible best
+          # effort, not a verified fact. Any other answer this probe doesn't
+          # recognize FAILS the job closed with a named cause instead of
+          # guessing. The registry's own message is never echoed — it is
+          # external text.
           set +e
           probe_error=$(docker manifest inspect "$IMAGE" 2>&1 >/dev/null)
           probe_status=$?
@@ -450,36 +499,31 @@ jobs:
           else
             case "$probe_error" in
               *"denied"* | *"unauthorized"* | *"UNAUTHORIZED"* | *"forbidden"* | *"FORBIDDEN"*)
-                # BOOTSTRAP ESCAPE (P2, round 3). Ask the GitHub Packages REST
-                # API -- a different surface from the ghcr.io registry API
-                # that just answered `denied` -- whether the package itself
-                # has EVER been created, using this job's own GITHUB_TOKEN
-                # (packages: write includes read for this endpoint).
-                #   * 404  -> the package has never existed, so no version and
-                #             no tag could possibly exist yet either. This is
-                #             the one condition under which an auth-shaped
-                #             registry answer is safe to treat as absence --
-                #             the bootstrap case, not a permissions problem.
-                #   * 200  -> the package exists (some version was pushed at
-                #             some point), so this exact tag cannot be ruled
-                #             out. Falls back to the same fail-closed refusal
-                #             as before this escape existed.
-                #   * anything else (non-2xx/404, or the API call itself
-                #     fails to reach api.github.com) -> also fails closed;
-                #     this escape only ever WIDENS the absence set for the
-                #     one narrow case it can prove, never narrows the
-                #     fail-closed default for every other case.
-                # Neither the underlying GHCR-denied-for-a-missing-package
-                # claim NOR this escape's own ability to call the Packages
-                # API under the installation token's real live permissions
-                # has been verified against an actual run -- this pipeline
-                # has never executed end to end. The M4 operator runbook's
-                # §6e first-run confirmation is what actually proves (or
-                # disproves) this path; until then this is a documented,
-                # fail-closed-compatible best effort, not a verified fact.
+                # BOOTSTRAP ESCAPE (P2, round 3) + AUTH CANARY (P1, round 4).
+                # Full rationale is in the comment block above this `case`;
+                # this is the mechanism only.
                 package_path="${IMAGE_REPOSITORY#ghcr.io/}"
                 package_owner="${package_path%%/*}"
                 package_name="${package_path#*/}"
+
+                # Prove this token's REST auth works BEFORE trusting anything
+                # the Packages API says below -- see the rationale above.
+                # GITHUB_REPOSITORY (owner/repo) is a default Actions runner
+                # env var; it is not declared in this step's env: block
+                # because every job step already has it.
+                set +e
+                canary_http_status=$(curl -sS -o /dev/null -w '%{http_code}' \
+                  -H "Authorization: Bearer ${GHCR_PACKAGES_API_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "https://api.github.com/repos/${GITHUB_REPOSITORY}")
+                canary_curl_status=$?
+                set -e
+                if [ "$canary_curl_status" -ne 0 ] || [ "$canary_http_status" != "200" ]; then
+                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=packages-api-auth-unprovable. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and this job's token could not be proven to have working REST auth before the Packages-API bootstrap check can be trusted (canary GET /repos/${GITHUB_REPOSITORY} returned curl exit ${canary_curl_status}, HTTP ${canary_http_status}, expected HTTP 200). A 404 from the Packages API is not, on its own, proof that a package has never existed -- GitHub deliberately answers 404, not 401/403, when a token cannot read a resource that DOES exist -- so a 404 cannot be trusted while this token's own auth is unproven. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's permissions and re-run."
+                  exit 1
+                fi
+
                 set +e
                 package_http_status=$(curl -sS -o /dev/null -w '%{http_code}' \
                   -H "Authorization: Bearer ${GHCR_PACKAGES_API_TOKEN}" \
@@ -495,7 +539,7 @@ jobs:
                 case "$package_http_status" in
                   404)
                     echo "exists=false" >> "$GITHUB_OUTPUT"
-                    echo "${IMAGE_REPOSITORY} has never been pushed before (Packages API confirms the package itself does not exist yet) -- this is the first-push bootstrap case, not an auth failure. ${IMAGE} does not exist yet — it will be built and pushed."
+                    echo "${IMAGE_REPOSITORY} has never been pushed before (the auth canary proved this token's REST auth works, and the Packages API confirms the package itself does not exist yet) -- this is the first-push bootstrap case, not an auth failure. ${IMAGE} does not exist yet — it will be built and pushed."
                     ;;
                   200)
                     echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login. The Packages API confirms ${IMAGE_REPOSITORY} already exists (a version was pushed before), which rules out the first-push bootstrap case -- this is a genuine, unexplained authorization problem. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's package permissions/visibility and re-run."
