@@ -21,9 +21,16 @@ php migrations/run.php
 Use `--url-env=OTHER_NAME` to read the URL from a **differently named** variable
 (e.g. a prod one later); the *value* format never changes.
 
-The URL is never printed. Error messages pass through a redactor that always
-strips the password and also masks user/host/db when they are ≥ 3 characters, so
-a CI log cannot leak the target even on a connection failure.
+The URL is never printed. Error messages pass through a redactor with two
+layers: the full raw connection string is always stripped wholesale (no
+length floor at all, so even a 1-2 character credential is masked wherever
+the URL appears intact — this layer is checked FIRST), and the
+password/user/host/db are also masked individually, word-boundary-aware, when
+each is ≥ 3 characters (below that floor a value is left out of blind
+matching entirely, or it would mangle the runner's own prose — a
+compose-style `app`/`app` credential is the live example). Either layer alone
+would leave a gap; together, a CI log cannot leak the target even on a
+connection failure.
 
 ## Commands
 
@@ -105,11 +112,16 @@ per-statement ledger a lie.
 
 - Name it `NNN_short_name.sql` (numeric prefix, sorted numerically — `10_x` runs
   after `2_x`). Any other `.sql` filename in this directory is a hard error, not
-  a silent skip.
+  a silent skip. Two files sharing the same numeric prefix (`005_a.sql` +
+  `005_b.sql`) are ALSO a hard error — an ambiguous apply order is almost
+  always a merge accident, not intent.
 - Plain `;`-separated statements. Quoted strings, `--`/`#`/`/* */` comments and
   `/*! ... */` version comments are all handled; `DELIMITER`, stored procedures,
   triggers and functions are **not** supported (nothing here uses them, and
-  pretending to support them is how a real database gets corrupted).
+  pretending to support them is how a real database gets corrupted). A bare
+  `DELIMITER` keyword found outside a quoted literal or comment REJECTS THE
+  WHOLE FILE up front, during parsing, before any of its statements run —
+  never mis-split on the stored-program body's own internal `;`s.
 - A comment-only file is valid: it is recorded applied with 0 statements. That
   is exactly what `004_erasure_audit_events_backfill.sql` is — a documented
   one-time ops backfill whose marker row proves an operator ran it.

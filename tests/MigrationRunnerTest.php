@@ -31,12 +31,16 @@ use PHPUnit\Framework\TestCase;
  * root or as the app's own `app` user. Two reasons, one of them a live trap:
  *   - fidelity: staging runs migrations as a scoped user, and the runner reads
  *     `information_schema`, whose visibility is privilege-filtered;
- *   - the runner's redactor strips its DB password from every log line with no
- *     minimum length, and the compose credentials are literally `app`/`app`, so
- *     running as `app` rewrites the runner's own words ("already applied"
- *     becomes "already <redacted:pass>lied"). A long, distinctive password
- *     keeps the log — and therefore every log assertion below — honest. See the
- *     F2 report's follow-ups.
+ *   - historically, the runner's redactor stripped its DB password from every
+ *     log line with NO minimum length, and the compose credentials are
+ *     literally `app`/`app`, so running as `app` rewrote the runner's own
+ *     words ("already applied" became "already <redacted:pass>lied"). `f2501d1`
+ *     fixed that with a ≥3-char word-boundary floor (test 15,
+ *     `testShortAppCredentialsDoNotMangleWordsButStayMaskedAsCredentials`,
+ *     proves an `app`/`app` run is clean today). This suite still uses a long,
+ *     distinctive password for its OWN dedicated account regardless: it keeps
+ *     every other test's log assertions unambiguous without depending on that
+ *     fix holding, and matches the account's least-privilege intent.
  *
  * Fixture migration sets under `tests/fixtures/migrations-*` are COPIED into a
  * temp directory before each run: some tests repair or corrupt a migration
@@ -744,6 +748,127 @@ final class MigrationRunnerTest extends TestCase
             $this->assertStringNotContainsString("'app'@", $combined, 'the bare quoted username must not survive redaction');
         } finally {
             $this->root->exec("REVOKE ALL PRIVILEGES ON `" . $this->schema . "`.* FROM 'app'@'%'");
+            $this->root->exec('FLUSH PRIVILEGES');
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. DELIMITER / stored-program syntax is rejected before anything runs
+    //     [gate1 batch 2 — codex fork P2]
+    // -----------------------------------------------------------------------
+
+    public function testDelimiterStoredProgramSyntaxIsRejectedBeforeAnyStatementRuns(): void
+    {
+        $dir = $this->stageFixture('delimiter');
+
+        // Anti-vacuity: the fixture's own 002 file must still contain
+        // exactly this bare DELIMITER keyword, or this test proves nothing.
+        $this->assertMatchesRegularExpression('/^DELIMITER\s/mi', (string)file_get_contents($dir . '/002_stored_proc.sql'));
+
+        $r = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(2, $r, 'a DELIMITER-bearing file must be a usage error (unparseable), never a partial apply');
+
+        $this->assertStringContainsString('001_before: APPLIED', $r['out'], 'the prior, ordinary file must still have applied cleanly');
+        $this->assertStringContainsString('cannot parse migration', $r['err']);
+        $this->assertStringContainsString('DELIMITER', $r['err']);
+        $this->assertStringContainsString('not supported', $r['err']);
+
+        // The decisive assertion: the ORDINARY statement preceding the
+        // DELIMITER block in 002 must never have run. A splitter that mangled
+        // (rather than rejected) the file could easily have applied this
+        // CREATE TABLE and only then failed on the routine body's mis-split
+        // remainder -- exactly the partial-application hazard codex flagged.
+        $this->assertFalse($this->tableExists('f2_delim_should_never_exist'), '002 must be rejected wholesale, before its leading CREATE TABLE runs');
+        $this->assertSame(['001_before'], $this->appliedVersions());
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. Duplicate numeric prefixes are a hard error, not silent name-order
+    //     application [gate1 batch 2 — eng T7]
+    // -----------------------------------------------------------------------
+
+    public function testDuplicateNumericPrefixesAreRejectedAsAHardError(): void
+    {
+        $dir = $this->stageFixture('duplicate-prefix');
+
+        $r = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(2, $r, 'two files sharing a numeric prefix must stop the run, never silently apply both in name order');
+
+        $this->assertStringContainsString('duplicate numeric prefix', $r['err']);
+        $this->assertStringContainsString('005_a', $r['err']);
+        $this->assertStringContainsString('005_b', $r['err']);
+
+        // Neither file may have applied — discovery itself must refuse before
+        // any migration in the directory runs.
+        $this->assertFalse($this->tableExists('f2_dup_a'));
+        $this->assertFalse($this->tableExists('f2_dup_b'));
+        $this->assertSame([], $this->tables());
+    }
+
+    // -----------------------------------------------------------------------
+    // 18. redact() masks the wholesale URL BEFORE `pass` can fragment it, so
+    //     sub-3-char URL components (below the word-boundary floor) cannot
+    //     leak [gate1 batch 2 — review P2-5]
+    // -----------------------------------------------------------------------
+
+    public function testRedactOrdersTheWholesaleUrlEntryBeforePassSoShortUrlComponentsCannotLeak(): void
+    {
+        // A 2-char user + 2-char db (both below redact()'s 3-char
+        // word-boundary floor) sitting inside a STATEMENT'S OWN SQL text —
+        // exercised via --verbose's out()-filtered statement preview, a real
+        // log line a migration author could produce (e.g. a seed row whose
+        // data happens to embed a URL-shaped value). Neither the 'user' nor
+        // the 'db' entry can mask these on their own; only the wholesale
+        // `url` entry — matched against the exact, unmutated raw connection
+        // string — can. If `pass` were substituted first (the P2-5 bug), it
+        // would break that exact-string match and 'ux'/'rd' would leak in
+        // full.
+        $user   = 'ux';
+        $dbName = 'rd';
+        $pass   = 'f2-redact-order-secret-pw';
+        $host   = $this->host; // 'db' by default in this harness — already < 3 chars itself
+
+        $this->root->exec('DROP DATABASE IF EXISTS `' . $dbName . '`');
+        $this->root->exec('CREATE DATABASE `' . $dbName . '` CHARACTER SET utf8mb4');
+        $this->root->exec("DROP USER IF EXISTS '" . $user . "'@'%'");
+        $this->root->exec("CREATE USER '" . $user . "'@'%' IDENTIFIED BY '" . $pass . "'");
+        $this->root->exec('GRANT ALL PRIVILEGES ON `' . $dbName . "`.* TO '" . $user . "'@'%'");
+        $this->root->exec('FLUSH PRIVILEGES');
+
+        try {
+            $url = sprintf('mysql://%s:%s@%s:%d/%s', $user, $pass, $host, $this->port, $dbName);
+
+            $dir  = $this->stageFixture('redact-order');
+            $path = $dir . '/001.sql';
+            $sql  = str_replace(['__HOST__', '__PORT__'], [$host, (string)$this->port], (string)file_get_contents($path));
+            file_put_contents($path, $sql);
+
+            // Sanity: the fixture's own SQL text must literally embed this
+            // exact URL, or the test proves nothing.
+            $this->assertStringContainsString($url, $sql, 'fixture must embed the exact URL this test connects with');
+
+            $r = $this->migrate(['--dir=' . $dir, '--verbose'], $url);
+            $this->assertExit(0, $r, 'the statement is valid SQL — only its DATA happens to look like a connection URL');
+
+            $combined = $r['out'] . "\n" . $r['err'];
+            $this->assertStringNotContainsString($url, $combined, 'the raw URL must never survive intact in the log, including the --verbose statement echo');
+            $this->assertStringNotContainsString($pass, $combined, 'the password must never survive verbatim, anywhere');
+            $this->assertStringContainsString('<redacted:url>', $r['out'], 'the wholesale url entry must actually have fired against the verbose statement preview');
+
+            // The decisive check: user/db are BELOW the word-boundary floor,
+            // so the wholesale `url` entry is the ONLY thing that can mask
+            // them. If `pass` ran first (P2-5), it would already have masked
+            // the password IN PLACE (breaking the url entry's exact-string
+            // match) while leaving the scheme+user prefix and the db suffix
+            // fully exposed either side of it — e.g. "mysql://ux:<redacted:
+            // pass>@db:3306/rd". Checking the password's own absence is not
+            // enough to catch that (pass masks itself either way); these two
+            // checks specifically target what the BUG leaves behind.
+            $this->assertStringNotContainsString('://' . $user . ':', $combined, "the URL's scheme+user prefix must not survive — 'ux' is below redact()'s word-boundary floor and only the wholesale url entry can mask it");
+            $this->assertStringNotContainsString('/' . $dbName . "'", $combined, "the 2-char db name must not survive — it is below redact()'s word-boundary floor and only the wholesale url entry can mask it");
+        } finally {
+            $this->root->exec("DROP USER IF EXISTS '" . $user . "'@'%'");
+            $this->root->exec('DROP DATABASE IF EXISTS `' . $dbName . '`');
             $this->root->exec('FLUSH PRIVILEGES');
         }
     }

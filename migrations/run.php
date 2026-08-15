@@ -323,9 +323,21 @@ function connect(string $envName): array
     // covers the full raw connection string unconditionally, so the
     // password is still masked wherever it is genuinely part of the
     // credential/DSN context, regardless of its length.
+    //
+    // ORDER MATTERS: 'url' MUST come before 'pass' here — redact() iterates
+    // this array in insertion order, and its wholesale url match is a
+    // str_replace against the RAW, UNMUTATED connection string. If 'pass' ran
+    // first it would already have replaced the password inside any message
+    // that happens to embed the full URL (e.g. --verbose's statement-preview
+    // echo, when a statement's own SQL text contains a URL-shaped value), so
+    // the message no longer contains an exact copy of $raw and the wholesale
+    // str_replace silently no-ops — leaving the URL's OTHER components (a
+    // sub-3-char user/host/db, which have no standalone entry to fall back
+    // on) fully exposed. Url first means the whole string is masked in one
+    // shot before anything else gets a chance to fragment it.
     $GLOBALS['__redactions'] = array_filter([
-        'pass' => strlen($pass) >= 3 ? $pass : '',
         'url'  => $raw,
+        'pass' => strlen($pass) >= 3 ? $pass : '',
         'user' => strlen($user) >= 3 ? $user : '',
         'host' => strlen($host) >= 3 ? $host : '',
         'db'   => strlen($db)   >= 3 ? $db   : '',
@@ -372,10 +384,18 @@ function connect(string $envName): array
  *
  * DELIMITER / stored programs are intentionally NOT supported: no migration in
  * this fork uses them, and pretending to handle them would be the kind of
- * silent half-support that corrupts a real database.
+ * silent half-support that corrupts a real database. A bare `DELIMITER`
+ * keyword found outside a quoted literal or comment therefore REJECTS THE
+ * WHOLE FILE right here, during parsing -- before any of its statements have
+ * run -- instead of being mis-split on the stored-program body's own internal
+ * `;`s. That distinction matters: `runApply`/dry-run both call this function
+ * before executing (or even previewing) a single statement of the file, so a
+ * migration with ordinary statements before a DELIMITER block can never
+ * partially apply them and then fail on the mangled remainder.
  *
  * @return list<string>
- * @throws RuntimeException on an unterminated literal or block comment
+ * @throws RuntimeException on an unterminated literal/block comment, or a
+ *         DELIMITER directive (stored programs are not supported -- see above)
  */
 function splitStatements(string $sql): array
 {
@@ -471,6 +491,25 @@ function splitStatements(string $sql): array
             continue;
         }
 
+        // DELIMITER changes what `;` means (it introduces a stored-program
+        // body terminated by a custom token), and this splitter has no notion
+        // of that: left undetected, it would slice the body on its own
+        // internal `;`s and hand back syntactically broken fragments. This
+        // check only ever sees text OUTSIDE quotes/comments (both branches
+        // above `continue`), and only fires at the START of a token ($buf
+        // empty or ending in the space `$space()` just inserted), so it can
+        // never mistrigger mid-identifier (e.g. "SOMEDELIMITERX") or inside a
+        // string literal that merely contains the word.
+        if (($c === 'D' || $c === 'd')
+            && ($buf === '' || substr($buf, -1) === ' ')
+            && preg_match('/^DELIMITER(?=\s|$)/i', substr($sql, $i))) {
+            throw new RuntimeException(
+                'DELIMITER / stored-program syntax is not supported by this splitter (found at byte offset '
+                . $i . '). Rewrite this migration as plain statements, or apply the stored program by hand '
+                . 'outside this runner.'
+            );
+        }
+
         $buf .= $c;
         $i++;
     }
@@ -526,6 +565,27 @@ function discoverMigrations(string $dir): array
         // a loud stop.
         fail(EXIT_USAGE, 'unrecognized .sql file(s) in ' . $real . ' (expected NNN[_name].sql): '
             . implode(', ', $bad));
+    }
+
+    // Two files sharing a numeric prefix (e.g. 005_a.sql + 005_b.sql) would
+    // otherwise both apply, ordered only by name (usort's [seq, version]
+    // tiebreak below) -- an ambiguous, almost certainly accidental apply
+    // order (a merge collision, not intent). Same "loud stop over silent
+    // tolerance" philosophy as the unrecognized-file check above.
+    $bySeq = [];
+    foreach ($found as $m) {
+        $bySeq[$m['seq']][] = $m['version'];
+    }
+    $dupes = [];
+    foreach ($bySeq as $seq => $versions) {
+        if (count($versions) > 1) {
+            $dupes[] = $seq . ' (' . implode(', ', $versions) . ')';
+        }
+    }
+    if ($dupes !== []) {
+        fail(EXIT_USAGE, 'duplicate numeric prefix(es) in ' . $real . ' -- each NNN must be unique '
+            . '(applying both in name order is almost always a merge accident, not intent): '
+            . implode('; ', $dupes));
     }
 
     usort($found, static function (array $a, array $b): int {

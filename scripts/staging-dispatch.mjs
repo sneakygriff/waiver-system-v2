@@ -112,11 +112,16 @@ export const ADMIN_REPO = 'sneakygriff/bookingsystemv2';
 export const ADMIN_WORKFLOW_FILE = 'staging.yml';
 // The admin `run-name:` is
 //   format('Staging — dispatch: {0} @{1}', github.event.action, github.sha)
-// so every dispatch run's display_title contains "dispatch: <event type>".
-// Matching that pair (not the bare event type) is what keeps the check honest:
-// the bare name could appear in a run title for unrelated reasons, the pair is
-// produced by exactly one expression, in exactly one workflow.
-export const RUN_TITLE_MARKER = `dispatch: ${EVENT_TYPE}`;
+// so every dispatch run's display_title contains "dispatch: <event type> @".
+// Matching that pair PLUS the trailing " @" (not just the bare event type) is
+// what keeps the check honest. The bare pair alone is an UNANCHORED substring
+// test (`includes()`): a future dispatch type that merely EXTENDS this one as
+// a string — e.g. "waiver-staging-deployed-v2" — would title-match too, since
+// "dispatch: waiver-staging-deployed" is itself a substring of "dispatch:
+// waiver-staging-deployed-v2". `format()`'s literal " @" immediately after
+// `{0}` is guaranteed by the admin workflow, so anchoring on it closes that
+// class exactly, for the cost of one extra character.
+export const RUN_TITLE_MARKER = `dispatch: ${EVENT_TYPE} @`;
 // The admin repo's manifest job refuses any client_payload value containing a
 // character outside this set (`*[!A-Za-z0-9._/:@-]*` in staging.yml). Sending
 // one would only earn a red run there, so the same rule is enforced here first.

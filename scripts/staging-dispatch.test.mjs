@@ -192,10 +192,10 @@ describe('cross-repo contract constants', () => {
         assert.equal(ADMIN_WORKFLOW_FILE, 'staging.yml');
     });
 
-    it('derives the run-name marker from the admin run-name expression', () => {
+    it('derives the run-name marker from the admin run-name expression, anchored on the trailing " @"', () => {
         // Admin staging.yml (M4/A1):
         //   format('Staging — dispatch: {0} @{1}', github.event.action, github.sha)
-        assert.equal(RUN_TITLE_MARKER, 'dispatch: waiver-staging-deployed');
+        assert.equal(RUN_TITLE_MARKER, 'dispatch: waiver-staging-deployed @');
         assert.equal(`Staging — dispatch: ${EVENT_TYPE} @abc`.includes(RUN_TITLE_MARKER), true);
     });
 
@@ -310,6 +310,19 @@ describe('M4 upgrade 1 — the run-name predicate is what makes a run OURS', () 
         assert.equal(runTitleCarriesMarker(null), false);
     });
 
+    it('does not false-match a dispatch type that merely EXTENDS this one as a string — the unanchored-substring class the trailing " @" anchor closes', () => {
+        // Under the OLD, unanchored marker ("dispatch: waiver-staging-deployed",
+        // no trailing " @") this title WOULD have matched, because that string
+        // is a genuine substring of "dispatch: waiver-staging-deployed-v2 @...".
+        // Eng T6.
+        const extendedTypeRun = ourRun({ display_title: `Staging — dispatch: ${EVENT_TYPE}-v2 @${GOOD_SHA}` });
+        assert.equal(`Staging — dispatch: ${EVENT_TYPE}-v2 @${GOOD_SHA}`.includes(`dispatch: ${EVENT_TYPE}`), true, "sanity: the OLD unanchored marker WOULD have matched this title");
+        assert.equal(runTitleCarriesMarker(extendedTypeRun), false, 'the anchored marker must refuse a dispatch type that only extends ours as a string');
+
+        const sentAt = Date.parse('2026-08-15T02:00:00Z');
+        assert.equal(selectRun([extendedTypeRun], sentAt), null, 'and it must never be selected as delivery either');
+    });
+
     it('selects our run and ignores a wizard dispatch in the same window', () => {
         const sentAt = Date.parse('2026-08-15T02:00:00Z');
         const { run, unmarkedInWindow } = classifyRuns([wizardRun(), ourRun()], sentAt);
@@ -356,7 +369,7 @@ describe('M4 upgrade 1 — the run-name predicate is what makes a run OURS', () 
         assert.equal(h.fetch.sends().length, 5);
         assert.equal(h.fetch.polls().length, 5);
         assert.equal(h.time.elapsed(), 225_000);
-        assert.match(h.stdout.text(), /none was run-named "dispatch: waiver-staging-deployed"/);
+        assert.match(h.stdout.text(), /none was run-named "dispatch: waiver-staging-deployed @"/);
     });
 });
 
@@ -627,7 +640,7 @@ describe('main() — validation, exit codes and the operator-facing errors', () 
 
         assert.equal(code, EXIT_FAILED);
         assert.match(h.stderr.text(), /does not yet carry M4's `run-name:` expression/);
-        assert.match(h.stderr.text(), /run-name marker "dispatch: waiver-staging-deployed"/);
+        assert.match(h.stderr.text(), /run-name marker "dispatch: waiver-staging-deployed @"/);
     });
 
     it('names the credential cause on a non-transient refusal', async () => {

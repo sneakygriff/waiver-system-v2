@@ -36,6 +36,20 @@ use Symfony\Component\Yaml\Yaml;
 final class WorkflowStructureTest extends TestCase {
   private const WORKFLOW_PATH = __DIR__.'/../.github/workflows/ci.yml';
   private const WORKFLOWS_DIR = __DIR__.'/../.github/workflows';
+  private const REPO_ROOT = __DIR__.'/..';
+
+  /** Directory names never treated as part of "the repo tree" by the UUID
+   *  scan below: vendor (third-party code), .git (VCS internals, binary
+   *  objects), storage (git-ignored runtime artifacts -- thousands of signed
+   *  PDFs, per .gitignore), node_modules (none today, defensive). */
+  private const UUID_SCAN_EXCLUDED_DIRS = ['vendor', '.git', 'storage', 'node_modules'];
+
+  /** Specific git-ignored files that are never part of the committed tree. */
+  private const UUID_SCAN_EXCLUDED_FILES = ['.phpunit.result.cache', '.DS_Store'];
+
+  /** Canonical 8-4-4-4-12 hex UUID shape -- what a Railway environment/service
+   *  id looks like. */
+  private const UUID_LITERAL_RE = '/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i';
 
   /** @var array<string,mixed>|null */
   private static ?array $workflow = null;
@@ -125,6 +139,53 @@ final class WorkflowStructureTest extends TestCase {
       }
     }
     return $out;
+  }
+
+  /**
+   * Every UUID-shaped literal found ANYWHERE in the repo tree (vendor/.git/
+   * storage/node_modules excluded -- see UUID_SCAN_EXCLUDED_DIRS/_FILES),
+   * lowercased, alongside the path it was found in relative to the repo
+   * root. Unlike allEnvPairsAcrossWorkflowsTree(), this is a raw byte scan of
+   * every file's contents -- it is what makes AC4.4's "no OTHER Railway ID
+   * literal exists anywhere in the repo" a claim about the whole tree, not
+   * just about env: mappings under .github/workflows/*.
+   *
+   * @return list<array{0:string,1:string}> [lowercased uuid, relative path]
+   */
+  private static function repoUuidLiterals(): array {
+    $root = realpath(self::REPO_ROOT);
+    if ($root === false) {
+      throw new \RuntimeException('WorkflowStructureTest::REPO_ROOT does not resolve -- the UUID scan cannot run.');
+    }
+
+    $found = [];
+    $dirIterator = new \RecursiveDirectoryIterator($root, \FilesystemIterator::SKIP_DOTS);
+    $filtered = new \RecursiveCallbackFilterIterator($dirIterator, static function (\SplFileInfo $file): bool {
+      if ($file->isDir()) {
+        return !in_array($file->getFilename(), self::UUID_SCAN_EXCLUDED_DIRS, true);
+      }
+      return !in_array($file->getFilename(), self::UUID_SCAN_EXCLUDED_FILES, true);
+    });
+    $iterator = new \RecursiveIteratorIterator($filtered);
+
+    foreach ($iterator as $fileInfo) {
+      /** @var \SplFileInfo $fileInfo */
+      if (!$fileInfo->isFile() || !$fileInfo->isReadable()) {
+        continue;
+      }
+      $contents = @file_get_contents($fileInfo->getPathname());
+      if ($contents === false || $contents === '') {
+        continue;
+      }
+      if (preg_match_all(self::UUID_LITERAL_RE, $contents, $matches) > 0) {
+        $relative = ltrim(substr($fileInfo->getPathname(), strlen($root)), '/');
+        foreach ($matches[0] as $uuid) {
+          $found[] = [strtolower($uuid), $relative];
+        }
+      }
+    }
+
+    return $found;
   }
 
   // ==========================================================================
@@ -365,6 +426,51 @@ final class WorkflowStructureTest extends TestCase {
         );
       }
     }
+  }
+
+  // ==========================================================================
+  // 7b. Repo-tree UUID-literal scan: AC4.4 "no OTHER Railway ID literal
+  //     exists anywhere in the repo", as specified -- not narrowed to
+  //     .github/workflows/ env: mappings (eng T2, gate1 batch 2). The two
+  //     tests above only ever look at env: mappings; a Railway UUID inlined
+  //     in a run: script body, a shell script, or any other committed file
+  //     would evade both of them -- a UUID doesn't spell "PROD" and isn't a
+  //     RAILWAY*_ID env key. This test globs the WHOLE repo tree instead.
+  // ==========================================================================
+
+  public function testNoRailwayUuidLiteralAnywhereInTheRepoTreeOutsideTheAllowedStagingPair(): void {
+    // The allowlist is DERIVED from the same staging pair
+    // testExactlyOneStagingRailwayIdPairAndNoOtherRailwayIdAnywhere() pins --
+    // never hardcoded -- so this test needs no edit on the day those env
+    // values are actually filled in at provisioning. Today both
+    // RAILWAY_STAGING_ENVIRONMENT_ID and RAILWAY_STAGING_SERVICE_ID are ""
+    // (unprovisioned), so the allowlist is empty and this test asserts ZERO
+    // UUID-shaped literals exist anywhere in the tree -- a real, non-vacuous
+    // guard today, verified by a mutation-kill: planting a UUID literal in a
+    // `run:` block must make this test die.
+    $allowlist = [];
+    foreach (self::allEnvPairsAcrossWorkflowsTree() as [$key, $value]) {
+      $isStagingIdKey = $key === 'RAILWAY_STAGING_ENVIRONMENT_ID' || $key === 'RAILWAY_STAGING_SERVICE_ID';
+      if ($isStagingIdKey && is_string($value) && preg_match(self::UUID_LITERAL_RE, $value)) {
+        $allowlist[] = strtolower($value);
+      }
+    }
+
+    $disallowed = [];
+    foreach (self::repoUuidLiterals() as [$uuid, $path]) {
+      if (!in_array($uuid, $allowlist, true)) {
+        $disallowed[] = $uuid.' ('.$path.')';
+      }
+    }
+    sort($disallowed);
+
+    $this->assertSame(
+      [],
+      $disallowed,
+      'a Railway-id-shaped UUID literal exists somewhere in the repo tree outside the allowed staging pair -- '.
+      'AC4.4 requires no OTHER Railway id (renamed, duplicated, or prod) anywhere in the repo, not just in an '.
+      '.github/workflows/ env: mapping.'
+    );
   }
 
   // ==========================================================================

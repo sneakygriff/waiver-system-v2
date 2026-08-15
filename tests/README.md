@@ -69,11 +69,16 @@ afterwards. Defaults are compose's `root` / `rootpw`; override with
 `WAIVER_TEST_DB_ROOT_USER` / `WAIVER_TEST_DB_ROOT_PASS` (host and port come from
 `config/config.test.php`, i.e. `WAIVER_TEST_DB_HOST` / `WAIVER_TEST_DB_PORT`).
 
-It deliberately does not run the migrations as the `app` user: the runner's
-redactor strips its DB password out of every log line with no minimum length,
-and compose's credentials are literally `app`/`app`, so an `app`-user run
-rewrites the runner's own words (`already applied` → `already
-<redacted:pass>lied`).
+It deliberately does not run the migrations as the `app` user, even though
+`redact()`'s ≥3-char word-boundary floor (`f2501d1`, regression-pinned by
+`MigrationRunnerTest::testShortAppCredentialsDoNotMangleWordsButStayMaskedAsCredentials`)
+now keeps a compose-style `app`/`app` credential from mangling the runner's
+own vocabulary (`already applied` no longer becomes `already
+<redacted:pass>lied`). Using a long, distinctive password for THIS suite's own
+dedicated `f2_migrunner` account is still the right default: it keeps every
+other test's log assertions unambiguous without depending on that fix, and
+matches the account's least-privilege intent (a real credential, not a
+throwaway "same as everything else" one).
 
 Fixture migration sets live in `tests/fixtures/migrations-*/` and are COPIED to
 a temp dir before each run — the resume and ledger-drift tests repair and
