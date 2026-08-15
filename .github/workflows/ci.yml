@@ -390,11 +390,21 @@ jobs:
           # registry hiccup rebuild and OVERWRITE an existing tag — the exact
           # thing this guard exists to prevent, and worse than a red run because
           # a promoted `:<sha>` would silently start meaning different bits.
-          # So a not-found-shaped answer means absent, and anything else stops
-          # the job. (GHCR answers `denied` for a package that does not exist
-          # yet, which is why that shape counts as absence too; if the token
-          # were genuinely broken, the push below would fail loudly anyway.)
-          # The registry's own message is never echoed — it is external text.
+          #
+          # So the absence set is narrowed to explicit not-found SHAPES only:
+          # the OCI distribution spec's documented not-found error codes
+          # (MANIFEST_UNKNOWN / NAME_UNKNOWN), docker CLI's textual renderings
+          # of the same ("manifest unknown", "no such manifest"), and a bare
+          # "not found" / HTTP 404. `denied` and `unauthorized` are explicitly
+          # EXCLUDED: this probe runs after a successful `docker login`, so an
+          # auth-denial answer at that point is anomalous (expired token
+          # exchange, a permissions/visibility blip) rather than proof the tag
+          # is free -- treating it as absent would let a push overwrite a tag
+          # that genuinely exists, defeating the immutability guarantee this
+          # step exists to provide. Any such answer, and any other answer this
+          # probe doesn't recognize, FAILS the job closed with a named cause
+          # instead of guessing. The registry's own message is never echoed —
+          # it is external text.
           set +e
           probe_error=$(docker manifest inspect "$IMAGE" 2>&1 >/dev/null)
           probe_status=$?
@@ -404,12 +414,16 @@ jobs:
             echo "${IMAGE} already exists in GHCR — this tag is immutable, so the build and push below are skipped."
           else
             case "$probe_error" in
-              *"manifest unknown"* | *"MANIFEST_UNKNOWN"* | *"no such manifest"* | *"not found"* | *"denied"* | *"unauthorized"*)
+              *"MANIFEST_UNKNOWN"* | *"manifest unknown"* | *"NAME_UNKNOWN"* | *"name unknown"* | *"no such manifest"* | *"not found"* | *"404"*)
                 echo "exists=false" >> "$GITHUB_OUTPUT"
                 echo "${IMAGE} does not exist yet — it will be built and pushed."
                 ;;
+              *"denied"* | *"unauthorized"* | *"UNAUTHORIZED"* | *"forbidden"* | *"FORBIDDEN"*)
+                echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) AFTER a successful login, which is not a not-found shape and is not proof of absence (message withheld — external text). Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's package permissions/visibility and re-run."
+                exit 1
+                ;;
               *)
-                echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: the registry answered something that is neither a manifest nor a not-found (message withheld — external text). Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
+                echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=ambiguous-response. The registry answered something that is neither a not-found shape nor a recognized authorization failure (message withheld — external text). Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
                 exit 1
                 ;;
             esac
