@@ -29,6 +29,16 @@ use Symfony\Component\Yaml\Yaml;
  * and every check below that touches free text is scoped to a specific,
  * named field (an `if:`, a named step's `run:`), never a blind sweep.
  *
+ * ONE deliberate exception to "no shell-out to git": §7b's repo-tree UUID
+ * scan shells out to `git ls-files` to enumerate which files are IN SCOPE --
+ * never to search their contents (that part is still a plain PHP byte scan
+ * per file, no grep). Scoping to git-tracked files, not a raw filesystem
+ * walk, is itself load-bearing: a filesystem walk would let any untracked
+ * local file -- a stray editor scratch file, a locally generated fixture
+ * nobody `git add`ed -- red this gate on a developer's own machine over
+ * content that will never reach CI's fresh clone, which only ever sees
+ * tracked content.
+ *
  * This suite needs no DB and no compose stack; it runs standalone, and it is
  * NOT DB-backed, so tests/README.md's markTestSkipped() convention does not
  * apply here -- there is nothing for these tests to skip.
@@ -142,13 +152,53 @@ final class WorkflowStructureTest extends TestCase {
   }
 
   /**
-   * Every UUID-shaped literal found ANYWHERE in the repo tree (vendor/.git/
-   * storage/node_modules excluded -- see UUID_SCAN_EXCLUDED_DIRS/_FILES),
-   * lowercased, alongside the path it was found in relative to the repo
-   * root. Unlike allEnvPairsAcrossWorkflowsTree(), this is a raw byte scan of
-   * every file's contents -- it is what makes AC4.4's "no OTHER Railway ID
-   * literal exists anywhere in the repo" a claim about the whole tree, not
-   * just about env: mappings under .github/workflows/*.
+   * The set of file paths (relative to $root, forward-slash separated,
+   * NUL-delimited by `-z` so a path containing a space or newline -- none
+   * exist today, but the parser must not assume otherwise -- still splits
+   * correctly) that `git` considers TRACKED: `git ls-files` over the given
+   * working tree. This is the scope boundary for the UUID scan below --
+   * untracked content (build output, a stray local scratch file, a fixture
+   * nobody `git add`ed) is invisible to it on purpose, because CI only ever
+   * sees a fresh clone of tracked content, and this suite is a claim about
+   * THAT tree, not about any one machine's working directory. A file that IS
+   * `git add`ed (staged, even before commit) counts as tracked -- the index
+   * is what `git ls-files` reads, not HEAD -- which is exactly the property
+   * that makes "add a UUID and it dies" a meaningful mutation-kill even
+   * pre-commit.
+   *
+   * @return list<string>
+   */
+  private static function gitTrackedFiles(string $root): array {
+    $descriptorSpec = [1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $process = @proc_open(['git', 'ls-files', '-z'], $descriptorSpec, $pipes, $root);
+    if (!is_resource($process)) {
+      throw new \RuntimeException('WorkflowStructureTest::gitTrackedFiles() could not start `git ls-files` -- the UUID scan cannot run.');
+    }
+    $stdout = stream_get_contents($pipes[1]) ?: '';
+    fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]) ?: '';
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+    if ($exitCode !== 0) {
+      throw new \RuntimeException('WorkflowStructureTest::gitTrackedFiles(): `git ls-files` exited '.$exitCode.' -- '.trim($stderr));
+    }
+
+    $entries = explode("\0", $stdout);
+    return array_values(array_filter($entries, static fn (string $entry): bool => $entry !== ''));
+  }
+
+  /**
+   * Every UUID-shaped literal found in every GIT-TRACKED file in the repo
+   * tree (vendor/.git/storage/node_modules excluded defensively -- see
+   * UUID_SCAN_EXCLUDED_DIRS/_FILES -- even though all four are already
+   * untracked today per .gitignore; the exclusion list is a second,
+   * independent line of defense, not a substitute for the tracked-files
+   * scope), lowercased, alongside the path it was found in relative to the
+   * repo root. Unlike allEnvPairsAcrossWorkflowsTree(), this is a raw byte
+   * scan of each tracked file's contents -- it is what makes AC4.4's "no
+   * OTHER Railway ID literal exists anywhere in the repo" a claim about the
+   * whole tracked tree, not just about env: mappings under
+   * .github/workflows/*.
    *
    * @return list<array{0:string,1:string}> [lowercased uuid, relative path]
    */
@@ -159,26 +209,26 @@ final class WorkflowStructureTest extends TestCase {
     }
 
     $found = [];
-    $dirIterator = new \RecursiveDirectoryIterator($root, \FilesystemIterator::SKIP_DOTS);
-    $filtered = new \RecursiveCallbackFilterIterator($dirIterator, static function (\SplFileInfo $file): bool {
-      if ($file->isDir()) {
-        return !in_array($file->getFilename(), self::UUID_SCAN_EXCLUDED_DIRS, true);
-      }
-      return !in_array($file->getFilename(), self::UUID_SCAN_EXCLUDED_FILES, true);
-    });
-    $iterator = new \RecursiveIteratorIterator($filtered);
-
-    foreach ($iterator as $fileInfo) {
-      /** @var \SplFileInfo $fileInfo */
-      if (!$fileInfo->isFile() || !$fileInfo->isReadable()) {
+    foreach (self::gitTrackedFiles($root) as $relative) {
+      $segments = explode('/', $relative);
+      $filename = end($segments);
+      $dirSegments = array_slice($segments, 0, -1);
+      if (array_intersect($dirSegments, self::UUID_SCAN_EXCLUDED_DIRS) !== []) {
         continue;
       }
-      $contents = @file_get_contents($fileInfo->getPathname());
+      if (in_array($filename, self::UUID_SCAN_EXCLUDED_FILES, true)) {
+        continue;
+      }
+
+      $path = $root.'/'.$relative;
+      if (!is_file($path) || !is_readable($path)) {
+        continue;
+      }
+      $contents = @file_get_contents($path);
       if ($contents === false || $contents === '') {
         continue;
       }
       if (preg_match_all(self::UUID_LITERAL_RE, $contents, $matches) > 0) {
-        $relative = ltrim(substr($fileInfo->getPathname(), strlen($root)), '/');
         foreach ($matches[0] as $uuid) {
           $found[] = [strtolower($uuid), $relative];
         }
