@@ -381,13 +381,16 @@ jobs:
         id: probe
         env:
           IMAGE: ${{ steps.ref.outputs.image }}
-          # A SEPARATE credential expression from `Log in to GHCR`'s GHCR_TOKEN
-          # above -- same underlying installation token, but this one talks to
-          # api.github.com (the Packages REST API), not the ghcr.io registry
-          # API, and only the auth-failure branch below ever reads it.
-          GHCR_PACKAGES_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The SAME installation token `Log in to GHCR` above already used to
+          # authenticate to ghcr.io, and the SAME token the eventual push
+          # below uses -- the auth-shaped branch exchanges it for a registry
+          # pull token directly from ghcr.io itself, never from a different
+          # surface. See the rationale in that branch.
+          GHCR_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_REGISTRY_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq is required on the runner."; exit 1; }
           # A manifest read is the cheapest existence proof and pulls no layers.
           #
           # ABSENCE MUST BE PROVEN, NOT INFERRED FROM ANY FAILURE. "the probe
@@ -435,59 +438,77 @@ jobs:
           # "must fail closed" (the naive fix) would deadlock the FIRST-EVER
           # push forever, since that exact push is the one place `denied` is
           # expected on a correctly-configured token. So an auth-shaped answer
-          # is disambiguated below via a second, more authoritative source --
-          # the GitHub Packages REST API -- instead of guessed from either
-          # extreme.
+          # is disambiguated below via SAME-AUTH-DOMAIN REGISTRY
+          # DISAMBIGUATION (round 5) -- never guessed from either extreme.
           #
-          # BUT the Packages API's own 404 is NOT, by itself, proof that the
-          # package has never existed (P1, round 3 gate finding -- fixed
-          # round 4). GitHub's REST API deliberately answers 404, not
-          # 401/403, when a token cannot read a resource that DOES exist --
-          # by design, so an unauthorized caller can never learn whether a
-          # resource is absent or merely hidden from it. If this job's own
-          # GHCR_PACKAGES_API_TOKEN has a transient auth problem, the
-          # Packages-API call below would ALSO 404 -- indistinguishable, on
-          # its face, from the genuine first-push bootstrap case -- and
-          # trusting that 404 on faith (the pre-round-4 behaviour) would let a
-          # push through and overwrite an existing tag the instant auth
-          # recovers, which is the exact failure this whole guard exists to
-          # prevent. So before any Packages-API 404 is trusted as absence,
-          # this token's REST auth is proven independently with a
-          # MUST-SUCCEED CANARY CALL, in this same step: `GET
-          # /repos/<this repository>`, a resource this job's token must
-          # always be able to read under the `contents: read` permission
-          # already granted to this job. The canary targets a different
-          # resource from the Packages API on purpose -- the Packages API's
-          # own 404 is exactly the ambiguous signal being disambiguated, so it
-          # can never be asked to vouch for itself.
-          #   * canary != 200 (including unreachable) -> fails the job closed
-          #     immediately, cause=packages-api-auth-unprovable, before the
-          #     package status is even inspected: this token's auth could not
-          #     be proven, so no 404 it returns can be trusted either.
-          #   * canary 200, package 404 -> the package has never existed, so
-          #     no version and no tag could possibly exist yet either. This is
-          #     the one condition under which an auth-shaped registry answer
-          #     is safe to treat as absence -- the bootstrap case, not a
-          #     permissions problem.
-          #   * canary 200, package 200 -> the package exists (some version
-          #     was pushed at some point), so this exact tag cannot be ruled
-          #     out. Falls back to the same fail-closed refusal as before this
-          #     escape existed.
-          #   * canary 200, package anything else (non-2xx/404, or the
-          #     package call itself fails to reach api.github.com) -> also
-          #     fails closed; this escape only ever WIDENS the absence set for
-          #     the one narrow case it can prove, never narrows the
-          #     fail-closed default for every other case.
-          # Neither the underlying GHCR-denied-for-a-missing-package claim NOR
-          # this escape's own ability to call the Packages API and the canary
-          # under the installation token's real live permissions has been
-          # verified against an actual run -- this pipeline has never
-          # executed end to end. The M4 operator runbook's §6e first-run
-          # confirmation is what actually proves (or disproves) this path;
-          # until then this is a documented, fail-closed-compatible best
-          # effort, not a verified fact. Any other answer this probe doesn't
-          # recognize FAILS the job closed with a named cause instead of
-          # guessing. The registry's own message is never echoed — it is
+          # ROUND 3/4 HISTORY, AND WHY IT WAS REPLACED RATHER THAN PATCHED
+          # AGAIN. Round 3's bootstrap escape, and round 4's canary in front
+          # of it, both asked the GitHub Packages REST API (api.github.com)
+          # to vouch for the ghcr.io registry API's own `denied` answer --
+          # a DIFFERENT surface, with its own, separate authorization model.
+          # Round 4's gate finding (P1) was not a hole in that canary; it was
+          # fatal to the whole approach: `GET /repos/<repo>` proves this
+          # token's REST auth works IN GENERAL, but general REST auth and
+          # per-package (or even repo-vs-package) authorization are
+          # independent axes on that surface, so "canary 200, package 404"
+          # could still mean "hidden from me", not "absent" -- no amount of
+          # narrowing the canary closes a gap between two different auth
+          # domains. The Packages API can never authoritatively vouch for a
+          # claim about a registry it does not itself control.
+          #
+          # SO THIS PROBE NOW STAYS ENTIRELY INSIDE THE REGISTRY'S OWN AUTH
+          # DOMAIN -- THE SAME ONE THE PUSH BELOW USES -- INSTEAD OF ASKING A
+          # SEPARATE SURFACE TO VOUCH FOR IT:
+          #   1. Exchange this job's GITHUB_TOKEN for a registry PULL token
+          #      scoped to exactly this image, straight from ghcr.io's own
+          #      token endpoint (`GET https://ghcr.io/token?scope=repository:
+          #      <owner>/<repo>:pull&service=ghcr.io`, HTTP Basic auth --
+          #      the same credential `docker login` above already used). This
+          #      exchange must itself succeed (HTTP 200, a non-empty `.token`)
+          #      before anything downstream can be trusted --
+          #      cause=registry-auth-unprovable otherwise.
+          #   2. Read the manifest directly from the registry
+          #      (`GET https://ghcr.io/v2/<owner>/<repo>/manifests/<tag>`)
+          #      using THAT freshly exchanged token -- not docker CLI's own
+          #      credential store, and not any REST API on a different host.
+          #      * 404 -> AUTHORITATIVE absence. This token was just minted by
+          #        the registry itself, scoped for `pull` on exactly this
+          #        repository path; the registry answers 401/403 for a token
+          #        that failed to authenticate or was denied scope -- never a
+          #        clean 404 -- so a 404 handed to a token the registry itself
+          #        just vouched for cannot mean "hidden from you". There is no
+          #        unauthorized-existing reading left standing. Proceed to
+          #        build+push.
+          #      * 200 -> the tag exists. Whatever `docker manifest inspect`
+          #        answered above, this direct, same-auth-domain read just
+          #        confirmed the tag is really there -- fail closed
+          #        (immutability), cause=authorization-failure, rather than
+          #        silently falling through to the ordinary "exists=true, skip
+          #        the push" path above: reaching this branch at all means the
+          #        docker-CLI probe and this direct check disagreed about
+          #        something, and that disagreement is worth an operator's
+          #        eyes, not a silent skip.
+          #      * anything else (a non-200/404 status, or the request itself
+          #        failing to reach ghcr.io) -> fail closed,
+          #        cause=ambiguous-response; this check only ever WIDENS the
+          #        absence set for the one shape it can prove absolutely (a
+          #        404 against a token it just watched the registry mint),
+          #        never narrows the fail-closed default for any other
+          #        answer.
+          #
+          # THE REMAINING GAP, NAMED HONESTLY: a TOCTOU tail. A tag could
+          # still be created by some OTHER actor/token in the seconds between
+          # this check and the `Build and push` step below. That race is out
+          # of this guard's threat model -- it always was, even for the plain
+          # `docker manifest inspect` fast path above -- and this change does
+          # not widen or narrow it. Neither the token exchange NOR the direct
+          # manifest read has been verified against an actual run -- this
+          # pipeline has never executed end to end. The M4 operator runbook's
+          # §6e first-run confirmation is what actually proves (or disproves)
+          # this path; until then this is a documented, fail-closed-compatible
+          # best effort, not a verified fact. Any other answer this probe
+          # doesn't recognize FAILS the job closed with a named cause instead
+          # of guessing. The registry's own message is never echoed — it is
           # external text.
           set +e
           probe_error=$(docker manifest inspect "$IMAGE" 2>&1 >/dev/null)
@@ -499,54 +520,59 @@ jobs:
           else
             case "$probe_error" in
               *"denied"* | *"unauthorized"* | *"UNAUTHORIZED"* | *"forbidden"* | *"FORBIDDEN"*)
-                # BOOTSTRAP ESCAPE (P2, round 3) + AUTH CANARY (P1, round 4).
-                # Full rationale is in the comment block above this `case`;
-                # this is the mechanism only.
+                # SAME-AUTH-DOMAIN REGISTRY DISAMBIGUATION (round 5). Full
+                # rationale is in the comment block above this `case`; this is
+                # the mechanism only.
                 package_path="${IMAGE_REPOSITORY#ghcr.io/}"
-                package_owner="${package_path%%/*}"
-                package_name="${package_path#*/}"
+                token_file="${RUNNER_TEMP:-/tmp}/ghcr-pull-token.json"
 
-                # Prove this token's REST auth works BEFORE trusting anything
-                # the Packages API says below -- see the rationale above.
-                # GITHUB_REPOSITORY (owner/repo) is a default Actions runner
-                # env var; it is not declared in this step's env: block
-                # because every job step already has it.
+                # Step 1: exchange GITHUB_TOKEN for a registry pull token
+                # scoped to exactly this repository path, straight from
+                # ghcr.io's own token endpoint -- the SAME auth domain the
+                # push below uses, not a separate REST surface.
                 set +e
-                canary_http_status=$(curl -sS -o /dev/null -w '%{http_code}' \
-                  -H "Authorization: Bearer ${GHCR_PACKAGES_API_TOKEN}" \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "https://api.github.com/repos/${GITHUB_REPOSITORY}")
-                canary_curl_status=$?
+                token_http_status=$(curl -sS -o "$token_file" -w '%{http_code}' --max-time 30 \
+                  -u "${GHCR_REGISTRY_ACTOR}:${GHCR_REGISTRY_TOKEN}" \
+                  "https://ghcr.io/token?scope=repository:${package_path}:pull&service=ghcr.io")
+                token_curl_status=$?
                 set -e
-                if [ "$canary_curl_status" -ne 0 ] || [ "$canary_http_status" != "200" ]; then
-                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=packages-api-auth-unprovable. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and this job's token could not be proven to have working REST auth before the Packages-API bootstrap check can be trusted (canary GET /repos/${GITHUB_REPOSITORY} returned curl exit ${canary_curl_status}, HTTP ${canary_http_status}, expected HTTP 200). A 404 from the Packages API is not, on its own, proof that a package has never existed -- GitHub deliberately answers 404, not 401/403, when a token cannot read a resource that DOES exist -- so a 404 cannot be trusted while this token's own auth is unproven. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's permissions and re-run."
+                pull_token=""
+                if [ "$token_curl_status" -eq 0 ] && [ "$token_http_status" = "200" ]; then
+                  pull_token=$(jq -r '.token // empty' "$token_file" 2>/dev/null || true)
+                fi
+                rm -f "$token_file"
+                if [ -z "$pull_token" ]; then
+                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=registry-auth-unprovable. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and this job could not exchange its own GITHUB_TOKEN for a registry pull token on ${package_path} directly from ghcr.io (GET https://ghcr.io/token?scope=repository:${package_path}:pull&service=ghcr.io returned curl exit ${token_curl_status}, HTTP ${token_http_status}, expected HTTP 200 with a non-empty token). A 404 read with an unproven token cannot be trusted as absence. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's permissions and re-run."
                   exit 1
                 fi
 
+                # Step 2: read the manifest directly from the registry with
+                # THAT exchanged pull token -- docker v2 and OCI manifest
+                # media types both offered, since either shape is a valid
+                # existence proof and this is a plain existence check, not a
+                # pull.
                 set +e
-                package_http_status=$(curl -sS -o /dev/null -w '%{http_code}' \
-                  -H "Authorization: Bearer ${GHCR_PACKAGES_API_TOKEN}" \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "https://api.github.com/users/${package_owner}/packages/container/${package_name}")
-                curl_status=$?
+                manifest_http_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+                  -H "Authorization: Bearer ${pull_token}" \
+                  -H "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json" \
+                  "https://ghcr.io/v2/${package_path}/manifests/${GITHUB_SHA}")
+                manifest_curl_status=$?
                 set -e
-                if [ "$curl_status" -ne 0 ]; then
-                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and the Packages-API bootstrap check could not be reached (curl exit ${curl_status}) to tell a first-ever push apart from a genuine auth problem. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's package permissions/visibility and re-run."
+                if [ "$manifest_curl_status" -ne 0 ]; then
+                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=ambiguous-response. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and the direct, same-auth-domain manifest read using a freshly exchanged pull token failed to complete (curl exit ${manifest_curl_status}). Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
                   exit 1
                 fi
-                case "$package_http_status" in
+                case "$manifest_http_status" in
                   404)
                     echo "exists=false" >> "$GITHUB_OUTPUT"
-                    echo "${IMAGE_REPOSITORY} has never been pushed before (the auth canary proved this token's REST auth works, and the Packages API confirms the package itself does not exist yet) -- this is the first-push bootstrap case, not an auth failure. ${IMAGE} does not exist yet — it will be built and pushed."
+                    echo "${IMAGE_REPOSITORY} does not have this tag yet (a freshly exchanged, correctly-scoped registry pull token read a 404 directly from ghcr.io's own manifest endpoint -- an authoritative absence, since the registry itself can only 404 a token it just vouched for when the manifest genuinely is not there). ${IMAGE} does not exist yet — it will be built and pushed."
                     ;;
                   200)
-                    echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login. The Packages API confirms ${IMAGE_REPOSITORY} already exists (a version was pushed before), which rules out the first-push bootstrap case -- this is a genuine, unexplained authorization problem. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's package permissions/visibility and re-run."
+                    echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, but a direct, same-auth-domain manifest read with a freshly exchanged pull token confirms ${IMAGE} already exists. Refusing to build and push, because an existing tag must never be overwritten. Check why docker manifest inspect and the direct registry read disagreed, and re-run."
                     exit 1
                     ;;
                   *)
-                    echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and the Packages-API bootstrap check returned an unrecognized HTTP status (${package_http_status}) instead of a clean 404 or 200. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's package permissions/visibility and re-run."
+                    echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=ambiguous-response. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and the direct, same-auth-domain manifest read returned an unrecognized HTTP status (${manifest_http_status}) instead of a clean 404 or 200. Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
                     exit 1
                     ;;
                 esac
