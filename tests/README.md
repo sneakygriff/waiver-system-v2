@@ -1,7 +1,7 @@
 # phpunit micro-harness
 
-Minimal harness (not a full test suite) pinning down two specific correctness
-properties from the F1-fork-erasure hardening pass:
+Minimal harness (not a full test suite) pinning down specific correctness
+properties:
 
 1. `WaiverController::eraseWaiver()` rolls back ALL of its DELETEs
    (waiver_responses, audit_events, waiver_instances) atomically on a
@@ -9,6 +9,10 @@ properties from the F1-fork-erasure hardening pass:
 2. `Utils::verifySignedEnvelope()` checks the HMAC signature BEFORE consuming
    the nonce, so a bad-signature replay never burns a legitimate nonce — see
    `UtilsVerifySignedEnvelopeTest.php`.
+3. `migrations/run.php` applies migrations in numeric order, records progress
+   per statement, resumes a half-applied file at the exact failed statement,
+   and treats a pre-existing ledger row as "file fully applied" — see
+   `MigrationRunnerTest.php` (CI/CD M4, AC4.2).
 
 ## One-time setup
 
@@ -42,9 +46,49 @@ docker compose exec php vendor/bin/phpunit
 ```
 
 Tests that need the DB (`WaiverControllerEraseTest`,
-`UtilsVerifySignedEnvelopeTest`) call `$this->markTestSkipped(...)` if
-`waiver_test` is unreachable, so the suite still runs cleanly (skipped, not
-failed/erroring) in an environment with no DB up.
+`UtilsVerifySignedEnvelopeTest`, `MigrationRunnerTest`) call
+`$this->markTestSkipped(...)` if their schema is unreachable, so the suite still
+runs cleanly (skipped, not failed/erroring) in an environment with no DB up.
+
+CI must run it with `--fail-on-skipped`, which turns that convenience back into
+a gate: a pipeline whose database never came up then goes red instead of
+silently green.
+
+```bash
+docker compose exec php vendor/bin/phpunit --fail-on-skipped
+```
+
+## Notes on `MigrationRunnerTest`
+
+This one needs no `waiver_test` setup, but it does need a MySQL account that can
+`CREATE`/`DROP DATABASE` and `CREATE USER`: every test builds its own throwaway
+schema (`f2mig_<hash>`) plus a least-privilege `f2_migrunner` account granted
+only on that schema, spawns `php migrations/run.php --dir=<staged fixture>` as a
+child process with `STAGING_WAIVER_DB_URL` in its environment, and drops both
+afterwards. Defaults are compose's `root` / `rootpw`; override with
+`WAIVER_TEST_DB_ROOT_USER` / `WAIVER_TEST_DB_ROOT_PASS` (host and port come from
+`config/config.test.php`, i.e. `WAIVER_TEST_DB_HOST` / `WAIVER_TEST_DB_PORT`).
+
+It deliberately does not run the migrations as the `app` user, even though
+`redact()`'s ≥3-char word-boundary floor (`f2501d1`, regression-pinned by
+`MigrationRunnerTest::testShortAppCredentialsDoNotMangleWordsButStayMaskedAsCredentials`)
+now keeps a compose-style `app`/`app` credential from mangling the runner's
+own vocabulary (`already applied` no longer becomes `already
+<redacted:pass>lied`). Using a long, distinctive password for THIS suite's own
+dedicated `f2_migrunner` account is still the right default: it keeps every
+other test's log assertions unambiguous without depending on that fix, and
+matches the account's least-privilege intent (a real credential, not a
+throwaway "same as everything else" one).
+
+Fixture migration sets live in `tests/fixtures/migrations-*/` and are COPIED to
+a temp dir before each run — the resume and ledger-drift tests repair and
+corrupt migrations mid-flight, so the committed fixtures must stay pristine.
+Two fixture properties are load-bearing and are asserted by the tests
+themselves, because losing them would silently turn a test green forever:
+`migrations-numeric-order/` uses UNPADDED numbers (`1`, `2`, `10`) so
+lexicographic and numeric order actually differ, and
+`migrations-long-version/`'s filename is 33 characters so it overflows the
+legacy `VARCHAR(32)` version column.
 
 ## Notes on `testEraseWaiverRollsBackOnMidTransactionFailure`
 

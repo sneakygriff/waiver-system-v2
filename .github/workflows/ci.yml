@@ -1,0 +1,1180 @@
+# =============================================================================
+# CI — the waiver fork's staging pipeline (CI/CD Milestone 4: AC4.1, AC4.3,
+# AC4.4, AC4.5, and the log-hygiene half of AC4.6).
+#
+# This is the fork's FIRST workflow. Before it, the fork deployed by Railway's
+# git auto-deploy building `docker/php/Dockerfile` straight from a push, with
+# no gate, no migration step, no image identity and no signal to the admin repo.
+# This file replaces that with one ordered chain:
+#
+#     phpunit ─┬─▶ image (GHCR build+push)
+#              ├─▶ dump  ──▶ migrate ──▶ deploy ──▶ health ──▶ dispatch
+#              └───────────────────────────────────┘ (deploy also needs image)
+#
+# ── ONE TRIGGER, EXACTLY: push to `master` ──────────────────────────────────
+#   `master` is this fork's release branch (NOT `main` — the admin repo's is
+#   `main`, the wizard's is `master`; the M2 runbook reality-sync exists because
+#   that difference was got wrong once already). No `pull_request`, no tags, no
+#   `workflow_dispatch`. That is SECURITY, not tidiness: this workflow carries
+#   RAILWAY_STAGING_TOKEN, STAGING_WAIVER_DB_URL and ADMIN_DISPATCH_PAT, and any
+#   PR-context trigger would expose all three to whoever opened the PR.
+#
+# ── STEP ORDER IS THE MECHANISM (AC4.3) ─────────────────────────────────────
+#   dump → migrate → deploy → health → dispatch, each `needs:`-gated on the one
+#   before it. A failing migration therefore aborts the run with the PREVIOUS
+#   image still serving on Railway: not because anything rolls back (nothing
+#   does — MySQL DDL implicitly commits, see migrations/README.md), but because
+#   the deploy job has not run and cannot run. The pre-migrate snapshot exists
+#   for the same reason: it is taken while the database is still in the state
+#   the running image expects.
+#
+# ── EVERY LATER JOB `needs:` THE GATE ───────────────────────────────────────
+#   No job in this file can start unless `phpunit` went green, and each states
+#   that edge DIRECTLY rather than relying on transitivity, so the property is
+#   readable one job at a time (and statically checkable — tests/ pins it).
+#
+# ── CONCURRENCY (D13 policy, same as the admin and wizard pipelines) ────────
+#   One group, `cancel-in-progress: false`. A RUNNING pipeline is never
+#   cancelled: a half-applied migration plus a half-flipped Railway image is
+#   worse than a late run. GitHub keeps one PENDING slot per group, so rapid
+#   pushes can displace an intermediate commit's pending run — "the latest push
+#   is always deployed" is the property, not "every push is".
+#
+# ── ARMED, BUT FAIL-FAST RED UNTIL THE OPERATOR PROVISIONS (M3 precedent) ───
+#   The dump, migrate, deploy and dispatch jobs each begin with a presence check
+#   for the secrets they need, and the health job asserts a DNS name that does
+#   not resolve yet. Until the operator completes the M4 runbook's provisioning
+#   sequence (Railway staging environment → PII-distinctness gate → staging DB
+#   baseline → secrets), those jobs go RED naming exactly what is missing. That
+#   red is the intended state, not a defect: nothing here is stubbed into a
+#   no-op, and no step is allowed to swallow a failure. Provisioning is what
+#   arms the deploy path — and it is deliberately the LAST step of the runbook,
+#   so this pipeline cannot touch a Railway environment before the PII gate has
+#   passed.
+#
+#   Secrets this workflow expects (names only — the operator sets them; the
+#   admin repo's scripts/verify-tokens.ts audits this exact list):
+#     STAGING_WAIVER_DB_URL  mysql://user:pass@host:3306/db   (dump + migrate)
+#     RAILWAY_STAGING_TOKEN  Railway PROJECT token, staging-scoped   (deploy)
+#     ADMIN_DISPATCH_PAT     fine-grained PAT on the admin repo only (dispatch)
+#   GHCR needs NO secret: the image job uses the built-in GITHUB_TOKEN with
+#   `packages: write` — an ephemeral installation token is strictly less
+#   credential surface than a long-lived PAT, and it cannot reach anything
+#   outside this repository.
+#
+# ── LOG HYGIENE (AC4.6) ─────────────────────────────────────────────────────
+#   * STAGING_WAIVER_DB_URL is passed to every consumer as an ENV VALUE and is
+#     never interpolated into a command line, never printed, and never derived
+#     into printed parts. The dump credentials are written to a 0600 file by a
+#     python one-liner that reads the URL from the environment.
+#   * The database dump goes ONLY to a run artifact. No step ever reads a row
+#     of it into the log.
+#   * No `${{ }}` expression is ever expanded INSIDE a `run:` block — external
+#     and secret values reach shell code exclusively through `env:`, so nothing
+#     from an API response or a secret can be spliced into the script text.
+#   * Every value written to $GITHUB_OUTPUT first proves it is a single-line
+#     token of [A-Za-z0-9._/:@-] (`safe_token`), the same charset the admin
+#     staging.yml enforces on client_payload values. A newline in a step output
+#     forges further `key=value` lines and `::workflow commands::`.
+#   * API error BODIES are never echoed: status codes, error counts and
+#     charset-stripped GraphQL error codes only.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+
+# Least privilege by default; each job grants only what it needs.
+permissions: {}
+
+# SHELL STRICTNESS, declared once for the whole file (the admin and wizard
+# pipelines carry the same block). Without it, `run:` blocks get the runner's
+# IMPLICIT default (`bash -e {0}`) — errexit on, pipefail OFF, and neither
+# written down. With `shell: bash` GitHub invokes
+# `bash --noprofile --norc -eo pipefail {0}`, so every step fails on the first
+# failing command AND on any failing stage of a pipeline. Multi-line scripts
+# additionally `set -euo pipefail` for nounset.
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: waiver-staging
+  cancel-in-progress: false
+
+env:
+  # ── The image identity (AC4.1/AC4.4) ──────────────────────────────────────
+  # The registry path is written out rather than derived from
+  # `github.repository` because it is a CONTRACT, not a convenience: the admin
+  # manifest job refuses any staging image that is not `ghcr.io/*`, and the tag
+  # is what M2's manifest pins. GHCR paths are lowercase; the image job asserts
+  # this literal still matches this repository before it pushes anything.
+  IMAGE_REPOSITORY: ghcr.io/sneakygriff/waiver-system-v2
+
+  # ── Railway staging topology (AC4.4: EXACTLY ONE ID PAIR, STAGING ONLY) ────
+  # These are IDENTIFIERS, not secrets, so they live here in the open where a
+  # static check can see that there is exactly one pair and that no PRODUCTION
+  # Railway id exists anywhere in this repository. They are EMPTY until the
+  # operator provisions the staging environment (M4 runbook §5 step 1) and
+  # fills them in; the deploy job refuses to start while either is blank.
+  #
+  # NEVER add a production environment/service id to this file, or to any file
+  # in this repository. The fork's CI deploys to staging and to nothing else;
+  # production waiver deploys are M5's promote lane, from the admin repo.
+  RAILWAY_STAGING_ENVIRONMENT_ID: ""
+  RAILWAY_STAGING_SERVICE_ID: ""
+  RAILWAY_API_URL: https://backboard.railway.app/graphql/v2
+
+  # ── The health gate (AC4.3) ───────────────────────────────────────────────
+  # CROSS-REPO DUPLICATED CONSTANTS. `WAIVER_STAGING_URL` is the admin repo's
+  # scripts/lib/endpoints.ts `WAIVER_STAGING_URL`, and `WAIVER_LOGIN_MARKER` is
+  # the admin repo's scripts/staging-smoke.ts `WAIVER_LOGIN_MARKER` — the same
+  # two values, asserted on both sides of the same deploy. They are duplicated
+  # rather than shared because the repositories share no build; if either side
+  # changes, change both (the admin comment says the same thing in reverse).
+  # The marker is a FIXED string from public/admin.php's `action=login` branch,
+  # never a loose "login" substring.
+  WAIVER_STAGING_URL: https://waiver.vrstudio.ro
+  WAIVER_LOGIN_MARKER: "<h1>Admin Login</h1>"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # phpunit — THE GATE. Nothing else in this file may run unless this job is
+  # green.
+  #
+  # `--fail-on-skipped` is the load-bearing flag (vacuous-test discipline, a
+  # standing lesson of this program). The fork's DB-backed tests call
+  # `markTestSkipped()` when `waiver_test` is unreachable, which is right for a
+  # laptop with no compose stack up and CATASTROPHIC in a gate: a
+  # misconfigured service container would turn the entire erase/nonce/migration
+  # suite into a green run that asserted nothing. With the flag, a skip is a
+  # failure, so the gate's greenness means the tests RAN.
+  #
+  # The MySQL service reproduces tests/README.md's documented one-time setup
+  # exactly — `waiver_test` schema, `app`/`app` with privileges on it alone,
+  # root/rootpw reachable (WaiverControllerEraseTest opens its own root
+  # connection to toggle privileges) — and then applies `001_init.sql`, which
+  # is the whole schema: 002 and 003 are baked into it (their own headers say
+  # so) and 004 is comment-only. `app` is deliberately NOT given global
+  # privileges: the erase test proves a mid-transaction rollback by REVOKEing
+  # `app`'s access to one table, and a wildcard grant would silently defeat it.
+  # ---------------------------------------------------------------------------
+  phpunit:
+    name: Gate — phpunit (+ dispatch-sender node:test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_DATABASE: waiver_test
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app
+        ports:
+          - 3306:3306
+        # The runner waits for this health-check before it starts the steps,
+        # so no step needs its own readiness loop.
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u root -prootpw"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The dispatch sender is node-only (node: builtins, no npm dependencies),
+      # so its suite runs here rather than in a job of its own: a job that did
+      # not `needs:` this gate would break the "everything descends from the
+      # gate" property, and one that did would cost a runner for two seconds of
+      # work.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # A suite that silently stops running must not green this gate — and
+      # exit status cannot tell the difference. `node --test <file>` reports the
+      # FILE ITSELF as one passing test, so an EMPTY test file exits 0 AND
+      # prints `# pass 1`: both "it exited 0" and "something passed" are
+      # compatible with zero real tests. (Measured, not assumed — the wizard
+      # repo shipped `node --test <dir>` that executed nothing and reported
+      # success, and the first draft of THIS check passed against an empty
+      # file for exactly the reason above.)
+      #
+      # So the TAP summary is read back against a FLOOR. The numbers are a
+      # floor, not an exact count: adding tests never breaks it, and deleting
+      # them deliberately means lowering the floor in the same change — which
+      # is the point.
+      - name: Test the dispatch sender
+        env:
+          MIN_TESTS: "40"
+          MIN_SUITES: "5"
+        run: |
+          set -euo pipefail
+          node --test --test-reporter=tap scripts/staging-dispatch.test.mjs | tee sender-tests.tap
+          tests=$(sed -n 's/^# tests \([0-9][0-9]*\)$/\1/p' sender-tests.tap | tail -n 1)
+          suites=$(sed -n 's/^# suites \([0-9][0-9]*\)$/\1/p' sender-tests.tap | tail -n 1)
+          failed=$(sed -n 's/^# fail \([0-9][0-9]*\)$/\1/p' sender-tests.tap | tail -n 1)
+          rm -f sender-tests.tap
+          if [ -z "$tests" ] || [ -z "$suites" ] || [ -z "$failed" ]; then
+            echo "::error::Could not read a TAP summary from the dispatch-sender run (see the output above). Refusing to treat an unreadable result as a pass."
+            exit 1
+          fi
+          if [ "$failed" != "0" ]; then
+            echo "::error::scripts/staging-dispatch.test.mjs reported ${failed} failing test(s) (see the TAP output above)."
+            exit 1
+          fi
+          if [ "$tests" -lt "$MIN_TESTS" ] || [ "$suites" -lt "$MIN_SUITES" ]; then
+            echo "::error::scripts/staging-dispatch.test.mjs ran ${tests} test(s) in ${suites} suite(s); the floor is ${MIN_TESTS} in ${MIN_SUITES}. node --test counts the FILE as one passing test, so a suite that stopped running still exits 0 — this floor is what notices. If tests were removed on purpose, lower the floor in the same change."
+            exit 1
+          fi
+          echo "dispatch sender: ${tests} test(s) in ${suites} suite(s), 0 failures."
+
+      # PHP 8.2 — the SAME minor the shipped image runs (docker/php/Dockerfile
+      # is FROM php:8.2-fpm-alpine), with the extensions that Dockerfile
+      # installs. Testing on a different PHP minor than production ships would
+      # make this gate answer a question nobody asked.
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: pdo_mysql, gd, zip, mbstring, dom, xml
+          coverage: none
+
+      - name: Prepare the waiver_test schema
+        env:
+          # Not a secret: this is the ephemeral service container's password,
+          # fixed by tests/README.md and hardcoded in WaiverControllerEraseTest's
+          # own root connection. It exists only for this job's lifetime.
+          MYSQL_PWD: rootpw
+        run: |
+          set -euo pipefail
+          if ! command -v mysql >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq mysql-client
+          fi
+          mysql -h 127.0.0.1 -P 3306 -u root -e "
+            CREATE DATABASE IF NOT EXISTS waiver_test;
+            GRANT ALL PRIVILEGES ON waiver_test.* TO 'app'@'%';
+            FLUSH PRIVILEGES;"
+          # 001_init.sql IS the schema. 002/003 are baked into it and 004 is
+          # comment-only (migrations/README.md), so applying 001 alone is the
+          # correct fresh-database bootstrap — and it is exactly what compose's
+          # initdb mount does locally.
+          mysql -h 127.0.0.1 -P 3306 -u root waiver_test < migrations/001_init.sql
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      # THE GATE. `--fail-on-skipped` — see this job's header.
+      - name: Run the phpunit suite
+        env:
+          # config/config.test.php reads these (defaulting to the compose
+          # `db` host); the service container is reachable on the runner's
+          # loopback via the port mapping above.
+          WAIVER_TEST_DB_HOST: 127.0.0.1
+          WAIVER_TEST_DB_PORT: "3306"
+          WAIVER_TEST_DB_NAME: waiver_test
+          WAIVER_TEST_DB_USER: app
+          WAIVER_TEST_DB_PASS: app
+          # MigrationRunnerTest creates and drops a scratch schema plus a
+          # dedicated migration account through a ROOT connection, and
+          # WaiverControllerEraseTest toggles table privileges the same way.
+          # Their defaults already match the service container above; stating
+          # them here makes the coupling explicit, so changing the service
+          # password cannot silently turn those suites into skips — which,
+          # under --fail-on-skipped, would be a red gate with a confusing cause.
+          WAIVER_TEST_DB_ROOT_USER: root
+          WAIVER_TEST_DB_ROOT_PASS: rootpw
+        run: vendor/bin/phpunit --fail-on-skipped
+
+  # ---------------------------------------------------------------------------
+  # image — AC4.1. Build `docker/php/Dockerfile` and push it to GHCR tagged with
+  # the full fork SHA, so a deployment can name the exact commit it runs.
+  #
+  # IMMUTABILITY GUARD. A tag that already exists is NEVER overwritten: the
+  # registry is probed first (a manifest read), and an existing tag makes the
+  # build+push a documented no-op. `<repo>:<sha>` must mean one and only one
+  # image forever — the admin manifest pins that string as the identity of a
+  # release, and M5's promote gate compares it. A re-run of this workflow on the
+  # same commit (or a force-push that replays a SHA) must not be able to make an
+  # already-promoted tag point at different bits.
+  #
+  # AUTH. The built-in GITHUB_TOKEN with `packages: write` — an installation
+  # token that expires with the job and can reach nothing outside this
+  # repository. This is a deliberate refinement of AC4.6's "GHCR push token"
+  # wording: it preserves the property the AC is about (no long-lived, no
+  # production credential in the fork) with strictly less credential surface
+  # than a PAT would have. If a review insists on the literal secret-name list,
+  # the fallback is a `GHCR_PUSH_TOKEN` repo secret here plus the same name in
+  # the admin repo's fork-secret audit and the runbook's §5 inventory — one
+  # list, all three places, or none.
+  # ---------------------------------------------------------------------------
+  image:
+    name: Build and push the staging image to GHCR
+    needs: [phpunit]
+    if: ${{ needs.phpunit.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      pushed: ${{ steps.build.outputs.pushed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute the image reference
+        id: ref
+        env:
+          REPO_FULL: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Every $GITHUB_OUTPUT write in this file proves it is a single-line
+          # token of the charset the admin repo accepts in a client_payload
+          # value, at the point of writing.
+          safe_token() {
+            case "${1:-}" in
+              "" | *[!A-Za-z0-9._/:@-]*) return 1 ;;
+            esac
+            return 0
+          }
+
+          # The pinned literal must still describe THIS repository. If the fork
+          # is ever renamed or moved, the push below would fail on a permission
+          # error from a registry path we no longer own — this says so first,
+          # in one line, naming the fix.
+          expected="ghcr.io/$(printf '%s' "$REPO_FULL" | tr '[:upper:]' '[:lower:]')"
+          if [ "$IMAGE_REPOSITORY" != "$expected" ]; then
+            echo "::error::IMAGE_REPOSITORY (${IMAGE_REPOSITORY}) no longer matches this repository (${expected}). Update the env constant in this workflow AND the admin repo's manifest expectations together — the image reference is a cross-repo contract."
+            exit 1
+          fi
+
+          image="${IMAGE_REPOSITORY}:${GITHUB_SHA}"
+          if ! safe_token "$image"; then
+            echo "::error::The computed image reference is not a single-line safe token (value withheld)."
+            exit 1
+          fi
+          echo "image reference: ${image}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        env:
+          # The ephemeral installation token, not a PAT. `--password-stdin`
+          # keeps it off the process table; docker's own output never repeats
+          # it, and GitHub masks it regardless.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USER" --password-stdin
+
+      - name: Probe GHCR for an existing tag
+        id: probe
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+          # The SAME installation token `Log in to GHCR` above already used to
+          # authenticate to ghcr.io, and the SAME token the eventual push
+          # below uses -- the auth-shaped branch exchanges it for a registry
+          # pull token directly from ghcr.io itself, never from a different
+          # surface. See the rationale in that branch.
+          GHCR_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_REGISTRY_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq is required on the runner."; exit 1; }
+          # A manifest read is the cheapest existence proof and pulls no layers.
+          #
+          # ABSENCE MUST BE PROVEN, NOT INFERRED FROM ANY FAILURE. "the probe
+          # exited non-zero, so the tag must be free" would let a transient
+          # registry hiccup rebuild and OVERWRITE an existing tag — the exact
+          # thing this guard exists to prevent, and worse than a red run because
+          # a promoted `:<sha>` would silently start meaning different bits.
+          #
+          # So the absence set is narrowed to explicit not-found SHAPES only:
+          # the OCI distribution spec's documented not-found error codes
+          # (MANIFEST_UNKNOWN / NAME_UNKNOWN) and docker CLI's textual
+          # renderings of the same ("manifest unknown", "name unknown", "no
+          # such manifest"). A bare "not found" or "404" substring is
+          # deliberately NOT in this set, even though real not-found answers
+          # often do contain one: this probe's tag is the 40-hex GITHUB_SHA,
+          # and roughly 1 in 110 SHAs contains the digits "404" somewhere in
+          # their hex; docker's transport-error text quotes the full manifest
+          # URL INCLUDING that tag (e.g. `Get "https://ghcr.io/v2/.../
+          # manifests/<sha>": connection reset by peer`), so a bare "404"
+          # pattern can mis-bucket a transient, unrelated network failure as
+          # "tag absent" purely because the SHA happened to contain that
+          # substring -- reopening exactly the overwrite path this guard
+          # exists to close. (This is not hypothetical: an earlier revision of
+          # this probe carried that pattern for one round.) The OCI codes and
+          # docker's exact textual phrasings above are the only shapes this
+          # probe trusts as absence, and none of them can appear inside a
+          # bare hex string or a bare decimal status code.
+          #
+          # ORDER ALSO MATTERS, independent of the above: the authorization
+          # branch is checked BEFORE the absence branch, so even if some
+          # future absence pattern were ever broadened again, it could never
+          # shadow a genuine auth-failure answer into the wrong bucket -- the
+          # more dangerous of the two mis-buckets (silently allowing an
+          # overwrite) always loses the race to the safe one (failing closed).
+          #
+          # `denied` / `unauthorized` / `forbidden` are handled, not simply
+          # excluded: this probe runs after a successful `docker login`, so an
+          # auth-shaped answer at that point is anomalous FOR AN EXISTING
+          # package -- BUT GHCR is reported (F3, unverified live) to answer
+          # `denied` for a container package that has never been pushed at
+          # all, since a nonexistent private-by-default package cannot be
+          # told apart from one this token merely can't read. Treating every
+          # `denied` as "must be absent" (the old behaviour) would let a push
+          # overwrite a tag that genuinely exists; treating every `denied` as
+          # "must fail closed" (the naive fix) would deadlock the FIRST-EVER
+          # push forever, since that exact push is the one place `denied` is
+          # expected on a correctly-configured token. So an auth-shaped answer
+          # is disambiguated below via SAME-AUTH-DOMAIN REGISTRY
+          # DISAMBIGUATION (round 5) -- never guessed from either extreme.
+          #
+          # ROUND 3/4 HISTORY, AND WHY IT WAS REPLACED RATHER THAN PATCHED
+          # AGAIN. Round 3's bootstrap escape, and round 4's canary in front
+          # of it, both asked the GitHub Packages REST API (api.github.com)
+          # to vouch for the ghcr.io registry API's own `denied` answer --
+          # a DIFFERENT surface, with its own, separate authorization model.
+          # Round 4's gate finding (P1) was not a hole in that canary; it was
+          # fatal to the whole approach: `GET /repos/<repo>` proves this
+          # token's REST auth works IN GENERAL, but general REST auth and
+          # per-package (or even repo-vs-package) authorization are
+          # independent axes on that surface, so "canary 200, package 404"
+          # could still mean "hidden from me", not "absent" -- no amount of
+          # narrowing the canary closes a gap between two different auth
+          # domains. The Packages API can never authoritatively vouch for a
+          # claim about a registry it does not itself control.
+          #
+          # SO THIS PROBE NOW STAYS ENTIRELY INSIDE THE REGISTRY'S OWN AUTH
+          # DOMAIN -- THE SAME ONE THE PUSH BELOW USES -- INSTEAD OF ASKING A
+          # SEPARATE SURFACE TO VOUCH FOR IT:
+          #   1. Exchange this job's GITHUB_TOKEN for a registry PULL token
+          #      scoped to exactly this image, straight from ghcr.io's own
+          #      token endpoint (`GET https://ghcr.io/token?scope=repository:
+          #      <owner>/<repo>:pull&service=ghcr.io`, HTTP Basic auth --
+          #      the same credential `docker login` above already used). This
+          #      exchange must itself succeed (HTTP 200, a non-empty `.token`)
+          #      before anything downstream can be trusted --
+          #      cause=registry-auth-unprovable otherwise.
+          #   2. Read the manifest directly from the registry
+          #      (`GET https://ghcr.io/v2/<owner>/<repo>/manifests/<tag>`)
+          #      using THAT freshly exchanged token -- not docker CLI's own
+          #      credential store, and not any REST API on a different host.
+          #      * 404 -> AUTHORITATIVE absence. This token was just minted by
+          #        the registry itself, scoped for `pull` on exactly this
+          #        repository path; the registry answers 401/403 for a token
+          #        that failed to authenticate or was denied scope -- never a
+          #        clean 404 -- so a 404 handed to a token the registry itself
+          #        just vouched for cannot mean "hidden from you". There is no
+          #        unauthorized-existing reading left standing. Proceed to
+          #        build+push.
+          #      * 200 -> the tag exists. Whatever `docker manifest inspect`
+          #        answered above, this direct, same-auth-domain read just
+          #        confirmed the tag is really there -- fail closed
+          #        (immutability), cause=authorization-failure, rather than
+          #        silently falling through to the ordinary "exists=true, skip
+          #        the push" path above: reaching this branch at all means the
+          #        docker-CLI probe and this direct check disagreed about
+          #        something, and that disagreement is worth an operator's
+          #        eyes, not a silent skip.
+          #      * anything else (a non-200/404 status, or the request itself
+          #        failing to reach ghcr.io) -> fail closed,
+          #        cause=ambiguous-response; this check only ever WIDENS the
+          #        absence set for the one shape it can prove absolutely (a
+          #        404 against a token it just watched the registry mint),
+          #        never narrows the fail-closed default for any other
+          #        answer.
+          #
+          # THE REMAINING GAP, NAMED HONESTLY: a TOCTOU tail. A tag could
+          # still be created by some OTHER actor/token in the seconds between
+          # this check and the `Build and push` step below. That race is out
+          # of this guard's threat model -- it always was, even for the plain
+          # `docker manifest inspect` fast path above -- and this change does
+          # not widen or narrow it. Neither the token exchange NOR the direct
+          # manifest read has been verified against an actual run -- this
+          # pipeline has never executed end to end. The M4 operator runbook's
+          # §6e first-run confirmation is what actually proves (or disproves)
+          # this path; until then this is a documented, fail-closed-compatible
+          # best effort, not a verified fact. Any other answer this probe
+          # doesn't recognize FAILS the job closed with a named cause instead
+          # of guessing. The registry's own message is never echoed — it is
+          # external text.
+          set +e
+          probe_error=$(docker manifest inspect "$IMAGE" 2>&1 >/dev/null)
+          probe_status=$?
+          set -e
+          if [ "$probe_status" -eq 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${IMAGE} already exists in GHCR — this tag is immutable, so the build and push below are skipped."
+          else
+            case "$probe_error" in
+              *"denied"* | *"unauthorized"* | *"UNAUTHORIZED"* | *"forbidden"* | *"FORBIDDEN"*)
+                # SAME-AUTH-DOMAIN REGISTRY DISAMBIGUATION (round 5). Full
+                # rationale is in the comment block above this `case`; this is
+                # the mechanism only.
+                package_path="${IMAGE_REPOSITORY#ghcr.io/}"
+                token_file="${RUNNER_TEMP:-/tmp}/ghcr-pull-token.json"
+
+                # Step 1: exchange GITHUB_TOKEN for a registry pull token
+                # scoped to exactly this repository path, straight from
+                # ghcr.io's own token endpoint -- the SAME auth domain the
+                # push below uses, not a separate REST surface.
+                set +e
+                token_http_status=$(curl -sS -o "$token_file" -w '%{http_code}' --max-time 30 \
+                  -u "${GHCR_REGISTRY_ACTOR}:${GHCR_REGISTRY_TOKEN}" \
+                  "https://ghcr.io/token?scope=repository:${package_path}:pull&service=ghcr.io")
+                token_curl_status=$?
+                set -e
+                pull_token=""
+                if [ "$token_curl_status" -eq 0 ] && [ "$token_http_status" = "200" ]; then
+                  pull_token=$(jq -r '.token // empty' "$token_file" 2>/dev/null || true)
+                fi
+                rm -f "$token_file"
+                if [ -z "$pull_token" ]; then
+                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=registry-auth-unprovable. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and this job could not exchange its own GITHUB_TOKEN for a registry pull token on ${package_path} directly from ghcr.io (GET https://ghcr.io/token?scope=repository:${package_path}:pull&service=ghcr.io returned curl exit ${token_curl_status}, HTTP ${token_http_status}, expected HTTP 200 with a non-empty token). A 404 read with an unproven token cannot be trusted as absence. Refusing to build and push, because an existing tag must never be overwritten. Check the GHCR token's permissions and re-run."
+                  exit 1
+                fi
+
+                # Step 2: read the manifest directly from the registry with
+                # THAT exchanged pull token -- docker v2 and OCI manifest
+                # media types both offered, since either shape is a valid
+                # existence proof and this is a plain existence check, not a
+                # pull.
+                set +e
+                manifest_http_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+                  -H "Authorization: Bearer ${pull_token}" \
+                  -H "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json" \
+                  "https://ghcr.io/v2/${package_path}/manifests/${GITHUB_SHA}")
+                manifest_curl_status=$?
+                set -e
+                if [ "$manifest_curl_status" -ne 0 ]; then
+                  echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=ambiguous-response. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and the direct, same-auth-domain manifest read using a freshly exchanged pull token failed to complete (curl exit ${manifest_curl_status}). Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
+                  exit 1
+                fi
+                case "$manifest_http_status" in
+                  404)
+                    echo "exists=false" >> "$GITHUB_OUTPUT"
+                    echo "${IMAGE_REPOSITORY} does not have this tag yet (a freshly exchanged, correctly-scoped registry pull token read a 404 directly from ghcr.io's own manifest endpoint -- an authoritative absence, since the registry itself can only 404 a token it just vouched for when the manifest genuinely is not there). ${IMAGE} does not exist yet — it will be built and pushed."
+                    ;;
+                  200)
+                    echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=authorization-failure. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, but a direct, same-auth-domain manifest read with a freshly exchanged pull token confirms ${IMAGE} already exists. Refusing to build and push, because an existing tag must never be overwritten. Check why docker manifest inspect and the direct registry read disagreed, and re-run."
+                    exit 1
+                    ;;
+                  *)
+                    echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=ambiguous-response. The registry answered an authorization denial (denied/unauthorized/forbidden) after a successful login, and the direct, same-auth-domain manifest read returned an unrecognized HTTP status (${manifest_http_status}) instead of a clean 404 or 200. Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
+                    exit 1
+                    ;;
+                esac
+                ;;
+              *"MANIFEST_UNKNOWN"* | *"manifest unknown"* | *"NAME_UNKNOWN"* | *"name unknown"* | *"no such manifest"*)
+                echo "exists=false" >> "$GITHUB_OUTPUT"
+                echo "${IMAGE} does not exist yet — it will be built and pushed."
+                ;;
+              *)
+                echo "::error::Could not determine whether ${IMAGE} already exists in GHCR: cause=ambiguous-response. The registry answered something that is neither a not-found shape nor a recognized authorization failure (message withheld — external text). Refusing to build and push, because an existing tag must never be overwritten. Re-run once the registry is reachable."
+                exit 1
+                ;;
+            esac
+          fi
+
+      - name: Build and push
+        id: build
+        if: ${{ steps.probe.outputs.exists == 'false' }}
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker build --file docker/php/Dockerfile --tag "$IMAGE" .
+          docker push "$IMAGE"
+          # Prove the tag is now readable from the registry rather than trusting
+          # the push's exit status: everything downstream (Railway's pull, the
+          # manifest pin) reads the registry, not this runner's daemon.
+          if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "::error::${IMAGE} was pushed but cannot be read back from GHCR. Railway would fail to pull it."
+            exit 1
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Record the skipped push
+        if: ${{ steps.probe.outputs.exists == 'true' }}
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Waiver staging image"
+            echo ""
+            echo "\`${IMAGE}\` already existed in GHCR — reused, not rebuilt (tags are immutable)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # dump — the pre-migrate snapshot (AC4.3's recoverability half).
+  #
+  # Taken BEFORE the migration and BEFORE any deploy, so it captures the
+  # database in the state the currently-running image expects. It is the only
+  # undo this pipeline has: `migrations/run.php` never claims a rollback,
+  # because MySQL DDL implicitly commits and per-file atomicity would be a lie
+  # (migrations/README.md).
+  #
+  # The dump is written straight to a file and uploaded as a run artifact. No
+  # step reads it, greps it, or counts rows in it: staging data is a scrubbed
+  # copy of production data (M4 runbook §5 step 2) and a CI log is not a place
+  # for it. Retention is short for the same reason.
+  # ---------------------------------------------------------------------------
+  dump:
+    name: Snapshot the staging waiver database
+    needs: [phpunit]
+    if: ${{ needs.phpunit.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # FIRST step on purpose: an unprovisioned secret must cost one line of
+      # log, not a client install plus a connection timeout. Presence only —
+      # the value is never echoed, and its validity is proven by the dump.
+      - name: Require STAGING_WAIVER_DB_URL
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${STAGING_WAIVER_DB_URL:-}" ]; then
+            echo "::error::STAGING_WAIVER_DB_URL is not set on this repository. Add it as an Actions secret in the form mysql://user:pass@host:3306/dbname pointing at the RAILWAY STAGING waiver database — never production (M4 operator runbook §5). Refusing to continue: without a pre-migrate snapshot there is no undo for the migration two jobs from now."
+            exit 1
+          fi
+          echo "STAGING_WAIVER_DB_URL is present (value never echoed)."
+
+      - name: Dump the staging database
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+        run: |
+          set -euo pipefail
+          if ! command -v mysqldump >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq mysql-client
+          fi
+
+          mkdir -p dump
+          # The credentials file is removed on EVERY exit path, including a
+          # failed dump — the runner is ephemeral, but a credentials file that
+          # outlives the command that needed it is a habit worth not having.
+          trap 'rm -f dump/my.cnf dump/database' EXIT
+          # The URL is parsed IN PYTHON, from the environment, into a 0600
+          # defaults file. Two properties this buys, both AC4.6:
+          #   * the password never appears on a command line (mysqldump's argv
+          #     is world-readable through /proc while it runs), and
+          #   * no fragment of the URL is ever assigned to a shell variable that
+          #     could later be echoed. Nothing is printed but the host-less
+          #     confirmation below.
+          python3 - <<'PY'
+          import os, sys, urllib.parse
+
+          # Same URL contract migrations/run.php parses (migrations/README.md):
+          # mysql://user:pass@host:3306/dbname[?charset=...], with mysql2:// and
+          # mariadb:// accepted as scheme aliases and percent-decoding applied.
+          raw = os.environ["STAGING_WAIVER_DB_URL"]
+          parsed = urllib.parse.urlparse(raw)
+          if parsed.scheme not in ("mysql", "mysql2", "mariadb"):
+              sys.exit("::error::STAGING_WAIVER_DB_URL does not carry a mysql:// scheme (value withheld).")
+          database = parsed.path.lstrip("/")
+          if not database:
+              sys.exit("::error::STAGING_WAIVER_DB_URL names no database (value withheld).")
+          host = parsed.hostname or ""
+          if not host:
+              sys.exit("::error::STAGING_WAIVER_DB_URL names no host (value withheld).")
+          user = urllib.parse.unquote(parsed.username or "")
+          password = urllib.parse.unquote(parsed.password or "")
+
+          # A MySQL option file is not a neutral container: an unquoted `#`
+          # starts a comment, and a newline (%0A in the URL) would end the line
+          # and let the rest of a credential be read as another directive. Every
+          # value is therefore double-quoted with `\` and `"` escaped, and any
+          # control character is REFUSED rather than mangled into something that
+          # silently connects somewhere else.
+          def option(value):
+              if any(ord(character) < 0x20 for character in value):
+                  sys.exit("::error::STAGING_WAIVER_DB_URL carries a control character in its credentials (value withheld). Re-mint it percent-encoded, or without that character.")
+              return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+          with open("dump/my.cnf", "w", encoding="utf-8") as handle:
+              handle.write("[client]\n")
+              handle.write(f"host={option(host)}\n")
+              handle.write(f"port={parsed.port or 3306}\n")
+              handle.write(f"user={option(user)}\n")
+              handle.write(f"password={option(password)}\n")
+          os.chmod("dump/my.cnf", 0o600)
+          with open("dump/database", "w", encoding="utf-8") as handle:
+              handle.write(database)
+          PY
+
+          database=$(cat dump/database)
+          # --no-tablespaces: mysqldump 8 asks for the global PROCESS privilege
+          # otherwise, which a least-privileged staging user has no business
+          # holding. No --routines/--events: this schema has no stored programs
+          # (migrations 001–004 carry no DELIMITER blocks), so asking for them
+          # would only add privilege requirements the dump does not need.
+          # Triggers are included by default.
+          mysqldump --defaults-file=dump/my.cnf \
+            --single-transaction --no-tablespaces \
+            --result-file=dump/waiver-staging-pre-migrate.sql \
+            "$database"
+          rm -f dump/my.cnf dump/database
+          gzip -9 dump/waiver-staging-pre-migrate.sql
+          # Size only. Never a row, never a table name, never the target.
+          echo "snapshot written: $(stat -c %s dump/waiver-staging-pre-migrate.sql.gz) bytes (compressed)"
+
+      - name: Upload the snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: waiver-staging-pre-migrate-${{ github.sha }}
+          path: dump/waiver-staging-pre-migrate.sql.gz
+          if-no-files-found: error
+          # Short on purpose: this is a copy of the staging database, and a
+          # long-lived artifact is a long-lived copy of it.
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # migrate — AC4.3. Applies `migrations/run.php` to the staging database.
+  #
+  # A failure here aborts the run with Railway UNTOUCHED, because the deploy job
+  # is downstream and simply never starts. To make that assertable in the M7
+  # bad-migration drill, this job records the image Railway is serving BEFORE it
+  # migrates: the drill's property is then "the staging service still serves the
+  # image recorded in the failed run's log", which is the same image-equality
+  # property AC4.4 uses, read with the same live-verified query the admin repo's
+  # manifest job uses. (The alternative — Railway's active DEPLOYMENT id —
+  # would need an unverified second query shape to answer a weaker question.)
+  #
+  # That baseline is why this job needs the Railway token as well as the
+  # database URL: it reads Railway, it never writes it.
+  #
+  # `--dry-run` runs first as a pre-flight. It is provably write-free (it does
+  # not even create the ledger tables — migrations/README.md), so it costs one
+  # connection and turns "this migration was going to fail on statement 3" into
+  # a report before anything is applied.
+  #
+  # WHY THIS JOB RUNS IN A CONTAINER RATHER THAN USING setup-php. This is the
+  # job that holds STAGING_WAIVER_DB_URL and the Railway token, and the smallest
+  # honest way to give it PHP is the official `php:8.2-cli` image plus the one
+  # bundled extension `run.php` needs — no third-party action runs anywhere near
+  # these credentials. (The gate job, which holds no secret at all, does use
+  # setup-php: it needs a composer install and five extensions, and the trade is
+  # different when there is nothing to steal.) The image is the same PHP MINOR
+  # the shipped container runs, so "it worked in CI" means something.
+  # ---------------------------------------------------------------------------
+  migrate:
+    name: Migrate the staging waiver database
+    needs: [phpunit, dump]
+    if: ${{ needs.phpunit.result == 'success' && needs.dump.result == 'success' }}
+    runs-on: ubuntu-latest
+    container:
+      image: php:8.2-cli
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      previous_image: ${{ steps.baseline.outputs.previous_image }}
+    steps:
+      - name: Require the staging secrets
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${STAGING_WAIVER_DB_URL:-}" ] || missing="${missing} STAGING_WAIVER_DB_URL"
+          [ -n "${RAILWAY_TOKEN:-}" ] || missing="${missing} RAILWAY_STAGING_TOKEN"
+          [ -n "${RAILWAY_STAGING_ENVIRONMENT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)"
+          [ -n "${RAILWAY_STAGING_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_SERVICE_ID(workflow env constant)"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing:${missing}. Set the Actions secrets and fill the staging Railway id pair in this workflow's env block (M4 operator runbook §5 — provisioning is what ARMS this pipeline, and it comes AFTER the PII-distinctness gate). Nothing was migrated."
+            exit 1
+          fi
+          echo "Staging secrets and Railway staging ids are present (values never echoed)."
+
+      # `php:8.2-cli` ships neither `git` (actions/checkout prefers it) nor `jq`
+      # (the Railway read below), and `run.php` needs pdo_mysql — which is a
+      # bundled extension, so enabling it compiles nothing from the network.
+      # `run.php` is plain PDO with no composer autoload, so that is the whole
+      # dependency list.
+      - name: Prepare the container
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git jq curl
+          docker-php-ext-install pdo_mysql
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record the image Railway is serving (pre-migrate baseline)
+        id: baseline
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq is required on the runner."; exit 1; }
+          safe_token() {
+            case "${1:-}" in
+              "" | *[!A-Za-z0-9._/:@-]*) return 1 ;;
+            esac
+            return 0
+          }
+          # A Railway PROJECT token authenticates with this header (an
+          # account token would use `Authorization: Bearer`). Least privilege
+          # from day one: this credential can see one project and nothing else.
+          query=$(jq -nc --arg e "$RAILWAY_STAGING_ENVIRONMENT_ID" --arg s "$RAILWAY_STAGING_SERVICE_ID" '{
+            query: "query ($environmentId: String!, $serviceId: String!) { serviceInstance(environmentId: $environmentId, serviceId: $serviceId) { source { image } } }",
+            variables: { environmentId: $e, serviceId: $s }
+          }')
+          body=$(curl -sS --max-time 30 -X POST "$RAILWAY_API_URL" \
+            -H "Project-Access-Token: ${RAILWAY_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$query" || true)
+          # Guard the PARSE before reading fields out of it: an empty body (a
+          # network failure, or a rejection at the edge that never reached
+          # GraphQL) would otherwise make every `jq` below yield an empty string
+          # and turn a hard failure into a confusing one.
+          if [ -z "$body" ] || ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+            echo "::error::The Railway API returned no parseable JSON when reading the staging service (body withheld). Usually a network failure, or an auth rejection before GraphQL was reached — check RAILWAY_STAGING_TOKEN."
+            exit 1
+          fi
+          errors=$(printf '%s' "$body" | jq -r '(.errors // []) | length')
+          if [ "$errors" != "0" ]; then
+            # Bodies are never echoed. The GraphQL error CODES are, after being
+            # stripped to a safe charset — enough to tell NOT_AUTHORIZED from a
+            # bad field name on the first live run.
+            codes=$(printf '%s' "$body" | jq -r '[(.errors // [])[].extensions.code // "none"] | join(",")' | tr -cd 'A-Za-z0-9,_-' | cut -c1-120)
+            echo "::error::The Railway API returned ${errors} GraphQL error(s) reading the staging service (messages withheld; codes: ${codes:-none}). Check RAILWAY_STAGING_TOKEN's project scope and the staging id pair."
+            exit 1
+          fi
+          previous=$(printf '%s' "$body" | jq -r '.data.serviceInstance.source.image // empty')
+          if [ -z "$previous" ]; then
+            # A service still building from the repo (Railway's git deploy) has
+            # no source image. That is the pre-M4 state; it is not an error, and
+            # the drill reads "none" as a perfectly good baseline.
+            previous="none"
+          elif ! safe_token "$previous"; then
+            echo "::error::The Railway API reported a source image outside [A-Za-z0-9._/:@-] (value withheld — it is not a valid image reference and must never be echoed into a step output)."
+            exit 1
+          fi
+          echo "pre-migrate baseline — the staging service currently serves: ${previous}"
+          echo "previous_image=${previous}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Waiver staging migrate"
+            echo ""
+            echo "Pre-migrate baseline image: \`${previous}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The URL reaches run.php through the ENVIRONMENT, never through argv:
+      # the runner does not expand secrets into the script text, but an
+      # interpolated command line would still put the credential into the
+      # process table (and into any `set -x` a future edit adds).
+      - name: Pre-flight (read-only)
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+        run: php migrations/run.php --dry-run
+
+      - name: Apply pending migrations
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+        run: php migrations/run.php
+
+  # ---------------------------------------------------------------------------
+  # deploy — AC4.4. Point the Railway STAGING waiver service at the exact image
+  # this run published, deploy it, and then PROVE the service reports that exact
+  # reference.
+  #
+  # WHY THE ASSERT IS THE POINT. "We called the update mutation and it returned
+  # true" is not evidence: the admin manifest job pins the image Railway REPORTS
+  # for the staging service, and M5's promote gate compares that string. If the
+  # update silently landed on another environment, or the deploy rolled back to
+  # the previous image, this assert is the only thing standing between that and
+  # a manifest that lies about what staging runs. String equality, exact, no
+  # prefix matching.
+  #
+  # FIELD SHAPES. The READ (`serviceInstance { source { image } }`) is the same
+  # query the admin repo's staging.yml runs against this project today — it is
+  # live-verified. The two MUTATIONS are NOT: no builder on this milestone could
+  # call the Railway API (the token does not exist yet and provisioning is
+  # operator-gated), so their exact argument shape is confirmed by the operator's
+  # first live run, exactly as M3's §6e confirmations were. They fail loudly and
+  # BEFORE the health gate if they are wrong.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy the image to Railway staging
+    needs: [phpunit, image, migrate]
+    if: ${{ needs.phpunit.result == 'success' && needs.image.result == 'success' && needs.migrate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Require RAILWAY_STAGING_TOKEN and the staging ids
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${RAILWAY_TOKEN:-}" ] || missing="${missing} RAILWAY_STAGING_TOKEN(Actions secret)"
+          [ -n "${RAILWAY_STAGING_ENVIRONMENT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)"
+          [ -n "${RAILWAY_STAGING_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_SERVICE_ID(workflow env constant)"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing:${missing}. RAILWAY_STAGING_TOKEN must be a Railway PROJECT token scoped to the STAGING environment (never an account token, never production). The id pair is filled in this workflow's env block after the operator provisions the staging environment and the PII-distinctness gate passes (M4 operator runbook §5). Nothing was deployed."
+            exit 1
+          fi
+          echo "RAILWAY_STAGING_TOKEN and the staging id pair are present (values never echoed)."
+
+      - name: Point the staging service at this run's image and deploy it
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          PREVIOUS_IMAGE: ${{ needs.migrate.outputs.previous_image }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null 2>&1 || { echo "::error::jq is required on the runner."; exit 1; }
+          railway() {
+            curl -sS --max-time 60 -X POST "$RAILWAY_API_URL" \
+              -H "Project-Access-Token: ${RAILWAY_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$1" || true
+          }
+          # API bodies are never echoed; GraphQL error CODES are, stripped to a
+          # safe charset so nothing in them can forge a workflow command.
+          graphql_ok() {
+            if [ -z "${1:-}" ] || ! printf '%s' "$1" | jq -e . >/dev/null 2>&1; then
+              echo "::error::The Railway API returned no parseable JSON for the ${2} call (body withheld). Usually a network failure, or an auth rejection before GraphQL was reached."
+              return 1
+            fi
+            errors=$(printf '%s' "$1" | jq -r '(.errors // []) | length')
+            if [ "$errors" != "0" ]; then
+              codes=$(printf '%s' "$1" | jq -r '[(.errors // [])[].extensions.code // "none"] | join(",")' | tr -cd 'A-Za-z0-9,_-' | cut -c1-120)
+              echo "::error::The Railway API returned ${errors} GraphQL error(s) for the ${2} call (messages withheld; codes: ${codes:-none})."
+              return 1
+            fi
+            return 0
+          }
+
+          # A GraphQL mutation that answers `false` is a REFUSAL, not an error:
+          # HTTP 200, no `errors` array, and nothing changed. Treating that as
+          # success would send this run on to assert an image Railway was never
+          # asked to serve.
+          mutation_ok() {
+            graphql_ok "$1" "$2" || return 1
+            if [ "$(printf '%s' "$1" | jq -r --arg f "$2" '.data[$f] // "absent"')" = "false" ]; then
+              echo "::error::Railway answered ${2} = false: the call was accepted and DECLINED. Nothing was changed."
+              return 1
+            fi
+            return 0
+          }
+
+          echo "staging service: ${PREVIOUS_IMAGE} -> ${IMAGE}"
+
+          update=$(jq -nc --arg e "$RAILWAY_STAGING_ENVIRONMENT_ID" --arg s "$RAILWAY_STAGING_SERVICE_ID" --arg i "$IMAGE" '{
+            query: "mutation ($environmentId: String!, $serviceId: String!, $image: String!) { serviceInstanceUpdate(environmentId: $environmentId, serviceId: $serviceId, input: { source: { image: $image } }) }",
+            variables: { environmentId: $e, serviceId: $s, image: $i }
+          }')
+          mutation_ok "$(railway "$update")" serviceInstanceUpdate
+
+          deploy=$(jq -nc --arg e "$RAILWAY_STAGING_ENVIRONMENT_ID" --arg s "$RAILWAY_STAGING_SERVICE_ID" '{
+            query: "mutation ($environmentId: String!, $serviceId: String!) { serviceInstanceDeploy(environmentId: $environmentId, serviceId: $serviceId) }",
+            variables: { environmentId: $e, serviceId: $s }
+          }')
+          mutation_ok "$(railway "$deploy")" serviceInstanceDeploy
+
+          echo "deploy requested for ${IMAGE}"
+
+      # AC4.4's assertion, as its own step so a red here reads as "the deploy
+      # did not become the image we published" rather than "a mutation failed".
+      - name: Assert Railway staging serves exactly this image
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          BUDGET_SECONDS: "600"
+          RETRY_SECONDS: "15"
+        run: |
+          set -euo pipefail
+          safe_token() {
+            case "${1:-}" in
+              "" | *[!A-Za-z0-9._/:@-]*) return 1 ;;
+            esac
+            return 0
+          }
+          # The same query the admin repo's staging.yml manifest job runs
+          # against this service — so "what staging serves" has ONE definition
+          # across the two repositories, and this assert and that pin can never
+          # disagree about which value they mean.
+          query=$(jq -nc --arg e "$RAILWAY_STAGING_ENVIRONMENT_ID" --arg s "$RAILWAY_STAGING_SERVICE_ID" '{
+            query: "query ($environmentId: String!, $serviceId: String!) { serviceInstance(environmentId: $environmentId, serviceId: $serviceId) { source { image } } }",
+            variables: { environmentId: $e, serviceId: $s }
+          }')
+
+          deadline=$(( $(date +%s) + BUDGET_SECONDS ))
+          attempt=0
+          reported="none"
+          while :; do
+            attempt=$(( attempt + 1 ))
+            body=$(curl -sS --max-time 30 -X POST "$RAILWAY_API_URL" \
+              -H "Project-Access-Token: ${RAILWAY_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "$query" || true)
+            live=$(printf '%s' "$body" | jq -r '.data.serviceInstance.source.image // empty' 2>/dev/null || true)
+            if [ -n "$live" ] && safe_token "$live"; then
+              reported="$live"
+            elif [ -n "$live" ]; then
+              echo "::error::The Railway API reported a source image outside [A-Za-z0-9._/:@-] (value withheld). Refusing to compare or print it."
+              exit 1
+            fi
+            # EXACT string equality — never a prefix or a substring test. The
+            # manifest pins this string; "starts with the right registry" is not
+            # the same claim.
+            if [ "$reported" = "$IMAGE" ]; then
+              echo "attempt ${attempt}: Railway staging serves ${reported} — the image this run published."
+              {
+                echo ""
+                echo "Deployed image: \`${reported}\`"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt ${attempt}: Railway staging still reports ${reported}, not ${IMAGE} — the deploy has not landed yet."
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              break
+            fi
+            sleep "$RETRY_SECONDS"
+          done
+          echo "::error::Railway staging never reported ${IMAGE} within ${BUDGET_SECONDS}s (${attempt} attempts; last reported: ${reported}). The manifest pin the admin repo would record must be the image this run published, so this run stops here — the dispatch below never fires."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # health — AC4.3's "the deployed thing actually serves the app" gate.
+  #
+  # Follows redirects from the staging origin to `/admin.php?action=login` and
+  # requires a FIXED marker in the body. Not a status check: a 200 proves an
+  # HTTP server answered, not that the waiver app booted (the entrypoint's
+  # fail-closed sentinel refuses to serve with a placeholder secret, and nginx
+  # would still answer). Not a loose "login" substring either.
+  #
+  # This job holds NO secret: it probes a public origin. Until the operator
+  # points `waiver.vrstudio.ro` at the Railway staging service (M4 runbook §5),
+  # it fails on DNS — the same accepted red the admin repo's smoke waiver leg
+  # carries, on purpose, from the same cause.
+  # ---------------------------------------------------------------------------
+  health:
+    name: Health-gate the staging origin
+    needs: [phpunit, deploy]
+    if: ${{ needs.phpunit.result == 'success' && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - name: Poll for the rendered admin login page
+        env:
+          BUDGET_SECONDS: "300"
+          RETRY_SECONDS: "15"
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + BUDGET_SECONDS ))
+          attempt=0
+          last="no request completed"
+          while :; do
+            attempt=$(( attempt + 1 ))
+            # -L follows the redirect chain to /admin.php?action=login; the body
+            # goes to a file and is never echoed. The status is captured through
+            # a file rather than `$(… || echo 000)`: on a connection failure
+            # curl writes "000" AND exits non-zero, so the fallback would append
+            # a second one and produce the nonsense status "000000".
+            rm -f body.html status.txt
+            if curl -sS -L --max-time 20 -o body.html -w '%{http_code}' "$WAIVER_STAGING_URL/" >status.txt 2>/dev/null; then
+              status=$(cat status.txt)
+            else
+              status="000"
+            fi
+            if [ "$status" = "200" ] && [ -f body.html ] && grep -qF "$WAIVER_LOGIN_MARKER" body.html; then
+              echo "attempt ${attempt}: ${WAIVER_STAGING_URL} served 200 carrying the fixed login marker."
+              exit 0
+            fi
+            if [ "$status" = "200" ]; then
+              last="HTTP 200 without the fixed marker (body withheld) — an HTTP server answered, but that is not the rendered login page"
+            elif [ "$status" = "000" ]; then
+              last="the request did not complete (DNS, TLS or connection failure)"
+            else
+              last="HTTP ${status}"
+            fi
+            echo "attempt ${attempt}: ${last}"
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              break
+            fi
+            sleep "$RETRY_SECONDS"
+          done
+          echo "::error::${WAIVER_STAGING_URL} did not serve the fixed login marker within ${BUDGET_SECONDS}s (${attempt} attempts; last: ${last}). Until DNS points waiver.vrstudio.ro at the Railway staging service and that service boots with real secrets, this red is the expected state (M4 operator runbook §5). The dispatch below never fires while this is red."
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # dispatch — AC4.5. Tells the admin repo that a new waiver image is live on
+  # staging, AFTER and only after a green deploy AND a green health gate.
+  #
+  # ONE step, NO error-swallowing modifier of any kind: a non-2xx response, a
+  # network failure, or an admin run that never appears all fail this job and
+  # therefore this run. `scripts/staging-dispatch.mjs` owns the retry-with-
+  # backoff the M2 runbook §7 requires of every repository_dispatch sender (5
+  # sends, waits [20,30,45,60,70]s, 225 s worst case), the run-name predicate
+  # that tells OUR admin run from a wizard dispatch, and the fail-fast on
+  # 401/403/404/422. This step neither parses its stdout nor re-implements any
+  # of it.
+  #
+  # The payload's `waiverImageTag` is the pin key the admin manifest job reads
+  # (`PAYLOAD_WAIVER_IMAGE_TAG` in its staging.yml) — the EXACT reference the
+  # image job published and the deploy job proved Railway is serving.
+  # ---------------------------------------------------------------------------
+  dispatch:
+    name: Dispatch waiver-staging-deployed to the admin repo
+    # `health` is the gate; `image` is also needed because this job reads its
+    # output (a `needs:` edge is what makes that output visible).
+    needs: [phpunit, image, health]
+    if: ${{ needs.phpunit.result == 'success' && needs.image.result == 'success' && needs.health.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Require ADMIN_DISPATCH_PAT
+        env:
+          ADMIN_DISPATCH_PAT: ${{ secrets.ADMIN_DISPATCH_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ADMIN_DISPATCH_PAT:-}" ]; then
+            echo "::error::ADMIN_DISPATCH_PAT is not set on this repository. Mint a fine-grained PAT scoped to sneakygriff/bookingsystemv2 ONLY, with Contents: Read & write (POST /dispatches requires it) and Actions: Read (the run-existence poll), and add it as an Actions secret (M4 operator runbook §5). It is NOT the admin repo's PROD_WIZARD_DISPATCH_PAT, and NOT the wizard repo's secret of the same name."
+            exit 1
+          fi
+          echo "ADMIN_DISPATCH_PAT is present (value never echoed)."
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # No dependency install: scripts/staging-dispatch.mjs imports only node:
+      # builtins.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Dispatch to the admin repo and confirm our run appeared
+        env:
+          ADMIN_DISPATCH_PAT: ${{ secrets.ADMIN_DISPATCH_PAT }}
+          IMAGE: ${{ needs.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          node scripts/staging-dispatch.mjs dispatch \
+            --image-tag "$IMAGE" \
+            --sha "$GITHUB_SHA"
