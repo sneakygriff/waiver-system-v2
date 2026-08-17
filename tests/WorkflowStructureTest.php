@@ -10,7 +10,9 @@ use Symfony\Component\Yaml\Yaml;
  * only workflow, the staging pipeline:
  *
  *   phpunit --+--> image  (GHCR build+push, immutability guard)
- *             +--> dump --> migrate --> deploy --> health --> dispatch
+ *             +--> provenance --> dump --> migrate --> deploy --> health --> dispatch
+ *                       (provenance also gates migrate directly; both DB touches
+ *                        wait on the M5.6 URL-provenance pre-flight)
  *
  * No DB, no network, no shell-out to git/grep: the workflow is parsed ONCE
  * with symfony/yaml and every assertion below reads the PARSED tree, never
@@ -288,9 +290,9 @@ final class WorkflowStructureTest extends TestCase {
 
   public function testJobIdSetIsPinnedExactly(): void {
     $this->assertEqualsCanonicalizing(
-      ['phpunit', 'image', 'dump', 'migrate', 'deploy', 'health', 'dispatch'],
+      ['phpunit', 'image', 'provenance', 'dump', 'migrate', 'deploy', 'health', 'dispatch'],
       array_keys(self::workflow()['jobs']),
-      'the job id set has drifted from the pinned chain: phpunit -> {image, dump -> migrate -> deploy -> health -> dispatch}.'
+      'the job id set has drifted from the pinned chain: phpunit -> {image, provenance -> dump -> migrate -> deploy -> health -> dispatch}.'
     );
   }
 
@@ -357,9 +359,212 @@ final class WorkflowStructureTest extends TestCase {
       );
     }
     $this->assertEqualsCanonicalizing(
-      ['phpunit'],
+      ['phpunit', 'provenance'],
       $jobs['dump']['needs'] ?? [],
-      'dump is the FIRST link in the deploy chain -- it must depend on nothing but the gate.'
+      'dump is the FIRST DB touch -- it must depend on exactly the gate (phpunit) and the URL-provenance '.
+      'pre-flight (provenance), and nothing else. The provenance edge is what stops a mis-set '.
+      'STAGING_WAIVER_DB_URL from being dumped before it is proven to point at staging.'
+    );
+  }
+
+  // ==========================================================================
+  // 4b. URL-provenance pre-flight (M5.6, AC4.6): a DEDICATED `provenance` job
+  //     runs the PHP pre-flight BEFORE the first DB touch in the whole DAG, and
+  //     BOTH DB-touching jobs -- `dump` (mysqldump) and `migrate` (run.php) --
+  //     name it DIRECTLY in needs:, so nothing dumps OR migrates the database
+  //     until provenance has proven STAGING_WAIVER_DB_URL reaches the staging
+  //     MySQL. (An earlier draft placed the step only INSIDE the migrate job;
+  //     the dump runs first, so that left the prod-PII exfiltration half of the
+  //     mis-set-URL event unguarded. This DAG-level pin is what closes it.)
+  // ==========================================================================
+
+  public function testProvenanceJobGatesEveryDbTouchingJob(): void {
+    $jobs = self::workflow()['jobs'];
+    $this->assertArrayHasKey('provenance', $jobs, 'a dedicated `provenance` job must exist (M5.6).');
+
+    // It descends from the gate and NOTHING else, so it precedes the first DB
+    // touch (dump). If it needed dump/migrate it could not run before them.
+    $this->assertEqualsCanonicalizing(
+      ['phpunit'],
+      $jobs['provenance']['needs'] ?? [],
+      'the provenance job must depend on nothing but the gate (phpunit) -- it has to be able to run BEFORE '.
+      'the dump, which is the first DB touch in the DAG.'
+    );
+
+    // THE position pin. Every DB-touching job must name `provenance` DIRECTLY in
+    // needs: -- dump (mysqldump) and migrate (run.php). A mutation that drops
+    // provenance from EITHER job's needs: (letting that job's DB touch run
+    // un-gated) makes this test DIE, which is exactly the round-1 P1 the pre-flight
+    // being only in the migrate job left open for the dump.
+    foreach (['dump', 'migrate'] as $dbJob) {
+      $needs = $jobs[$dbJob]['needs'] ?? [];
+      $this->assertIsArray($needs, "job '$dbJob' must declare needs: as a list.");
+      $this->assertContains(
+        'provenance',
+        $needs,
+        "job '$dbJob' touches the staging database, so it must name 'provenance' DIRECTLY in needs: -- the ".
+        "URL-provenance pre-flight must PASS before ANY dump or migrate opens a connection. Gating only one of ".
+        "the two would leave the other exposed to a prod-mis-set STAGING_WAIVER_DB_URL (the dump is a full read ".
+        "of every table, uploaded as an artifact)."
+      );
+    }
+  }
+
+  // ==========================================================================
+  // 4c. The `if:` CHANNEL of every DB-touching job (M5.6 hardening). Pinning
+  //     `needs: [.., provenance]` (§4b above) is only HALF the gate: `needs:`
+  //     and `if:` are two INDEPENDENT channels. A job that names provenance in
+  //     needs: but whose `if:` uses a status-override function
+  //     (always()/failure()/cancelled(), OR a construct built on success() such
+  //     as `!success() || needs.provenance.result == 'success'`) RUNS EVEN WHEN
+  //     provenance FAILED -- GitHub evaluates such an `if:` regardless of a need's
+  //     result, and `!success()` is true precisely when a need failed -- so the
+  //     DB touch would execute after the URL-provenance pre-flight went RED, the
+  //     exact prod-PII event the whole job exists to block. §4b cannot see this:
+  //     it reads only needs:. This pins the second channel for BOTH dump
+  //     (mysqldump) and migrate (run.php): their `if:` must positively gate on the
+  //     `needs.provenance.result == 'success'` COMPARISON AND must carry no
+  //     status-function CALL at all (all four: always/failure/cancelled/success).
+  //     Mutation proof: rewriting either job's `if:` to `${{ always() }}` -- or to
+  //     `${{ !success() || needs.provenance.result == 'success' }}` -- makes an
+  //     assertion below DIE.
+  // ==========================================================================
+
+  public function testEveryDbTouchingJobIfChannelGatesOnProvenanceSuccess(): void {
+    $jobs = self::workflow()['jobs'];
+    foreach (['dump', 'migrate'] as $dbJob) {
+      $if = $jobs[$dbJob]['if'] ?? null;
+      $this->assertIsString(
+        $if,
+        "job '$dbJob' touches the staging database, so it MUST carry an if: expression -- a DB-touching job with ".
+        "no if: runs whenever its needs: resolve, and needs:-satisfied is not the same as provenance-succeeded."
+      );
+      // The EXACT expression form the workflow uses. This is the positive half:
+      // the provenance-success clause must be present in the if: channel, not
+      // merely in needs:. A mutation that drops this clause (e.g. rewriting the
+      // if: to ${{ always() }}) makes this assertion DIE.
+      $this->assertStringContainsString(
+        "needs.provenance.result == 'success'",
+        $if,
+        "job '$dbJob' must gate its if: on needs.provenance.result == 'success' -- gating the needs: edge alone ".
+        "is not enough; without this clause a status-override if: would let the DB touch run even after the ".
+        "URL-provenance pre-flight FAILED."
+      );
+    }
+  }
+
+  public function testNoDbTouchingJobIfUsesAStatusOverrideFunction(): void {
+    $jobs = self::workflow()['jobs'];
+    foreach (['dump', 'migrate'] as $dbJob) {
+      $if = $jobs[$dbJob]['if'] ?? null;
+      $this->assertIsString($if, "job '$dbJob' must carry an if: expression (see the sibling test).");
+      // The negative half: BAN every GitHub status-check FUNCTION CALL. The four
+      // status functions are always(), failure(), cancelled() and success() --
+      // each can be composed into an expression that evaluates true past a FAILED
+      // need. always()/failure()/cancelled() are override functions outright;
+      // success() is banned too because its negation is the override -- e.g.
+      // `${{ !success() || needs.provenance.result == 'success' }}` runs the job
+      // AFTER a failed dependency (`!success()` is true precisely when a need
+      // failed), sneaking past a red provenance while still carrying the required
+      // clause verbatim. The positive gate uses the COMPARISON
+      // `needs.provenance.result == 'success'`, never a function, so there is no
+      // legitimate use of a status-function call here. Case-insensitive because
+      // GitHub treats these names case-insensitively. The `'success'` string
+      // literal in the required clause does NOT match -- the pattern requires a `(`
+      // after the bare word, so only a function CALL trips it, never the
+      // `result == 'success'` comparison.
+      $this->assertDoesNotMatchRegularExpression(
+        '/\b(?:always|failure|cancelled|success)\s*\(/i',
+        $if,
+        "job '$dbJob' if: must not use a status-override function call (always(), failure(), cancelled(), ".
+        "success()) -- each can evaluate true even when a need (provenance) FAILED (success() via its negation ".
+        "!success()), which would run the staging-DB touch past a red URL-provenance pre-flight. Rewriting the ".
+        "if: to \${{ always() }} -- or to \${{ !success() || needs.provenance.result == 'success' }} -- must ".
+        "make this test DIE. The required `needs.provenance.result == 'success'` comparison does NOT trip this ".
+        "(it is a string literal, not a function call)."
+      );
+    }
+  }
+
+  /** @return array{0:list<array<string,mixed>>,1:int,2:int} provenance steps + the require & pre-flight indices. */
+  private static function provenancePreflightSteps(): array {
+    $steps = self::workflow()['jobs']['provenance']['steps'] ?? [];
+    $requiresIndex = null;
+    $provenanceIndex = null;
+    foreach ($steps as $i => $step) {
+      $name = $step['name'] ?? null;
+      if ($name === 'Require the staging secrets') {
+        $requiresIndex = $i;
+      }
+      if ($name === 'Assert STAGING_WAIVER_DB_URL points at the staging MySQL (URL-provenance pre-flight)') {
+        $provenanceIndex = $i;
+      }
+    }
+    return [$steps, $requiresIndex, $provenanceIndex];
+  }
+
+  public function testProvenancePreflightRunsAfterRequiresInsideItsJob(): void {
+    [, $requiresIndex, $provenanceIndex] = self::provenancePreflightSteps();
+    $this->assertNotNull($requiresIndex, 'the provenance job must have its "Require the staging secrets" step.');
+    $this->assertNotNull($provenanceIndex, 'the provenance job must have the URL-provenance pre-flight step (M5.6).');
+    $this->assertGreaterThan(
+      $requiresIndex,
+      $provenanceIndex,
+      'inside the provenance job the pre-flight must run AFTER "Require the staging secrets" -- it depends on '.
+      'the secrets and the Railway staging ids being present first (the require is the inert-until-provisioned '.
+      'fail-fast).'
+    );
+  }
+
+  public function testProvenancePreflightInvokesThePhpScriptAndFailsClosed(): void {
+    [$steps, , $provenanceIndex] = self::provenancePreflightSteps();
+    $this->assertNotNull($provenanceIndex, 'the provenance job must have the URL-provenance pre-flight step (M5.6).');
+    $step = $steps[$provenanceIndex];
+
+    // Fail-closed exit path: no continue-on-error may swallow the pre-flight's
+    // non-zero exit (that is what BLOCKS the dump AND the migrate on a
+    // bad/unverifiable URL, since both jobs need this one).
+    $this->assertArrayNotHasKey(
+      'continue-on-error',
+      $step,
+      'AC4.5/AC4.6: the URL-provenance pre-flight must fail its job on any non-PASS verdict; continue-on-error '.
+      'would silently swallow exactly the failure that keeps a staging run from dumping/migrating production.'
+    );
+
+    // It invokes the tested PHP pre-flight script -- the single place the parse /
+    // compare logic lives (tests/DbHostProvenanceTest.php exercises that logic).
+    $run = $step['run'] ?? '';
+    $this->assertIsString($run);
+    $this->assertMatchesRegularExpression(
+      '/(^|\s)php\s+scripts\/preflight-db-host\.php(\s|$)/',
+      $run,
+      'the pre-flight step must invoke `php scripts/preflight-db-host.php`.'
+    );
+
+    // AC4.6 log hygiene: the run: body must splice NO ${{ }} expression -- every
+    // secret/external value reaches the script through env: only, so nothing from
+    // a secret can be interpolated into the script text (or a future `set -x`).
+    $this->assertStringNotContainsString(
+      '${{',
+      $run,
+      'the pre-flight run: body must not interpolate any ${{ }} expression -- STAGING_WAIVER_DB_URL and the '.
+      'Railway token reach the script exclusively through env:, never spliced into the command text.'
+    );
+
+    // The two step-scoped secrets it needs are provided via env: (the workflow env
+    // supplies RAILWAY_API_URL + the staging ids to every step).
+    $env = $step['env'] ?? [];
+    $this->assertIsArray($env);
+    $this->assertArrayHasKey(
+      'STAGING_WAIVER_DB_URL',
+      $env,
+      'the pre-flight step must receive STAGING_WAIVER_DB_URL via env:.'
+    );
+    $this->assertArrayHasKey(
+      'RAILWAY_TOKEN',
+      $env,
+      'the pre-flight step must receive the Railway staging token via env: (RAILWAY_TOKEN), the project-scoped '.
+      'read credential it uses to fetch the staging MySQL service variables.'
     );
   }
 
@@ -448,12 +653,20 @@ final class WorkflowStructureTest extends TestCase {
       }
     }
     sort($railwayIdKeys);
+    // The pinned STAGING TRIPLE (M5.6 extended the M4 pair): the environment id,
+    // the WAIVER APP service id, and the STAGING MySQL service id the migrate
+    // job's URL-provenance pre-flight reads. All three are STAGING names -- no
+    // additional Railway id (renamed, duplicated, or PROD) may be declared
+    // anywhere in the .github/workflows/ tree. The invariant's substance is
+    // unchanged from M4 ("exactly these, and no PROD id"); only the allowed set
+    // grew by the MySQL service id. Sorted alphabetically:
+    // ENVIRONMENT_ID < MYSQL_SERVICE_ID < SERVICE_ID.
     $this->assertSame(
-      ['RAILWAY_STAGING_ENVIRONMENT_ID', 'RAILWAY_STAGING_SERVICE_ID'],
+      ['RAILWAY_STAGING_ENVIRONMENT_ID', 'RAILWAY_STAGING_MYSQL_SERVICE_ID', 'RAILWAY_STAGING_SERVICE_ID'],
       $railwayIdKeys,
-      'exactly ONE Railway environment id env key and ONE Railway service id env key must exist anywhere in '.
-      'the .github/workflows/ tree, and they must be these two STAGING names -- no additional Railway id '.
-      '(renamed, duplicated, or prod) may be declared anywhere.'
+      'exactly THREE Railway id env keys must exist anywhere in the .github/workflows/ tree, and they must be '.
+      'these STAGING names (environment id, waiver-app service id, staging MySQL service id) -- no additional '.
+      'Railway id (renamed, duplicated, or prod) may be declared anywhere.'
     );
   }
 
@@ -500,7 +713,12 @@ final class WorkflowStructureTest extends TestCase {
     // `run:` block must make this test die.
     $allowlist = [];
     foreach (self::allEnvPairsAcrossWorkflowsTree() as [$key, $value]) {
-      $isStagingIdKey = $key === 'RAILWAY_STAGING_ENVIRONMENT_ID' || $key === 'RAILWAY_STAGING_SERVICE_ID';
+      // The allowlist is the STAGING TRIPLE's own values (M5.6 added the MySQL
+      // service id) -- derived, never hardcoded, so the test needs no edit on the
+      // day those env values are filled in at provisioning.
+      $isStagingIdKey = $key === 'RAILWAY_STAGING_ENVIRONMENT_ID'
+        || $key === 'RAILWAY_STAGING_SERVICE_ID'
+        || $key === 'RAILWAY_STAGING_MYSQL_SERVICE_ID';
       if ($isStagingIdKey && is_string($value) && preg_match(self::UUID_LITERAL_RE, $value)) {
         $allowlist[] = strtolower($value);
       }
