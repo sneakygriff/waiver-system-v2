@@ -123,8 +123,19 @@ env:
   # NEVER add a production environment/service id to this file, or to any file
   # in this repository. The fork's CI deploys to staging and to nothing else;
   # production waiver deploys are M5's promote lane, from the admin repo.
+  #
+  # RAILWAY_STAGING_SERVICE_ID is the WAIVER APP service (the one the deploy job
+  # points at the new image). RAILWAY_STAGING_MYSQL_SERVICE_ID is the STAGING
+  # MySQL service — a DIFFERENT service — read (never written) by the migrate
+  # job's M5.6 URL-provenance pre-flight to prove STAGING_WAIVER_DB_URL reaches
+  # the staging database Railway itself reports (scripts/preflight-db-host.php).
+  # All three are EMPTY until provisioning; the migrate/deploy jobs refuse to
+  # start while any they need is blank. The MYSQL id's VALUE is filled in the
+  # same §5 arming commit as the pair (M5 operator runbook) — its absence is a
+  # first-step fail-fast, never a silent skip.
   RAILWAY_STAGING_ENVIRONMENT_ID: ""
   RAILWAY_STAGING_SERVICE_ID: ""
+  RAILWAY_STAGING_MYSQL_SERVICE_ID: ""
   RAILWAY_API_URL: https://backboard.railway.app/graphql/v2
 
   # ── The health gate (AC4.3) ───────────────────────────────────────────────
@@ -796,11 +807,12 @@ jobs:
           [ -n "${RAILWAY_TOKEN:-}" ] || missing="${missing} RAILWAY_STAGING_TOKEN"
           [ -n "${RAILWAY_STAGING_ENVIRONMENT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)"
           [ -n "${RAILWAY_STAGING_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_SERVICE_ID(workflow env constant)"
+          [ -n "${RAILWAY_STAGING_MYSQL_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_MYSQL_SERVICE_ID(workflow env constant)"
           if [ -n "$missing" ]; then
             echo "::error::Missing:${missing}. Set the Actions secrets and fill the staging Railway id pair in this workflow's env block (M4 operator runbook §5 — provisioning is what ARMS this pipeline, and it comes AFTER the PII-distinctness gate). Nothing was migrated."
             exit 1
           fi
-          echo "Staging secrets and Railway staging ids are present (values never echoed)."
+          echo "Staging secrets and the Railway staging id triple are present (values never echoed)."
 
       # `php:8.2-cli` ships neither `git` (actions/checkout prefers it) nor `jq`
       # (the Railway read below), and `run.php` needs pdo_mysql — which is a
@@ -875,6 +887,38 @@ jobs:
             echo ""
             echo "Pre-migrate baseline image: \`${previous}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # URL-PROVENANCE PRE-FLIGHT (M5.6, AC4.6) — the each-run mechanical proof
+      # that STAGING_WAIVER_DB_URL reaches the SAME endpoint Railway reports for
+      # the STAGING MySQL service, so this job can never dump/migrate PRODUCTION.
+      # It runs AFTER "Require the staging secrets" and BEFORE the dry-run below —
+      # the first thing that touches the database — so a prod-pointing (or
+      # unverifiable) URL is caught before any DB connection is opened.
+      #
+      # It reads the staging MySQL service's OWN Railway-provisioned connection
+      # variables (RAILWAY_TOKEN = the staging PROJECT token already in this job —
+      # no secret-surface widening; RAILWAY_STAGING_MYSQL_SERVICE_ID from the
+      # workflow env) and asserts STAGING_WAIVER_DB_URL's full canonical AUTHORITY
+      # (host AND port) equals the staging MySQL's. Host-only would be a false-PASS
+      # here: Railway's PUBLIC MySQL endpoints (the only ones a hosted runner can
+      # reach) share a proxy DOMAIN and differ ONLY by port, so the port is
+      # load-bearing — see scripts/preflight-db-host.php and
+      # src/Preflight/DbHostProvenance.php for the canonical-only, fail-closed,
+      # secret-safe parse posture (ported from the admin M5.5 host-distinct gate).
+      #
+      # FAIL CLOSED ON EVERYTHING (mismatch, unparseable, Railway-API-down, an
+      # unexpected query shape): a red run is re-runnable; a migrate against the
+      # wrong database is not. Availability-coupling a PII guard to Railway is
+      # deliberate. The variables(...) query shape is UNVERIFIED-LIVE (a wrong
+      # shape fails GraphQL validation → the pre-flight fails closed, never a
+      # silent pass); its first-run confirmation is owed in the M5 runbook. All
+      # secret values reach the script through env: only — never a ${{ }}
+      # expression inside run:, never a command line, never a step output.
+      - name: Assert STAGING_WAIVER_DB_URL points at the staging MySQL (URL-provenance pre-flight)
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+        run: php scripts/preflight-db-host.php
 
       # The URL reaches run.php through the ENVIRONMENT, never through argv:
       # the runner does not expand secrets into the script text, but an

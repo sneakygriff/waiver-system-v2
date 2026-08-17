@@ -364,6 +364,105 @@ final class WorkflowStructureTest extends TestCase {
   }
 
   // ==========================================================================
+  // 4b. URL-provenance pre-flight (M5.6, AC4.6): in the migrate job, the
+  //     provenance step must run AFTER "Require the staging secrets" and BEFORE
+  //     the "Pre-flight (read-only)" dry-run (the first DB touch), invoke the
+  //     PHP pre-flight script, carry no continue-on-error (fail-closed exit),
+  //     and splice NO secret ${{ }} expression into its run: body.
+  // ==========================================================================
+
+  /** @return array{0:list<array<string,mixed>>,1:int,2:int,3:int} steps + the three key step indices. */
+  private static function migratePreflightSteps(): array {
+    $steps = self::workflow()['jobs']['migrate']['steps'];
+    $requiresIndex = null;
+    $provenanceIndex = null;
+    $dryRunIndex = null;
+    foreach ($steps as $i => $step) {
+      $name = $step['name'] ?? null;
+      if ($name === 'Require the staging secrets') {
+        $requiresIndex = $i;
+      }
+      if ($name === 'Assert STAGING_WAIVER_DB_URL points at the staging MySQL (URL-provenance pre-flight)') {
+        $provenanceIndex = $i;
+      }
+      if ($name === 'Pre-flight (read-only)') {
+        $dryRunIndex = $i;
+      }
+    }
+    return [$steps, $requiresIndex, $provenanceIndex, $dryRunIndex];
+  }
+
+  public function testProvenancePreflightRunsAfterRequiresAndBeforeTheDryRun(): void {
+    [, $requiresIndex, $provenanceIndex, $dryRunIndex] = self::migratePreflightSteps();
+    $this->assertNotNull($requiresIndex, 'the migrate job must have its "Require the staging secrets" step.');
+    $this->assertNotNull($provenanceIndex, 'the migrate job must have the URL-provenance pre-flight step (M5.6).');
+    $this->assertNotNull($dryRunIndex, 'the migrate job must have its "Pre-flight (read-only)" dry-run step.');
+    $this->assertGreaterThan(
+      $requiresIndex,
+      $provenanceIndex,
+      'the URL-provenance pre-flight must run AFTER "Require the staging secrets" -- it depends on the secrets '.
+      'and the Railway staging id triple being present first.'
+    );
+    $this->assertLessThan(
+      $dryRunIndex,
+      $provenanceIndex,
+      'the URL-provenance pre-flight must run BEFORE the "Pre-flight (read-only)" dry-run (the first step that '.
+      'opens a DB connection) -- a prod-pointing or unverifiable URL must be caught before any database is touched.'
+    );
+  }
+
+  public function testProvenancePreflightInvokesThePhpScriptAndFailsClosed(): void {
+    [$steps, , $provenanceIndex, ] = self::migratePreflightSteps();
+    $this->assertNotNull($provenanceIndex, 'the migrate job must have the URL-provenance pre-flight step (M5.6).');
+    $step = $steps[$provenanceIndex];
+
+    // Fail-closed exit path: no continue-on-error may swallow the pre-flight's
+    // non-zero exit (that is what BLOCKS the migrate on a bad/unverifiable URL).
+    $this->assertArrayNotHasKey(
+      'continue-on-error',
+      $step,
+      'AC4.5/AC4.6: the URL-provenance pre-flight must fail the job on any non-PASS verdict; continue-on-error '.
+      'would silently swallow exactly the failure that keeps a staging run from dumping/migrating production.'
+    );
+
+    // It invokes the tested PHP pre-flight script -- the single place the parse /
+    // compare logic lives (tests/DbHostProvenanceTest.php exercises that logic).
+    $run = $step['run'] ?? '';
+    $this->assertIsString($run);
+    $this->assertMatchesRegularExpression(
+      '/(^|\s)php\s+scripts\/preflight-db-host\.php(\s|$)/',
+      $run,
+      'the pre-flight step must invoke `php scripts/preflight-db-host.php`.'
+    );
+
+    // AC4.6 log hygiene: the run: body must splice NO ${{ }} expression -- every
+    // secret/external value reaches the script through env: only, so nothing from
+    // a secret can be interpolated into the script text (or a future `set -x`).
+    $this->assertStringNotContainsString(
+      '${{',
+      $run,
+      'the pre-flight run: body must not interpolate any ${{ }} expression -- STAGING_WAIVER_DB_URL and the '.
+      'Railway token reach the script exclusively through env:, never spliced into the command text.'
+    );
+
+    // The two step-scoped secrets it needs are provided via env: (the workflow env
+    // supplies RAILWAY_API_URL + the staging id triple to every step).
+    $env = $step['env'] ?? [];
+    $this->assertIsArray($env);
+    $this->assertArrayHasKey(
+      'STAGING_WAIVER_DB_URL',
+      $env,
+      'the pre-flight step must receive STAGING_WAIVER_DB_URL via env:.'
+    );
+    $this->assertArrayHasKey(
+      'RAILWAY_TOKEN',
+      $env,
+      'the pre-flight step must receive the Railway staging token via env: (RAILWAY_TOKEN), the project-scoped '.
+      'read credential it uses to fetch the staging MySQL service variables.'
+    );
+  }
+
+  // ==========================================================================
   // 5. GHCR immutability guard precedes AND gates the build/push step
   //    (AC4.1; brief assertion #5). "Gates" is checked via the actual `if:`
   //    expression, not merely step order -- an ordered-but-ungated push
@@ -448,12 +547,20 @@ final class WorkflowStructureTest extends TestCase {
       }
     }
     sort($railwayIdKeys);
+    // The pinned STAGING TRIPLE (M5.6 extended the M4 pair): the environment id,
+    // the WAIVER APP service id, and the STAGING MySQL service id the migrate
+    // job's URL-provenance pre-flight reads. All three are STAGING names -- no
+    // additional Railway id (renamed, duplicated, or PROD) may be declared
+    // anywhere in the .github/workflows/ tree. The invariant's substance is
+    // unchanged from M4 ("exactly these, and no PROD id"); only the allowed set
+    // grew by the MySQL service id. Sorted alphabetically:
+    // ENVIRONMENT_ID < MYSQL_SERVICE_ID < SERVICE_ID.
     $this->assertSame(
-      ['RAILWAY_STAGING_ENVIRONMENT_ID', 'RAILWAY_STAGING_SERVICE_ID'],
+      ['RAILWAY_STAGING_ENVIRONMENT_ID', 'RAILWAY_STAGING_MYSQL_SERVICE_ID', 'RAILWAY_STAGING_SERVICE_ID'],
       $railwayIdKeys,
-      'exactly ONE Railway environment id env key and ONE Railway service id env key must exist anywhere in '.
-      'the .github/workflows/ tree, and they must be these two STAGING names -- no additional Railway id '.
-      '(renamed, duplicated, or prod) may be declared anywhere.'
+      'exactly THREE Railway id env keys must exist anywhere in the .github/workflows/ tree, and they must be '.
+      'these STAGING names (environment id, waiver-app service id, staging MySQL service id) -- no additional '.
+      'Railway id (renamed, duplicated, or prod) may be declared anywhere.'
     );
   }
 
@@ -500,7 +607,12 @@ final class WorkflowStructureTest extends TestCase {
     // `run:` block must make this test die.
     $allowlist = [];
     foreach (self::allEnvPairsAcrossWorkflowsTree() as [$key, $value]) {
-      $isStagingIdKey = $key === 'RAILWAY_STAGING_ENVIRONMENT_ID' || $key === 'RAILWAY_STAGING_SERVICE_ID';
+      // The allowlist is the STAGING TRIPLE's own values (M5.6 added the MySQL
+      // service id) -- derived, never hardcoded, so the test needs no edit on the
+      // day those env values are filled in at provisioning.
+      $isStagingIdKey = $key === 'RAILWAY_STAGING_ENVIRONMENT_ID'
+        || $key === 'RAILWAY_STAGING_SERVICE_ID'
+        || $key === 'RAILWAY_STAGING_MYSQL_SERVICE_ID';
       if ($isStagingIdKey && is_string($value) && preg_match(self::UUID_LITERAL_RE, $value)) {
         $allowlist[] = strtolower($value);
       }

@@ -1,0 +1,190 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * scripts/preflight-db-host.php — migrate-job URL-provenance pre-flight
+ * [CI/CD M5.6, AC4.6 — the each-run mechanical provenance closer]
+ *
+ * Runs in the `migrate` job (php:8.2-cli container), AFTER "Require the staging
+ * secrets" and BEFORE the `run.php --dry-run`. It refuses to let the run reach
+ * the dump/migrate of `STAGING_WAIVER_DB_URL` unless that URL provably reaches
+ * the SAME endpoint Railway reports for the STAGING MySQL service — so a staging
+ * CI run can never dump or migrate the PRODUCTION waiver database. See
+ * src/Preflight/DbHostProvenance.php for the full rationale and the
+ * canonical-only / fail-closed / secret-safe host-parse posture.
+ *
+ * NO COMPOSER AUTOLOAD. Like migrations/run.php, this runs in a container that
+ * never `composer install`ed — it requires the ONE self-contained pure-logic
+ * class directly by path. All parsing/compare logic lives in that class (unit-
+ * tested by tests/DbHostProvenanceTest.php); this file is only the thin I/O
+ * shell: read env → POST Railway → validate → verdict → exit.
+ *
+ * FAIL CLOSED ON EVERYTHING: a missing env value, an unparseable/prod-pointing
+ * URL, a Railway API that is down/unreachable/unauthorized, an unexpected query
+ * shape, or a host/port mismatch all exit non-zero and BLOCK the migrate. A red
+ * run is re-runnable; a migrate against the wrong database is not.
+ *
+ * SECRET SAFETY: the Railway token and `STAGING_WAIVER_DB_URL` are read from the
+ * environment and NEVER written to a command line, a step output, or the log.
+ * The variable map Railway returns contains passwords and full connection URLs;
+ * it is handed straight to the pure parser and never echoed. Only status codes
+ * and charset-stripped GraphQL error CODES are ever printed on a Railway error.
+ */
+
+use App\Preflight\DbHostProvenance;
+
+require __DIR__ . '/../src/Preflight/DbHostProvenance.php';
+
+const EXIT_OK   = 0;
+const EXIT_FAIL = 1;
+
+/** Emit a GitHub Actions error annotation and exit non-zero (fail closed). */
+function preflight_fail(string $message): never
+{
+    fwrite(STDERR, '::error::' . $message . "\n");
+    exit(EXIT_FAIL);
+}
+
+function preflight_ok(string $message): never
+{
+    fwrite(STDOUT, $message . "\n");
+    exit(EXIT_OK);
+}
+
+/**
+ * A non-empty environment value, trimmed — or null. Never returns the value to
+ * anywhere it could be logged; the caller only ever tests presence or hands it
+ * to the parser / the HTTP layer.
+ */
+function preflight_env(string $name): ?string
+{
+    $value = getenv($name);
+    if ($value === false) {
+        return null;
+    }
+    $trimmed = trim($value);
+    return $trimmed === '' ? null : $trimmed;
+}
+
+// ---------------------------------------------------------------------------
+// 1. Required inputs (names only in any error — never the values).
+// ---------------------------------------------------------------------------
+$dbUrl          = preflight_env('STAGING_WAIVER_DB_URL');
+$railwayToken   = preflight_env('RAILWAY_TOKEN');
+$railwayApiUrl  = preflight_env('RAILWAY_API_URL');
+$environmentId  = preflight_env('RAILWAY_STAGING_ENVIRONMENT_ID');
+$mysqlServiceId = preflight_env('RAILWAY_STAGING_MYSQL_SERVICE_ID');
+
+$missing = [];
+if ($dbUrl === null) {
+    $missing[] = 'STAGING_WAIVER_DB_URL(Actions secret)';
+}
+if ($railwayToken === null) {
+    $missing[] = 'RAILWAY_STAGING_TOKEN(Actions secret)';
+}
+if ($railwayApiUrl === null) {
+    $missing[] = 'RAILWAY_API_URL(workflow env constant)';
+}
+if ($environmentId === null) {
+    $missing[] = 'RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)';
+}
+if ($mysqlServiceId === null) {
+    $missing[] = 'RAILWAY_STAGING_MYSQL_SERVICE_ID(workflow env constant)';
+}
+if ($missing !== []) {
+    preflight_fail(
+        'URL-provenance pre-flight cannot run — missing: ' . implode(', ', $missing) . '. '
+        . 'Set the Actions secrets and fill the staging Railway id triple in this workflow\'s env block '
+        . '(M4/M5 operator runbook §5). Nothing was migrated.'
+    );
+}
+
+// A Railway PROJECT token authenticates with the `Project-Access-Token` header.
+// Validate its charset before it reaches an HTTP header so a stray CR/LF can
+// never inject a header line. The value itself is NEVER printed.
+if (!preg_match('/^[A-Za-z0-9._\-]+$/', $railwayToken)) {
+    preflight_fail('RAILWAY_STAGING_TOKEN contains characters outside [A-Za-z0-9._-] (value withheld) — refusing to build a request with it.');
+}
+
+// ---------------------------------------------------------------------------
+// 2. The two authorities.
+// ---------------------------------------------------------------------------
+$urlAuthority = DbHostProvenance::parseAuthorityFromUrl($dbUrl);
+
+// Railway read — UNVERIFIED-LIVE query shape (see the class const docblock).
+// file_get_contents keeps the token in an in-process header, off the argv/proc
+// table entirely (strictly less exposure than a curl command line).
+$payload = json_encode([
+    'query'     => DbHostProvenance::RAILWAY_SERVICE_VARIABLES_QUERY,
+    'variables' => ['environmentId' => $environmentId, 'serviceId' => $mysqlServiceId],
+], JSON_UNESCAPED_SLASHES);
+if ($payload === false) {
+    preflight_fail('Could not encode the Railway request (internal) — refusing to migrate.');
+}
+
+$context = stream_context_create([
+    'http' => [
+        'method'        => 'POST',
+        'header'        => "Content-Type: application/json\r\n"
+                         . 'Project-Access-Token: ' . $railwayToken . "\r\n"
+                         . "Accept: application/json\r\n",
+        'content'       => $payload,
+        'timeout'       => 30,
+        'ignore_errors' => true, // read a non-2xx BODY rather than throwing, so we can classify
+    ],
+    'ssl' => [
+        'verify_peer'      => true,
+        'verify_peer_name' => true,
+    ],
+]);
+
+$body = @file_get_contents($railwayApiUrl, false, $context);
+
+// $http_response_header is set by the http stream wrapper after the call.
+$status = 0;
+if (isset($http_response_header) && is_array($http_response_header) && isset($http_response_header[0])) {
+    if (preg_match('#\bHTTP/\S+\s+(\d{3})\b#', $http_response_header[0], $m) === 1) {
+        $status = (int) $m[1];
+    }
+}
+
+if ($body === false || $status < 200 || $status >= 300) {
+    // Never the body, never the token. Status only (0 = transport failure / no response).
+    preflight_fail(
+        'The Railway API did not return a usable response reading the staging MySQL variables '
+        . '(HTTP status: ' . $status . '; body withheld). Usually a network failure or an auth rejection — '
+        . 'check RAILWAY_STAGING_TOKEN\'s project scope and the staging id triple. Refusing to migrate (re-runnable).'
+    );
+}
+
+// Surface GraphQL error CODES (charset-stripped) before folding to indeterminate,
+// so the first live run can tell NOT_AUTHORIZED from a bad field name.
+$decoded = json_decode($body, true);
+if (is_array($decoded) && isset($decoded['errors']) && is_array($decoded['errors']) && count($decoded['errors']) > 0) {
+    $codes = [];
+    foreach ($decoded['errors'] as $error) {
+        $code = (is_array($error) && isset($error['extensions']['code']) && is_string($error['extensions']['code']))
+            ? $error['extensions']['code']
+            : 'none';
+        $codes[] = $code;
+    }
+    $safeCodes = substr((string) preg_replace('/[^A-Za-z0-9,_\-]/', '', implode(',', $codes)), 0, 120);
+    preflight_fail(
+        'The Railway API returned GraphQL error(s) reading the staging MySQL variables '
+        . '(messages withheld; codes: ' . ($safeCodes !== '' ? $safeCodes : 'none') . '). '
+        . 'If this is the first live run, confirm the variables(...) query shape and the staging MySQL service id '
+        . '(M5 operator runbook). Refusing to migrate.'
+    );
+}
+
+$variables       = DbHostProvenance::parseRailwayVariables($body);
+$railwayAuthority = $variables === null ? null : DbHostProvenance::extractRailwayAuthority($variables);
+
+// ---------------------------------------------------------------------------
+// 3. Verdict — PASS opens the gate; every other outcome blocks the migrate.
+// ---------------------------------------------------------------------------
+$verdict = DbHostProvenance::verdict($urlAuthority, $railwayAuthority);
+if ($verdict['ok'] !== true) {
+    preflight_fail('[' . $verdict['code'] . '] ' . $verdict['reason']);
+}
+preflight_ok('[' . $verdict['code'] . '] ' . $verdict['reason']);
