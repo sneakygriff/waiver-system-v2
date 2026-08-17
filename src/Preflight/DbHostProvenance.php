@@ -159,10 +159,16 @@ final class DbHostProvenance
         if (!self::isStructurallyValidHostname($stripped)) {
             return null;
         }
-        // Any all-numeric-and-dots value is an IPv4-literal ATTEMPT and MUST be a
-        // strictly-canonical quad (defeats the octal/short-form parser differential);
-        // a real DNS host always carries a non-digit character and skips this.
-        if (preg_match('/^[0-9.]+$/', $stripped)) {
+        // Any value whose labels are ALL integer spellings — decimal, or a C-style
+        // hex/octal octet (`0x7f`, `017`) — is an IPv4-literal ATTEMPT and MUST pass
+        // the strictly-canonical dotted-quad bar. This defeats the octal AND the hex
+        // parser differentials at once: inet_aton-family resolvers read `017.0.0.1`
+        // (octal) and `0x7f.0.0.1` / `0x7f000001` (hex) as 127.0.0.1, but a bare
+        // `/^[0-9.]+$/` trigger would let the hex spellings slip through as
+        // DNS-shaped hosts. A real DNS host always carries a label that is not an
+        // integer spelling and skips this. normalizeIpv4Strict then trusts only a
+        // canonical decimal quad, so every hex/octal/short form → null (fail-closed).
+        if (self::isNumericIpv4Attempt($stripped)) {
             return self::normalizeIpv4Strict($stripped);
         }
         return $stripped;
@@ -220,11 +226,21 @@ final class DbHostProvenance
                 continue; // genuinely ABSENT → try the next candidate
             }
             $value = $variables[$key];
-            if (!is_string($value) || trim($value) === '') {
-                continue; // empty/non-string is treated as absent → next candidate
+            // A PRESENT candidate whose value is a NON-STRING is malformed —
+            // Railway serializes every connection URL as a JSON string. This is
+            // "present but not usable", NOT "absent": first-present-decides means it
+            // fails the map to INDETERMINATE (return null), never a fall-through to a
+            // lower, possibly-weaker candidate an ambiguous map could exploit.
+            if (!is_string($value)) {
+                return null;
             }
-            // PRESENT decides (fail-closed): trusted → use it; untrusted → `null`,
-            // never a fall-through to a lower, possibly-weaker candidate.
+            // An EMPTY string is Railway's serialization of an UNSET variable (not a
+            // malformed value) → treat as genuinely absent and try the next one.
+            if (trim($value) === '') {
+                continue;
+            }
+            // PRESENT, non-empty string decides (fail-closed): trusted → use it;
+            // untrusted (unparseable) → `null`, never a fall-through to a lower one.
             $authority = self::parseAuthorityFromUrl($value);
             if ($authority === null) {
                 return null;
@@ -251,8 +267,24 @@ final class DbHostProvenance
         if (!is_array($decoded)) {
             return null;
         }
-        if (isset($decoded['errors']) && is_array($decoded['errors']) && count($decoded['errors']) > 0) {
-            return null; // the query failed validation/authorization → fail closed
+        if (isset($decoded['errors'])) {
+            // isset() is already false for a null `errors`, so we are here only for a
+            // PRESENT, non-null errors field. A clean GraphQL success omits it (or
+            // sends null); per the spec a present errors field is a NON-EMPTY LIST.
+            //   · not a list (a string / number / object) → a MALFORMED response, not
+            //     a success → fail closed, so we never read `data` out of an answer
+            //     whose shape we do not understand (an HTTP-200 with a non-array
+            //     `errors` must never be able to reach a PASS).
+            //   · a non-empty list → an actual error set → fail closed.
+            //   · an empty list is spec-violating but carries no error signal; it
+            //     falls through to the data check below, which fails closed on its
+            //     own if the payload is unusable.
+            if (!is_array($decoded['errors'])) {
+                return null;
+            }
+            if (count($decoded['errors']) > 0) {
+                return null;
+            }
         }
         $data = $decoded['data'] ?? null;
         if (!is_array($data) || !array_key_exists('variables', $data)) {
@@ -306,6 +338,26 @@ final class DbHostProvenance
             self::RULE,
             'STAGING_WAIVER_DB_URL authority matches the staging MySQL authority Railway reports (from ' . $railwayAuthority['source'] . '; values withheld) — provenance confirmed.'
         );
+    }
+
+    /**
+     * True when every dot-separated label of $host is a C-style integer spelling
+     * — decimal (`10`), hex (`0x7f`), or octal (leading-zero decimal `017`) —
+     * which is exactly the set inet_aton-family resolvers parse as a packed IPv4
+     * address. Such a value is an IPv4-literal ATTEMPT and must be held to
+     * normalizeIpv4Strict's canonical-quad bar rather than trusted as a DNS host;
+     * a genuine hostname always carries at least one non-integer label. `$host`
+     * arrives already lowercased from canonicalizeHost, so `0x` (not `0X`) is the
+     * only hex prefix to match.
+     */
+    private static function isNumericIpv4Attempt(string $host): bool
+    {
+        foreach (explode('.', $host) as $label) {
+            if (!preg_match('/^(?:0x[0-9a-f]+|[0-9]+)$/', $label)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** RFC-1123 hostname STRUCTURE: ≤253 total, every label a valid 1–63 char label. */

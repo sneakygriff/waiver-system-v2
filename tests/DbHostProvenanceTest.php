@@ -137,6 +137,7 @@ final class DbHostProvenanceTest extends TestCase
             'no port'                 => ['mysql://stage.rlwy.net/railway', 'an explicit port is required (proxy defeat)'],
             'port out of range'       => ['mysql://stage.rlwy.net:70000/railway', 'a >65535 port is invalid'],
             'octal ipv4 host'         => ['mysql://017.0.0.1:3306/db', 'a leading-zero octet is read as octal → refuse'],
+            'hex ipv4 host'           => ['mysql://0x7f.0.0.1:3306/db', 'a hex-spelled IPv4 literal is an IPv4 attempt → refuse'],
             'ipv6 literal host'       => ['mysql://[::1]:3306/db', 'an IPv6 literal is refused (allowlist)'],
             'loopback ipv4 host'      => ['mysql://127.0.0.1:3306/db', 'special-use loopback is refused'],
             'unspecified ipv4 host'   => ['mysql://0.0.0.0:3306/db', 'special-use 0.0.0.0/8 is refused'],
@@ -165,6 +166,13 @@ final class DbHostProvenanceTest extends TestCase
             'routable ipv4'         => ['10.0.0.5', '10.0.0.5'],
             'octal ipv4'            => ['017.0.0.1', null],
             'leading zero octet'    => ['10.000.000.001', null],
+            // MUTATION KILL for the hex-IPv4 parity fix (P2): inet_aton-family
+            // resolvers read these as 127.0.0.1, but a decimal-only `/^[0-9.]+$/`
+            // trigger would let the `x` slip the strict-quad check and return them
+            // as DNS-shaped hosts. All-integer-label (incl. hex) forms must → null.
+            'hex dotted ipv4'       => ['0x7f.0.0.1', null],
+            'hex packed ipv4'       => ['0x7f000001', null],
+            'hex all octets'        => ['0x7f.0x0.0x0.0x1', null],
             'loopback'              => ['127.0.0.1', null],
             'unspecified'           => ['0.0.0.0', null],
             'out of range'          => ['999.1.1.1', null],
@@ -197,6 +205,27 @@ final class DbHostProvenanceTest extends TestCase
             DbHostProvenance::extractRailwayAuthority($vars),
             'a present-but-untrusted preferred candidate must not fall through to a lower one.'
         );
+    }
+
+    public function testRailwayExtractionPresentNonStringCandidateIsIndeterminate(): void
+    {
+        // MUTATION KILL for the non-string first-present guard: a PRESENT preferred
+        // candidate whose value is a NON-STRING (an int, an array, a bool -- a
+        // malformed Railway map) must fail the map to INDETERMINATE (null), NEVER
+        // fall through to a valid lower candidate. Treating a non-string as "absent"
+        // (the pre-fix behaviour) would let a malformed higher entry be silently
+        // skipped and resolve from a weaker source. Two shapes, both must be null.
+        foreach ([12345, ['nested' => 'map'], true] as $malformed) {
+            $vars = [
+                'MYSQL_PUBLIC_URL' => $malformed,      // present, non-string
+                'MYSQL_URL'        => self::stagingUrl(), // valid, lower priority
+            ];
+            $this->assertNull(
+                DbHostProvenance::extractRailwayAuthority($vars),
+                'a present-but-non-string preferred candidate must make the authority indeterminate, '
+                . 'never fall through to a lower candidate.'
+            );
+        }
     }
 
     public function testRailwayExtractionSkipsGenuinelyAbsentCandidate(): void
@@ -251,6 +280,20 @@ final class DbHostProvenanceTest extends TestCase
             'null data'          => ['{"data":null}', true],
             'no variables field' => ['{"data":{"other":1}}', true],
             'variables not obj'  => ['{"data":{"variables":"nope"}}', true],
+            // MUTATION KILL for the non-array `errors` guard: an HTTP-200 whose
+            // `errors` field is PRESENT but not a list (a string, a number, an
+            // object) is a malformed response, NOT a success -- it must fail closed
+            // to null, never be allowed to reach a PASS by reading `data` past it.
+            // The pre-fix guard (is_array && count>0) skipped these and returned
+            // the (valid) variables map, opening a fail-open.
+            'errors is a string' => ['{"errors":"boom","data":{"variables":{"MYSQL_PUBLIC_URL":"mysql://u:p@h.rlwy.net:1/db"}}}', true],
+            'errors is a number' => ['{"errors":1,"data":{"variables":{"MYSQL_PUBLIC_URL":"mysql://u:p@h.rlwy.net:1/db"}}}', true],
+            'errors is an object'=> ['{"errors":{"code":"X"},"data":{"variables":{"MYSQL_PUBLIC_URL":"mysql://u:p@h.rlwy.net:1/db"}}}', true],
+            // An EMPTY errors array carries no error signal (spec-violating but
+            // benign); it falls through to the data check, which succeeds here.
+            'errors empty array' => ['{"errors":[],"data":{"variables":{"MYSQL_PUBLIC_URL":"mysql://u:p@h.rlwy.net:1/db"}}}', false],
+            // A null `errors` alongside a valid data payload is a clean success.
+            'errors null'        => ['{"errors":null,"data":{"variables":{"MYSQL_PUBLIC_URL":"mysql://u:p@h.rlwy.net:1/db"}}}', false],
             'valid map'          => ['{"data":{"variables":{"MYSQL_PUBLIC_URL":"mysql://u:p@h.rlwy.net:1/db"}}}', false],
         ];
     }

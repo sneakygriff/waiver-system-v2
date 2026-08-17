@@ -8,8 +8,12 @@
 # This file replaces that with one ordered chain:
 #
 #     phpunit ─┬─▶ image (GHCR build+push)
-#              ├─▶ dump  ──▶ migrate ──▶ deploy ──▶ health ──▶ dispatch
-#              └───────────────────────────────────┘ (deploy also needs image)
+#              └─▶ provenance ──▶ dump ──▶ migrate ──▶ deploy ──▶ health ──▶ dispatch
+#
+#   deploy also needs image; migrate also names provenance DIRECTLY in needs:.
+#   provenance is the URL-provenance pre-flight (M5.6): BOTH dump and migrate
+#   depend on it, so NO DB touch — the dump's mysqldump OR the migrate — runs
+#   until it has proven STAGING_WAIVER_DB_URL reaches the staging (not prod) DB.
 #
 # ── ONE TRIGGER, EXACTLY: push to `master` ──────────────────────────────────
 #   `master` is this fork's release branch (NOT `main` — the admin repo's is
@@ -20,8 +24,10 @@
 #   PR-context trigger would expose all three to whoever opened the PR.
 #
 # ── STEP ORDER IS THE MECHANISM (AC4.3) ─────────────────────────────────────
-#   dump → migrate → deploy → health → dispatch, each `needs:`-gated on the one
-#   before it. A failing migration therefore aborts the run with the PREVIOUS
+#   provenance → dump → migrate → deploy → health → dispatch, each `needs:`-gated
+#   on the one before it (provenance gates BOTH dump and migrate — the two DB
+#   touches — so neither can run before the URL-provenance pre-flight passes).
+#   A failing migration therefore aborts the run with the PREVIOUS
 #   image still serving on Railway: not because anything rolls back (nothing
 #   does — MySQL DDL implicitly commits, see migrations/README.md), but because
 #   the deploy job has not run and cannot run. The pre-migrate snapshot exists
@@ -41,8 +47,9 @@
 #   is always deployed" is the property, not "every push is".
 #
 # ── ARMED, BUT FAIL-FAST RED UNTIL THE OPERATOR PROVISIONS (M3 precedent) ───
-#   The dump, migrate, deploy and dispatch jobs each begin with a presence check
-#   for the secrets they need, and the health job asserts a DNS name that does
+#   The provenance, dump, migrate, deploy and dispatch jobs each begin with a
+#   presence check for the secrets they need, and the health job asserts a DNS
+#   name that does
 #   not resolve yet. Until the operator completes the M4 runbook's provisioning
 #   sequence (Railway staging environment → PII-distinctness gate → staging DB
 #   baseline → secrets), those jobs go RED naming exactly what is missing. That
@@ -54,8 +61,8 @@
 #
 #   Secrets this workflow expects (names only — the operator sets them; the
 #   admin repo's scripts/verify-tokens.ts audits this exact list):
-#     STAGING_WAIVER_DB_URL  mysql://user:pass@host:3306/db   (dump + migrate)
-#     RAILWAY_STAGING_TOKEN  Railway PROJECT token, staging-scoped   (deploy)
+#     STAGING_WAIVER_DB_URL  mysql://user:pass@host:3306/db  (provenance+dump+migrate)
+#     RAILWAY_STAGING_TOKEN  Railway PROJECT token, staging-scoped  (provenance+migrate+deploy)
 #     ADMIN_DISPATCH_PAT     fine-grained PAT on the admin repo only (dispatch)
 #   GHCR needs NO secret: the image job uses the built-in GITHUB_TOKEN with
 #   `packages: write` — an ephemeral installation token is strictly less
@@ -126,13 +133,14 @@ env:
   #
   # RAILWAY_STAGING_SERVICE_ID is the WAIVER APP service (the one the deploy job
   # points at the new image). RAILWAY_STAGING_MYSQL_SERVICE_ID is the STAGING
-  # MySQL service — a DIFFERENT service — read (never written) by the migrate
-  # job's M5.6 URL-provenance pre-flight to prove STAGING_WAIVER_DB_URL reaches
-  # the staging database Railway itself reports (scripts/preflight-db-host.php).
-  # All three are EMPTY until provisioning; the migrate/deploy jobs refuse to
-  # start while any they need is blank. The MYSQL id's VALUE is filled in the
-  # same §5 arming commit as the pair (M5 operator runbook) — its absence is a
-  # first-step fail-fast, never a silent skip.
+  # MySQL service — a DIFFERENT service — read (never written) by the dedicated
+  # provenance job's M5.6 URL-provenance pre-flight to prove STAGING_WAIVER_DB_URL
+  # reaches the staging database Railway itself reports (scripts/preflight-db-host.php),
+  # BEFORE either the dump or the migrate touches it.
+  # All three are EMPTY until provisioning; the provenance/migrate/deploy jobs
+  # refuse to start while any they need is blank. The MYSQL id's VALUE is filled
+  # in the same §5 arming commit as the pair (M5 operator runbook) — its absence
+  # is a first-step fail-fast, never a silent skip.
   RAILWAY_STAGING_ENVIRONMENT_ID: ""
   RAILWAY_STAGING_SERVICE_ID: ""
   RAILWAY_STAGING_MYSQL_SERVICE_ID: ""
@@ -629,6 +637,102 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
+  # provenance — URL-PROVENANCE PRE-FLIGHT (M5.6, AC4.6). The each-run mechanical
+  # proof that STAGING_WAIVER_DB_URL reaches the SAME endpoint Railway reports for
+  # the STAGING MySQL service.
+  #
+  # WHY IT IS ITS OWN JOB, UPSTREAM OF THE DUMP. The first DB touch in this whole
+  # DAG is the `dump` job's `mysqldump` (a full read of every table, uploaded as a
+  # 7-day artifact) — NOT the migrate. If a mis-mint / wrong-panel copy-paste /
+  # bad rotation ever pointed STAGING_WAIVER_DB_URL at the PRODUCTION waiver DB, a
+  # guard that lived only in the migrate job would fire too late: the dump would
+  # already have exfiltrated prod PII (names, DOBs, signatures) into a CI artifact
+  # on every push. So the proof runs HERE, and BOTH `dump` and `migrate` `needs:`
+  # it — nothing dumps OR migrates until it passes.
+  #
+  # It reads the staging MySQL service's OWN Railway-provisioned connection
+  # variables (RAILWAY_TOKEN = the staging PROJECT token; RAILWAY_STAGING_MYSQL_
+  # SERVICE_ID from the workflow env) and asserts STAGING_WAIVER_DB_URL's full
+  # canonical AUTHORITY (host AND port) equals the staging MySQL's. Host-only
+  # would be a false-PASS here: Railway's PUBLIC MySQL endpoints (the only ones a
+  # hosted runner can reach) share a proxy DOMAIN and differ ONLY by port, so the
+  # port is load-bearing — see scripts/preflight-db-host.php and
+  # src/Preflight/DbHostProvenance.php for the canonical-only, fail-closed,
+  # secret-safe parse posture (ported from the admin M5.5 host-distinct gate).
+  #
+  # FAIL CLOSED ON EVERYTHING (mismatch, unparseable, Railway-API-down, an
+  # unexpected query shape): a red run is re-runnable; a dump/migrate against the
+  # wrong database is not. Availability-coupling a PII guard to Railway is
+  # deliberate. The variables(...) query shape is UNVERIFIED-LIVE (a wrong shape
+  # fails GraphQL validation → the pre-flight fails closed, never a silent pass);
+  # its first-run confirmation is owed in the M5 runbook. All secret values reach
+  # the script through env: only — never a ${{ }} expression inside run:, never a
+  # command line, never a step output.
+  #
+  # WHY A CONTAINER (same reasoning as the migrate job): this job holds
+  # STAGING_WAIVER_DB_URL and the Railway token, and the smallest honest way to
+  # give it PHP is the official `php:8.2-cli` image. The script is dependency-free
+  # — parse_url plus one https `file_get_contents` on the base image's bundled
+  # openssl, no composer autoload and no pdo_mysql — so nothing but `git` (for a
+  # clean checkout) is installed, and no third-party action runs near the secrets.
+  # ---------------------------------------------------------------------------
+  provenance:
+    name: Prove STAGING_WAIVER_DB_URL points at the staging MySQL (URL-provenance pre-flight)
+    needs: [phpunit]
+    if: ${{ needs.phpunit.result == 'success' }}
+    runs-on: ubuntu-latest
+    container:
+      image: php:8.2-cli
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # FIRST step on purpose: an unprovisioned secret/id must cost one line of
+      # log, not a checkout plus a Railway round-trip. Presence only — the values
+      # are never echoed. This is what keeps the job inert-until-provisioned:
+      # today every input is absent, so this step fails fast (RED, never a false
+      # green), and dump + migrate — which need this job — are skipped.
+      - name: Require the staging secrets
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${STAGING_WAIVER_DB_URL:-}" ] || missing="${missing} STAGING_WAIVER_DB_URL"
+          [ -n "${RAILWAY_TOKEN:-}" ] || missing="${missing} RAILWAY_STAGING_TOKEN"
+          [ -n "${RAILWAY_STAGING_ENVIRONMENT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)"
+          [ -n "${RAILWAY_STAGING_MYSQL_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_MYSQL_SERVICE_ID(workflow env constant)"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing:${missing}. Set the Actions secrets and fill the staging Railway environment id and MySQL service id in this workflow's env block (M5 operator runbook §5 — provisioning is what ARMS this pipeline, and it comes AFTER the PII-distinctness gate). Nothing was dumped or migrated."
+            exit 1
+          fi
+          echo "The staging DB URL, Railway token, environment id and MySQL service id are present (values never echoed)."
+
+      # `php:8.2-cli` ships no `git`, which actions/checkout prefers. The
+      # pre-flight script needs only PHP core plus the base image's bundled
+      # openssl (its one network call is an https file_get_contents), so nothing
+      # else — no jq, no curl, no pdo_mysql — is installed here.
+      - name: Prepare the container
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Secret values reach the script through env: ONLY — never a ${{ }}
+      # expression inside run:, never a command line, never a step output. No
+      # continue-on-error: a non-PASS verdict must fail this job (and so skip both
+      # dump and migrate). RAILWAY_API_URL + the staging ids come from workflow env.
+      - name: Assert STAGING_WAIVER_DB_URL points at the staging MySQL (URL-provenance pre-flight)
+        env:
+          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
+        run: php scripts/preflight-db-host.php
+
+  # ---------------------------------------------------------------------------
   # dump — the pre-migrate snapshot (AC4.3's recoverability half).
   #
   # Taken BEFORE the migration and BEFORE any deploy, so it captures the
@@ -644,8 +748,11 @@ jobs:
   # ---------------------------------------------------------------------------
   dump:
     name: Snapshot the staging waiver database
-    needs: [phpunit]
-    if: ${{ needs.phpunit.result == 'success' }}
+    # provenance gates the dump: the URL-provenance pre-flight must PASS before
+    # `mysqldump` — the first DB touch in the DAG — reads a single row, so a
+    # prod-mis-set STAGING_WAIVER_DB_URL can never be dumped into a CI artifact.
+    needs: [phpunit, provenance]
+    if: ${{ needs.phpunit.result == 'success' && needs.provenance.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -785,8 +892,12 @@ jobs:
   # ---------------------------------------------------------------------------
   migrate:
     name: Migrate the staging waiver database
-    needs: [phpunit, dump]
-    if: ${{ needs.phpunit.result == 'success' && needs.dump.result == 'success' }}
+    # provenance is named DIRECTLY (as well as transitively through dump) so the
+    # "no DB touch before the URL-provenance proof" property is readable one job
+    # at a time and a static test can pin it: migrate must never run run.php until
+    # the pre-flight has PASSED.
+    needs: [phpunit, dump, provenance]
+    if: ${{ needs.phpunit.result == 'success' && needs.dump.result == 'success' && needs.provenance.result == 'success' }}
     runs-on: ubuntu-latest
     container:
       image: php:8.2-cli
@@ -807,12 +918,11 @@ jobs:
           [ -n "${RAILWAY_TOKEN:-}" ] || missing="${missing} RAILWAY_STAGING_TOKEN"
           [ -n "${RAILWAY_STAGING_ENVIRONMENT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)"
           [ -n "${RAILWAY_STAGING_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_SERVICE_ID(workflow env constant)"
-          [ -n "${RAILWAY_STAGING_MYSQL_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_MYSQL_SERVICE_ID(workflow env constant)"
           if [ -n "$missing" ]; then
             echo "::error::Missing:${missing}. Set the Actions secrets and fill the staging Railway id pair in this workflow's env block (M4 operator runbook §5 — provisioning is what ARMS this pipeline, and it comes AFTER the PII-distinctness gate). Nothing was migrated."
             exit 1
           fi
-          echo "Staging secrets and the Railway staging id triple are present (values never echoed)."
+          echo "Staging secrets and the Railway staging id pair are present (values never echoed)."
 
       # `php:8.2-cli` ships neither `git` (actions/checkout prefers it) nor `jq`
       # (the Railway read below), and `run.php` needs pdo_mysql — which is a
@@ -888,38 +998,13 @@ jobs:
             echo "Pre-migrate baseline image: \`${previous}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # URL-PROVENANCE PRE-FLIGHT (M5.6, AC4.6) — the each-run mechanical proof
-      # that STAGING_WAIVER_DB_URL reaches the SAME endpoint Railway reports for
-      # the STAGING MySQL service, so this job can never dump/migrate PRODUCTION.
-      # It runs AFTER "Require the staging secrets" and BEFORE the dry-run below —
-      # the first thing that touches the database — so a prod-pointing (or
-      # unverifiable) URL is caught before any DB connection is opened.
+      # NO URL-provenance step here: the dedicated `provenance` job (which this
+      # job `needs:`) already proved STAGING_WAIVER_DB_URL reaches the staging
+      # MySQL, BEFORE the dump ran — a single gate covering both DB touches, no
+      # duplicated Railway read. migrate cannot start unless that proof PASSED
+      # (needs: [phpunit, dump, provenance]), so run.php below runs only against a
+      # URL whose provenance is settled.
       #
-      # It reads the staging MySQL service's OWN Railway-provisioned connection
-      # variables (RAILWAY_TOKEN = the staging PROJECT token already in this job —
-      # no secret-surface widening; RAILWAY_STAGING_MYSQL_SERVICE_ID from the
-      # workflow env) and asserts STAGING_WAIVER_DB_URL's full canonical AUTHORITY
-      # (host AND port) equals the staging MySQL's. Host-only would be a false-PASS
-      # here: Railway's PUBLIC MySQL endpoints (the only ones a hosted runner can
-      # reach) share a proxy DOMAIN and differ ONLY by port, so the port is
-      # load-bearing — see scripts/preflight-db-host.php and
-      # src/Preflight/DbHostProvenance.php for the canonical-only, fail-closed,
-      # secret-safe parse posture (ported from the admin M5.5 host-distinct gate).
-      #
-      # FAIL CLOSED ON EVERYTHING (mismatch, unparseable, Railway-API-down, an
-      # unexpected query shape): a red run is re-runnable; a migrate against the
-      # wrong database is not. Availability-coupling a PII guard to Railway is
-      # deliberate. The variables(...) query shape is UNVERIFIED-LIVE (a wrong
-      # shape fails GraphQL validation → the pre-flight fails closed, never a
-      # silent pass); its first-run confirmation is owed in the M5 runbook. All
-      # secret values reach the script through env: only — never a ${{ }}
-      # expression inside run:, never a command line, never a step output.
-      - name: Assert STAGING_WAIVER_DB_URL points at the staging MySQL (URL-provenance pre-flight)
-        env:
-          STAGING_WAIVER_DB_URL: ${{ secrets.STAGING_WAIVER_DB_URL }}
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_STAGING_TOKEN }}
-        run: php scripts/preflight-db-host.php
-
       # The URL reaches run.php through the ENVIRONMENT, never through argv:
       # the runner does not expand secrets into the script text, but an
       # interpolated command line would still put the credential into the

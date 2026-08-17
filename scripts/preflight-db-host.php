@@ -2,15 +2,20 @@
 declare(strict_types=1);
 
 /**
- * scripts/preflight-db-host.php — migrate-job URL-provenance pre-flight
+ * scripts/preflight-db-host.php — the URL-provenance pre-flight
  * [CI/CD M5.6, AC4.6 — the each-run mechanical provenance closer]
  *
- * Runs in the `migrate` job (php:8.2-cli container), AFTER "Require the staging
- * secrets" and BEFORE the `run.php --dry-run`. It refuses to let the run reach
- * the dump/migrate of `STAGING_WAIVER_DB_URL` unless that URL provably reaches
- * the SAME endpoint Railway reports for the STAGING MySQL service — so a staging
- * CI run can never dump or migrate the PRODUCTION waiver database. See
- * src/Preflight/DbHostProvenance.php for the full rationale and the
+ * Runs in the DEDICATED `provenance` job (php:8.2-cli container), AFTER "Require
+ * the staging secrets". BOTH the `dump` and `migrate` jobs `needs:` that job, so
+ * this pre-flight runs BEFORE the first DB touch in the whole DAG — the `dump`
+ * job's mysqldump — and gates it as well as the migrate. It refuses to let the
+ * run reach the dump OR the migrate of `STAGING_WAIVER_DB_URL` unless that URL
+ * provably reaches the SAME endpoint Railway reports for the STAGING MySQL
+ * service — so a staging CI run can never dump or migrate the PRODUCTION waiver
+ * database. (Gating only the migrate would leave the dump — a full read of every
+ * table, uploaded as a 7-day artifact — exposed to a mis-set URL, the
+ * PII-exfiltration half of the exact event this gate exists to make impossible.)
+ * See src/Preflight/DbHostProvenance.php for the full rationale and the
  * canonical-only / fail-closed / secret-safe host-parse posture.
  *
  * NO COMPOSER AUTOLOAD. Like migrations/run.php, this runs in a container that
@@ -21,8 +26,9 @@ declare(strict_types=1);
  *
  * FAIL CLOSED ON EVERYTHING: a missing env value, an unparseable/prod-pointing
  * URL, a Railway API that is down/unreachable/unauthorized, an unexpected query
- * shape, or a host/port mismatch all exit non-zero and BLOCK the migrate. A red
- * run is re-runnable; a migrate against the wrong database is not.
+ * shape, or a host/port mismatch all exit non-zero and BLOCK the dump and the
+ * migrate. A red run is re-runnable; a dump/migrate against the wrong database is
+ * not.
  *
  * SECRET SAFETY: the Railway token and `STAGING_WAIVER_DB_URL` are read from the
  * environment and NEVER written to a command line, a step output, or the log.
@@ -34,6 +40,16 @@ declare(strict_types=1);
 use App\Preflight\DbHostProvenance;
 
 require __DIR__ . '/../src/Preflight/DbHostProvenance.php';
+
+// Defence-in-depth on a secret-handling path. The php:8.2-cli image loads no
+// php.ini, so zend.exception_ignore_args defaults Off: an uncaught throwable
+// would print stack frames WITH their scalar argument values (truncated) into
+// the CI log. No reachable throw site holds a secret in-frame today (parse_url /
+// preg_match / json_decode do not throw on the DSN, file_get_contents returns
+// false rather than throwing) — but one future edit (a typed helper that throws
+// on $dbUrl) would turn a trace into a first-chars-of-the-DSN leak. Force the
+// flag On (PHP_INI_ALL) so a trace can never carry an argument value regardless.
+ini_set('zend.exception_ignore_args', '1');
 
 const EXIT_OK   = 0;
 const EXIT_FAIL = 1;
@@ -131,6 +147,15 @@ $context = stream_context_create([
         'content'       => $payload,
         'timeout'       => 30,
         'ignore_errors' => true, // read a non-2xx BODY rather than throwing, so we can classify
+        // NEVER follow a redirect. PHP's http wrapper re-sends the full custom
+        // header block — INCLUDING the Project-Access-Token — to a redirect
+        // target, cross-host included, so a server-directed 3xx could forward the
+        // staging token off the pinned Railway host. With following OFF, a 3xx is
+        // left in place and the status check below (< 200 || >= 300) fails closed
+        // on it. RAILWAY_API_URL is a fixed https endpoint; a redirect off it is
+        // anomalous by definition, so refusing it costs nothing legitimate.
+        'follow_location' => 0,
+        'max_redirects'   => 0,
     ],
     'ssl' => [
         'verify_peer'      => true,
