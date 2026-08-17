@@ -309,6 +309,71 @@ final class DbHostProvenanceTest extends TestCase
         $this->assertTrue(DbHostProvenance::verdict($url, $railway)['ok']);
     }
 
+    // ── Railway API URL scheme guard (M5.6 hardening): token → https only ──────
+
+    /**
+     * @dataProvider apiUrlSchemeProvider
+     */
+    public function testRailwayApiUrlHttpsGuard(string $url, bool $expectSecure): void
+    {
+        // The guard the pre-flight consults BEFORE placing the Railway
+        // Project-Access-Token in an HTTP header. A non-https RAILWAY_API_URL must
+        // fail closed (isHttpsApiUrl → false) so the bearer token is never sent
+        // over cleartext or an unexpected transport.
+        // MUTATION KILL: weakening isHttpsApiUrl to accept a non-https scheme
+        // (removing the guard) flips the false-expecting rows to true → this DIES.
+        $this->assertSame($expectSecure, DbHostProvenance::isHttpsApiUrl($url));
+    }
+
+    /** @return array<string,array{0:string,1:bool}> */
+    public static function apiUrlSchemeProvider(): array
+    {
+        return [
+            // The live workflow default — the ONE form over which the token may go.
+            'https default'      => ['https://backboard.railway.app/graphql/v2', true],
+            'https upcased'      => ['HTTPS://backboard.railway.app/graphql/v2', true],
+            // A non-https override would put the token on the wire in cleartext.
+            'http insecure'      => ['http://backboard.railway.app/graphql/v2', false],
+            'ws insecure'        => ['ws://backboard.railway.app/graphql/v2', false],
+            'ftp insecure'       => ['ftp://backboard.railway.app/graphql/v2', false],
+            'scheme-relative'    => ['//backboard.railway.app/graphql/v2', false],
+            'no scheme'          => ['backboard.railway.app/graphql/v2', false],
+            'mysql dsn mispaste' => ['mysql://u:p@h:3306/db', false],
+            'empty'              => ['', false],
+        ];
+    }
+
+    public function testPreflightCliGuardsTheApiUrlSchemeBeforeSendingTheToken(): void
+    {
+        // Wiring pin (defence against a live-but-uncalled guard): the CLI shell
+        // must actually consult isHttpsApiUrl on $railwayApiUrl AND that check must
+        // appear BEFORE the token is placed in the request header — otherwise the
+        // token could be spliced into a header over an insecure scheme before the
+        // scheme is ever checked. Removing the guard from the script makes this DIE.
+        $source = file_get_contents(__DIR__ . '/../scripts/preflight-db-host.php');
+        $this->assertIsString($source);
+
+        $guardPos = strpos($source, 'DbHostProvenance::isHttpsApiUrl($railwayApiUrl)');
+        $this->assertNotFalse(
+            $guardPos,
+            'the CLI must consult DbHostProvenance::isHttpsApiUrl($railwayApiUrl) — the https transport guard.'
+        );
+        $this->assertStringContainsString(
+            'railway-api-url-insecure',
+            $source,
+            'the insecure-scheme refusal must carry its distinct, value-free code.'
+        );
+
+        $tokenHeaderPos = strpos($source, 'Project-Access-Token: ');
+        $this->assertNotFalse($tokenHeaderPos, 'sanity: the script must build the Project-Access-Token header.');
+        $this->assertLessThan(
+            $tokenHeaderPos,
+            $guardPos,
+            'the https guard must run BEFORE the token is placed in the Project-Access-Token header — a scheme '
+            . 'check that runs after the token is already on the wire guards nothing.'
+        );
+    }
+
     // ── Secret safety: no host/port/credential/raw-URL ever reaches a reason ───
 
     public function testVerdictReasonsWithholdHostsPortsAndCredentials(): void

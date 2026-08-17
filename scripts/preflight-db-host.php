@@ -111,7 +111,7 @@ if ($missing !== []) {
     preflight_fail(
         'URL-provenance pre-flight cannot run — missing: ' . implode(', ', $missing) . '. '
         . 'Set the Actions secrets and fill the staging Railway id triple in this workflow\'s env block '
-        . '(M4/M5 operator runbook §5). Nothing was migrated.'
+        . '(M4/M5 operator runbook §5). Nothing was dumped or migrated.'
     );
 }
 
@@ -120,6 +120,18 @@ if ($missing !== []) {
 // never inject a header line. The value itself is NEVER printed.
 if (!preg_match('/^[A-Za-z0-9._\-]+$/', $railwayToken)) {
     preflight_fail('RAILWAY_STAGING_TOKEN contains characters outside [A-Za-z0-9._-] (value withheld) — refusing to build a request with it.');
+}
+
+// The Railway Project-Access-Token is a bearer credential the request below
+// places in an HTTP header. Refuse to send it over anything but https://: a
+// mis-set or later-overridden RAILWAY_API_URL carrying an http:// (or any
+// non-https) scheme would put the staging token on the wire in cleartext.
+// RAILWAY_API_URL is a fixed https default in the workflow env with no override
+// path wired today — this guard is here for OVERRIDE-SAFETY, so a future env
+// edit can never silently downgrade the token's transport. Fail CLOSED with a
+// distinct, value-free code, BEFORE the token is placed in a header below.
+if (!DbHostProvenance::isHttpsApiUrl($railwayApiUrl)) {
+    preflight_fail('[ac4.6.waiver-db-url-provenance.railway-api-url-insecure] RAILWAY_API_URL is not an https:// endpoint (value withheld) — refusing to send the Railway Project-Access-Token over an insecure scheme. Refusing to access the staging DB.');
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +147,7 @@ $payload = json_encode([
     'variables' => ['environmentId' => $environmentId, 'serviceId' => $mysqlServiceId],
 ], JSON_UNESCAPED_SLASHES);
 if ($payload === false) {
-    preflight_fail('Could not encode the Railway request (internal) — refusing to migrate.');
+    preflight_fail('Could not encode the Railway request (internal) — refusing to access the staging DB.');
 }
 
 $context = stream_context_create([
@@ -178,7 +190,7 @@ if ($body === false || $status < 200 || $status >= 300) {
     preflight_fail(
         'The Railway API did not return a usable response reading the staging MySQL variables '
         . '(HTTP status: ' . $status . '; body withheld). Usually a network failure or an auth rejection — '
-        . 'check RAILWAY_STAGING_TOKEN\'s project scope and the staging id triple. Refusing to migrate (re-runnable).'
+        . 'check RAILWAY_STAGING_TOKEN\'s project scope and the staging id triple. Refusing to access the staging DB (re-runnable).'
     );
 }
 
@@ -198,7 +210,7 @@ if (is_array($decoded) && isset($decoded['errors']) && is_array($decoded['errors
         'The Railway API returned GraphQL error(s) reading the staging MySQL variables '
         . '(messages withheld; codes: ' . ($safeCodes !== '' ? $safeCodes : 'none') . '). '
         . 'If this is the first live run, confirm the variables(...) query shape and the staging MySQL service id '
-        . '(M5 operator runbook). Refusing to migrate.'
+        . '(M5 operator runbook). Refusing to access the staging DB.'
     );
 }
 

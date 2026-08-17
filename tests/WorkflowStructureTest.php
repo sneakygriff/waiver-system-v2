@@ -410,6 +410,67 @@ final class WorkflowStructureTest extends TestCase {
     }
   }
 
+  // ==========================================================================
+  // 4c. The `if:` CHANNEL of every DB-touching job (M5.6 hardening). Pinning
+  //     `needs: [.., provenance]` (§4b above) is only HALF the gate: `needs:`
+  //     and `if:` are two INDEPENDENT channels. A job that names provenance in
+  //     needs: but whose `if:` uses a status-override function
+  //     (always()/failure()/cancelled()) RUNS EVEN WHEN provenance FAILED --
+  //     GitHub evaluates such an `if:` regardless of a need's result -- so the
+  //     DB touch would execute after the URL-provenance pre-flight went RED, the
+  //     exact prod-PII event the whole job exists to block. §4b cannot see this:
+  //     it reads only needs:. This pins the second channel for BOTH dump
+  //     (mysqldump) and migrate (run.php): their `if:` must positively gate on
+  //     `needs.provenance.result == 'success'` AND must carry no status-override
+  //     function. Mutation proof: rewriting either job's `if:` to
+  //     `${{ always() }}` makes BOTH assertions below DIE.
+  // ==========================================================================
+
+  public function testEveryDbTouchingJobIfChannelGatesOnProvenanceSuccess(): void {
+    $jobs = self::workflow()['jobs'];
+    foreach (['dump', 'migrate'] as $dbJob) {
+      $if = $jobs[$dbJob]['if'] ?? null;
+      $this->assertIsString(
+        $if,
+        "job '$dbJob' touches the staging database, so it MUST carry an if: expression -- a DB-touching job with ".
+        "no if: runs whenever its needs: resolve, and needs:-satisfied is not the same as provenance-succeeded."
+      );
+      // The EXACT expression form the workflow uses. This is the positive half:
+      // the provenance-success clause must be present in the if: channel, not
+      // merely in needs:. A mutation that drops this clause (e.g. rewriting the
+      // if: to ${{ always() }}) makes this assertion DIE.
+      $this->assertStringContainsString(
+        "needs.provenance.result == 'success'",
+        $if,
+        "job '$dbJob' must gate its if: on needs.provenance.result == 'success' -- gating the needs: edge alone ".
+        "is not enough; without this clause a status-override if: would let the DB touch run even after the ".
+        "URL-provenance pre-flight FAILED."
+      );
+    }
+  }
+
+  public function testNoDbTouchingJobIfUsesAStatusOverrideFunction(): void {
+    $jobs = self::workflow()['jobs'];
+    foreach (['dump', 'migrate'] as $dbJob) {
+      $if = $jobs[$dbJob]['if'] ?? null;
+      $this->assertIsString($if, "job '$dbJob' must carry an if: expression (see the sibling test).");
+      // The negative half: BAN the three status-check functions that evaluate
+      // true despite a FAILED need. success() is the safe default and is NOT
+      // banned; always()/failure()/cancelled() each run the job past a red
+      // provenance. Case-insensitive because GitHub treats these names
+      // case-insensitively. The `'success'` string literal in the real if: does
+      // NOT match -- the pattern requires a `(` after the bare word, so only a
+      // function CALL trips it.
+      $this->assertDoesNotMatchRegularExpression(
+        '/\b(?:always|failure|cancelled)\s*\(/i',
+        $if,
+        "job '$dbJob' if: must not use a status-override function (always(), failure(), cancelled()) -- each ".
+        "evaluates true even when a need (provenance) FAILED, which would run the staging-DB touch past a red ".
+        "URL-provenance pre-flight. Rewriting the if: to \${{ always() }} must make this test DIE."
+      );
+    }
+  }
+
   /** @return array{0:list<array<string,mixed>>,1:int,2:int} provenance steps + the require & pre-flight indices. */
   private static function provenancePreflightSteps(): array {
     $steps = self::workflow()['jobs']['provenance']['steps'] ?? [];

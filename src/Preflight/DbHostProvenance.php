@@ -299,6 +299,31 @@ final class DbHostProvenance
     }
 
     /**
+     * The Railway GraphQL endpoint the pre-flight sends its project token to must
+     * be an https:// URL — and this predicate is the sole gate on that. The token
+     * (`Project-Access-Token`) is a bearer credential; sending it over http:// (or
+     * any non-https scheme) would put it on the wire in cleartext. Returns true
+     * ONLY for an unambiguous https URL; every other value — http, a scheme-less
+     * or scheme-relative URL, an unparseable one, a mis-pasted mysql DSN — returns
+     * false so the caller can fail CLOSED before the token is ever placed in a
+     * header.
+     *
+     * RAILWAY_API_URL ships as a hardcoded https default in the workflow env, with
+     * no override path wired today; this guard exists for OVERRIDE-SAFETY — a later
+     * edit to that env constant can never silently downgrade the token's transport
+     * to cleartext. Schemes are case-insensitive (RFC 3986 §3.1), so the parsed
+     * scheme is lowercased before the compare.
+     */
+    public static function isHttpsApiUrl(string $url): bool
+    {
+        $parts = parse_url(trim($url));
+        if ($parts === false || !isset($parts['scheme'])) {
+            return false;
+        }
+        return strtolower((string) $parts['scheme']) === 'https';
+    }
+
+    /**
      * The verdict. PASS only when BOTH authorities resolved AND their host and
      * port are equal. Every other state fails CLOSED. Reasons are secret-safe:
      * ROLE + Railway variable NAME + "values withheld" — never a host/port value,
