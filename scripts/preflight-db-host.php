@@ -134,6 +134,16 @@ if (!DbHostProvenance::isHttpsApiUrl($railwayApiUrl)) {
     preflight_fail('[ac4.6.waiver-db-url-provenance.railway-api-url-insecure] RAILWAY_API_URL is not an https:// endpoint (value withheld) — refusing to send the Railway Project-Access-Token over an insecure scheme. Refusing to access the staging DB.');
 }
 
+// Transport (https) is not enough: a valid https URL whose host is an attacker's
+// (`https://user:pass@attacker/`) would still receive the bearer token. Pin the
+// DESTINATION to the Railway API host the workflow's hardcoded RAILWAY_API_URL
+// default names. The comparison uses the PARSED host only (userinfo stripped), so
+// a credential-smuggled authority cannot spoof it. Fail CLOSED with a distinct,
+// value-free code — still BEFORE the token is placed in a header below.
+if (!DbHostProvenance::apiUrlHostIsExpected($railwayApiUrl)) {
+    preflight_fail('[ac4.6.waiver-db-url-provenance.railway-api-url-host-unexpected] RAILWAY_API_URL does not point at the expected Railway API host (value withheld) — refusing to send the Railway Project-Access-Token to an unexpected host. Refusing to access the staging DB.');
+}
+
 // ---------------------------------------------------------------------------
 // 2. The two authorities.
 // ---------------------------------------------------------------------------

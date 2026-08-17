@@ -128,6 +128,18 @@ final class DbHostProvenance
         'DATABASE_URL',
     ];
 
+    /**
+     * The Railway GraphQL API endpoint the pre-flight POSTs the staging
+     * Project-Access-Token to — the SAME hardcoded https default the workflow env
+     * sets `RAILWAY_API_URL` to (.github/workflows/ci.yml). It is duplicated here
+     * (not read from that file at runtime — the pre-flight container never sees the
+     * workflow) so the token's DESTINATION HOST can be pinned in code: the host the
+     * token may be sent to is DERIVED from this URL's parse_url host
+     * (`expectedRailwayApiHost()`), never hand-typed as a bare host literal. If the
+     * workflow default ever changes host, change this constant in the same commit.
+     */
+    public const RAILWAY_API_URL_DEFAULT = 'https://backboard.railway.app/graphql/v2';
+
     private const CANONICAL_HOST_ALLOWLIST = '/^[a-z0-9.-]+$/';
     private const HOSTNAME_LABEL           = '/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/';
     private const RULE                     = 'ac4.6.waiver-db-url-provenance';
@@ -300,27 +312,70 @@ final class DbHostProvenance
 
     /**
      * The Railway GraphQL endpoint the pre-flight sends its project token to must
-     * be an https:// URL — and this predicate is the sole gate on that. The token
-     * (`Project-Access-Token`) is a bearer credential; sending it over http:// (or
-     * any non-https scheme) would put it on the wire in cleartext. Returns true
-     * ONLY for an unambiguous https URL; every other value — http, a scheme-less
-     * or scheme-relative URL, an unparseable one, a mis-pasted mysql DSN — returns
-     * false so the caller can fail CLOSED before the token is ever placed in a
-     * header.
+     * be an unambiguous `https://HOST…` URL — and this predicate is the TRANSPORT
+     * half of the gate on that (the destination-host half is apiUrlHostIsExpected()).
+     * The token (`Project-Access-Token`) is a bearer credential; sending it over
+     * http:// (or any non-https scheme) would put it on the wire in cleartext.
+     * Returns true ONLY when parse_url yields BOTH an exactly-`https` scheme
+     * (case-insensitive, RFC 3986 §3.1) AND a NON-EMPTY host. Every other value
+     * fails CLOSED so the caller never places the token in a header for it: http,
+     * ws, ftp, a scheme-less or scheme-relative URL, an unparseable one, a
+     * mis-pasted mysql DSN — AND the hostless/opaque forms parse_url reports a
+     * scheme-but-no-host for (`https:`, `https:foo`, `https:host/path`: a missing
+     * `//` turns the authority into a path, so there is no host to send a token to).
      *
      * RAILWAY_API_URL ships as a hardcoded https default in the workflow env, with
      * no override path wired today; this guard exists for OVERRIDE-SAFETY — a later
      * edit to that env constant can never silently downgrade the token's transport
-     * to cleartext. Schemes are case-insensitive (RFC 3986 §3.1), so the parsed
-     * scheme is lowercased before the compare.
+     * to a non-https scheme or a hostless URL.
      */
     public static function isHttpsApiUrl(string $url): bool
     {
         $parts = parse_url(trim($url));
-        if ($parts === false || !isset($parts['scheme'])) {
+        if ($parts === false || !isset($parts['scheme'], $parts['host'])) {
             return false;
         }
-        return strtolower((string) $parts['scheme']) === 'https';
+        if (strtolower((string) $parts['scheme']) !== 'https') {
+            return false;
+        }
+        return trim((string) $parts['host']) !== '';
+    }
+
+    /**
+     * The DESTINATION half of the token gate (beside isHttpsApiUrl()'s transport
+     * half): the Railway Project-Access-Token may be sent to the Railway API host
+     * and NOTHING else. A scheme-only guard still lets `https://user:pass@attacker/`
+     * receive the bearer token — a valid https URL with a non-empty host — so this
+     * pins the host to the ONE the workflow's hardcoded RAILWAY_API_URL default
+     * names (`expectedRailwayApiHost()`, DERIVED from RAILWAY_API_URL_DEFAULT, never
+     * a hand-typed host). Returns true ONLY when the configured URL's PARSED host
+     * (lowercased; userinfo is already stripped by parse_url, so the raw
+     * `user:pass@` authority is never part of the compare) equals that expected
+     * host. Every other value — a different host, a hostless/opaque URL, an
+     * unparseable one — fails CLOSED.
+     */
+    public static function apiUrlHostIsExpected(string $url): bool
+    {
+        $parts = parse_url(trim($url));
+        if ($parts === false || !isset($parts['host'])) {
+            return false;
+        }
+        $host = strtolower(trim((string) $parts['host']));
+        if ($host === '') {
+            return false;
+        }
+        return $host === self::expectedRailwayApiHost();
+    }
+
+    /**
+     * The expected Railway API host — the parse_url host of the hardcoded
+     * RAILWAY_API_URL_DEFAULT, lowercased. Derived, never a bare host literal, so
+     * the destination pin cannot drift from the URL the workflow actually POSTs to.
+     */
+    private static function expectedRailwayApiHost(): string
+    {
+        $host = parse_url(self::RAILWAY_API_URL_DEFAULT, PHP_URL_HOST);
+        return is_string($host) ? strtolower($host) : '';
     }
 
     /**

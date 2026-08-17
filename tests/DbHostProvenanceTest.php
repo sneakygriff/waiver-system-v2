@@ -316,12 +316,17 @@ final class DbHostProvenanceTest extends TestCase
      */
     public function testRailwayApiUrlHttpsGuard(string $url, bool $expectSecure): void
     {
-        // The guard the pre-flight consults BEFORE placing the Railway
-        // Project-Access-Token in an HTTP header. A non-https RAILWAY_API_URL must
-        // fail closed (isHttpsApiUrl → false) so the bearer token is never sent
-        // over cleartext or an unexpected transport.
-        // MUTATION KILL: weakening isHttpsApiUrl to accept a non-https scheme
-        // (removing the guard) flips the false-expecting rows to true → this DIES.
+        // The transport guard the pre-flight consults BEFORE placing the Railway
+        // Project-Access-Token in an HTTP header. It must return true ONLY for an
+        // unambiguous https://HOST form: a non-https scheme, OR an https URL with no
+        // host (`https:`, `https:foo`, `https:host/path` — no `//`, so parse_url
+        // reports a scheme but no host), must fail closed so the bearer token is
+        // never sent over cleartext or to a hostless/opaque endpoint.
+        // MUTATION KILL (scheme): weakening isHttpsApiUrl to accept a non-https
+        // scheme flips the non-https rows to true → this DIES.
+        // MUTATION KILL (host): reverting to the scheme-ONLY check flips the
+        // hostless-https rows ('https no slashes'/'opaque'/'host as path') to true
+        // → this DIES.
         $this->assertSame($expectSecure, DbHostProvenance::isHttpsApiUrl($url));
     }
 
@@ -339,7 +344,57 @@ final class DbHostProvenanceTest extends TestCase
             'scheme-relative'    => ['//backboard.railway.app/graphql/v2', false],
             'no scheme'          => ['backboard.railway.app/graphql/v2', false],
             'mysql dsn mispaste' => ['mysql://u:p@h:3306/db', false],
+            // Hostless/opaque https — parse_url reports scheme-but-no-host. A
+            // scheme-only guard (the pre-fix bug) returned true for all three,
+            // sending the token to a URL with no host. Must fail closed.
+            'https no slashes'   => ['https:', false],
+            'https opaque'       => ['https:foo', false],
+            'https host as path' => ['https:backboard.railway.app/graphql/v2', false],
+            // parse_url() itself returns false here (a non-numeric port) → fail closed.
+            'parse_url false'    => ['https://host:port', false],
             'empty'              => ['', false],
+        ];
+    }
+
+    // ── Railway API URL host allowlist (M5.6 hardening): token → the ONE host ───
+
+    /**
+     * @dataProvider apiUrlHostProvider
+     */
+    public function testRailwayApiUrlHostAllowlist(string $url, bool $expectHost): void
+    {
+        // The destination guard, beside the transport guard above. https alone is
+        // not enough: `https://user:pass@attacker/` is a valid https URL with a
+        // non-empty host, so isHttpsApiUrl() passes it — only this host allowlist
+        // stops the Project-Access-Token from being POSTed to an attacker's host.
+        // The expected host is DERIVED from RAILWAY_API_URL_DEFAULT, so the real
+        // default MUST pass. The compare is on the PARSED host (userinfo stripped),
+        // never the raw authority.
+        // MUTATION KILL: removing the host check (e.g. `apiUrlHostIsExpected`
+        // returning true unconditionally) flips every false-expecting row to true →
+        // this DIES.
+        $this->assertSame($expectHost, DbHostProvenance::apiUrlHostIsExpected($url));
+    }
+
+    /** @return array<string,array{0:string,1:bool}> */
+    public static function apiUrlHostProvider(): array
+    {
+        return [
+            // The real hardcoded default MUST still pass — don't break the run.
+            'real default'     => [DbHostProvenance::RAILWAY_API_URL_DEFAULT, true],
+            'default literal'  => ['https://backboard.railway.app/graphql/v2', true],
+            // Case-insensitive host compare (parse_url keeps host case; we lowercase).
+            'host upcased'     => ['https://Backboard.Railway.App/graphql/v2', true],
+            // The attack the scheme-only guard could not stop: a real host of
+            // `attacker`, with the Railway name smuggled into the userinfo.
+            'userinfo attacker'=> ['https://user:pass@attacker/', false],
+            'evil host'        => ['https://evil.example', false],
+            'lookalike host'   => ['https://backboard.railway.app.evil.example/v2', false],
+            'non-railway host' => ['https://example.com/graphql/v2', false],
+            // Hostless/unparseable → no host to trust → fail closed.
+            'hostless opaque'  => ['https:backboard.railway.app/graphql/v2', false],
+            'parse_url false'  => ['https://host:port', false],
+            'empty'            => ['', false],
         ];
     }
 
@@ -370,6 +425,38 @@ final class DbHostProvenanceTest extends TestCase
             $tokenHeaderPos,
             $guardPos,
             'the https guard must run BEFORE the token is placed in the Project-Access-Token header — a scheme '
+            . 'check that runs after the token is already on the wire guards nothing.'
+        );
+    }
+
+    public function testPreflightCliGuardsTheApiUrlHostBeforeSendingTheToken(): void
+    {
+        // Wiring pin for the destination guard (defence against a live-but-uncalled
+        // host allowlist): the CLI must actually consult apiUrlHostIsExpected on
+        // $railwayApiUrl AND that check must appear BEFORE the token is placed in
+        // the request header — otherwise the token could be spliced into a header
+        // for an unexpected host before the host is ever checked. Removing the host
+        // guard call from the script makes this DIE.
+        $source = file_get_contents(__DIR__ . '/../scripts/preflight-db-host.php');
+        $this->assertIsString($source);
+
+        $guardPos = strpos($source, 'DbHostProvenance::apiUrlHostIsExpected($railwayApiUrl)');
+        $this->assertNotFalse(
+            $guardPos,
+            'the CLI must consult DbHostProvenance::apiUrlHostIsExpected($railwayApiUrl) — the destination-host guard.'
+        );
+        $this->assertStringContainsString(
+            'railway-api-url-host-unexpected',
+            $source,
+            'the unexpected-host refusal must carry its distinct, value-free code.'
+        );
+
+        $tokenHeaderPos = strpos($source, 'Project-Access-Token: ');
+        $this->assertNotFalse($tokenHeaderPos, 'sanity: the script must build the Project-Access-Token header.');
+        $this->assertLessThan(
+            $tokenHeaderPos,
+            $guardPos,
+            'the host guard must run BEFORE the token is placed in the Project-Access-Token header — a host '
             . 'check that runs after the token is already on the wire guards nothing.'
         );
     }

@@ -415,15 +415,19 @@ final class WorkflowStructureTest extends TestCase {
   //     `needs: [.., provenance]` (§4b above) is only HALF the gate: `needs:`
   //     and `if:` are two INDEPENDENT channels. A job that names provenance in
   //     needs: but whose `if:` uses a status-override function
-  //     (always()/failure()/cancelled()) RUNS EVEN WHEN provenance FAILED --
-  //     GitHub evaluates such an `if:` regardless of a need's result -- so the
+  //     (always()/failure()/cancelled(), OR a construct built on success() such
+  //     as `!success() || needs.provenance.result == 'success'`) RUNS EVEN WHEN
+  //     provenance FAILED -- GitHub evaluates such an `if:` regardless of a need's
+  //     result, and `!success()` is true precisely when a need failed -- so the
   //     DB touch would execute after the URL-provenance pre-flight went RED, the
   //     exact prod-PII event the whole job exists to block. §4b cannot see this:
   //     it reads only needs:. This pins the second channel for BOTH dump
-  //     (mysqldump) and migrate (run.php): their `if:` must positively gate on
-  //     `needs.provenance.result == 'success'` AND must carry no status-override
-  //     function. Mutation proof: rewriting either job's `if:` to
-  //     `${{ always() }}` makes BOTH assertions below DIE.
+  //     (mysqldump) and migrate (run.php): their `if:` must positively gate on the
+  //     `needs.provenance.result == 'success'` COMPARISON AND must carry no
+  //     status-function CALL at all (all four: always/failure/cancelled/success).
+  //     Mutation proof: rewriting either job's `if:` to `${{ always() }}` -- or to
+  //     `${{ !success() || needs.provenance.result == 'success' }}` -- makes an
+  //     assertion below DIE.
   // ==========================================================================
 
   public function testEveryDbTouchingJobIfChannelGatesOnProvenanceSuccess(): void {
@@ -454,19 +458,30 @@ final class WorkflowStructureTest extends TestCase {
     foreach (['dump', 'migrate'] as $dbJob) {
       $if = $jobs[$dbJob]['if'] ?? null;
       $this->assertIsString($if, "job '$dbJob' must carry an if: expression (see the sibling test).");
-      // The negative half: BAN the three status-check functions that evaluate
-      // true despite a FAILED need. success() is the safe default and is NOT
-      // banned; always()/failure()/cancelled() each run the job past a red
-      // provenance. Case-insensitive because GitHub treats these names
-      // case-insensitively. The `'success'` string literal in the real if: does
-      // NOT match -- the pattern requires a `(` after the bare word, so only a
-      // function CALL trips it.
+      // The negative half: BAN every GitHub status-check FUNCTION CALL. The four
+      // status functions are always(), failure(), cancelled() and success() --
+      // each can be composed into an expression that evaluates true past a FAILED
+      // need. always()/failure()/cancelled() are override functions outright;
+      // success() is banned too because its negation is the override -- e.g.
+      // `${{ !success() || needs.provenance.result == 'success' }}` runs the job
+      // AFTER a failed dependency (`!success()` is true precisely when a need
+      // failed), sneaking past a red provenance while still carrying the required
+      // clause verbatim. The positive gate uses the COMPARISON
+      // `needs.provenance.result == 'success'`, never a function, so there is no
+      // legitimate use of a status-function call here. Case-insensitive because
+      // GitHub treats these names case-insensitively. The `'success'` string
+      // literal in the required clause does NOT match -- the pattern requires a `(`
+      // after the bare word, so only a function CALL trips it, never the
+      // `result == 'success'` comparison.
       $this->assertDoesNotMatchRegularExpression(
-        '/\b(?:always|failure|cancelled)\s*\(/i',
+        '/\b(?:always|failure|cancelled|success)\s*\(/i',
         $if,
-        "job '$dbJob' if: must not use a status-override function (always(), failure(), cancelled()) -- each ".
-        "evaluates true even when a need (provenance) FAILED, which would run the staging-DB touch past a red ".
-        "URL-provenance pre-flight. Rewriting the if: to \${{ always() }} must make this test DIE."
+        "job '$dbJob' if: must not use a status-override function call (always(), failure(), cancelled(), ".
+        "success()) -- each can evaluate true even when a need (provenance) FAILED (success() via its negation ".
+        "!success()), which would run the staging-DB touch past a red URL-provenance pre-flight. Rewriting the ".
+        "if: to \${{ always() }} -- or to \${{ !success() || needs.provenance.result == 'success' }} -- must ".
+        "make this test DIE. The required `needs.provenance.result == 'success'` comparison does NOT trip this ".
+        "(it is a string literal, not a function call)."
       );
     }
   }
