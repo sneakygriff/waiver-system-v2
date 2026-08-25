@@ -653,20 +653,28 @@ final class WorkflowStructureTest extends TestCase {
       }
     }
     sort($railwayIdKeys);
-    // The pinned STAGING TRIPLE (M5.6 extended the M4 pair): the environment id,
-    // the WAIVER APP service id, and the STAGING MySQL service id the migrate
-    // job's URL-provenance pre-flight reads. All three are STAGING names -- no
-    // additional Railway id (renamed, duplicated, or PROD) may be declared
+    // The pinned STAGING QUAD (the provenance-400 fix extended the M5.6 triple,
+    // which extended the M4 pair): the PROJECT id, the environment id, the
+    // WAIVER APP service id, and the STAGING MySQL service id. The project id
+    // joined because Railway's variables(...) read REQUIRES projectId -- a bare
+    // HTTP 400 without it (live-confirmed 2026-08-26) -- so the provenance
+    // pre-flight cannot run on the triple alone. All four are STAGING names --
+    // no additional Railway id (renamed, duplicated, or PROD) may be declared
     // anywhere in the .github/workflows/ tree. The invariant's substance is
     // unchanged from M4 ("exactly these, and no PROD id"); only the allowed set
-    // grew by the MySQL service id. Sorted alphabetically:
-    // ENVIRONMENT_ID < MYSQL_SERVICE_ID < SERVICE_ID.
+    // grew. Sorted alphabetically:
+    // ENVIRONMENT_ID < MYSQL_SERVICE_ID < PROJECT_ID < SERVICE_ID.
     $this->assertSame(
-      ['RAILWAY_STAGING_ENVIRONMENT_ID', 'RAILWAY_STAGING_MYSQL_SERVICE_ID', 'RAILWAY_STAGING_SERVICE_ID'],
+      [
+        'RAILWAY_STAGING_ENVIRONMENT_ID',
+        'RAILWAY_STAGING_MYSQL_SERVICE_ID',
+        'RAILWAY_STAGING_PROJECT_ID',
+        'RAILWAY_STAGING_SERVICE_ID',
+      ],
       $railwayIdKeys,
-      'exactly THREE Railway id env keys must exist anywhere in the .github/workflows/ tree, and they must be '.
-      'these STAGING names (environment id, waiver-app service id, staging MySQL service id) -- no additional '.
-      'Railway id (renamed, duplicated, or prod) may be declared anywhere.'
+      'exactly FOUR Railway id env keys must exist anywhere in the .github/workflows/ tree, and they must be '.
+      'these STAGING names (project id, environment id, waiver-app service id, staging MySQL service id) -- no '.
+      'additional Railway id (renamed, duplicated, or prod) may be declared anywhere.'
     );
   }
 
@@ -713,10 +721,12 @@ final class WorkflowStructureTest extends TestCase {
     // `run:` block must make this test die.
     $allowlist = [];
     foreach (self::allEnvPairsAcrossWorkflowsTree() as [$key, $value]) {
-      // The allowlist is the STAGING TRIPLE's own values (M5.6 added the MySQL
-      // service id) -- derived, never hardcoded, so the test needs no edit on the
-      // day those env values are filled in at provisioning.
-      $isStagingIdKey = $key === 'RAILWAY_STAGING_ENVIRONMENT_ID'
+      // The allowlist is the STAGING QUAD's own values (M5.6 added the MySQL
+      // service id; the provenance-400 fix added the project id) -- derived,
+      // never hardcoded, so the test needs no edit on the day those env values
+      // are filled in at provisioning.
+      $isStagingIdKey = $key === 'RAILWAY_STAGING_PROJECT_ID'
+        || $key === 'RAILWAY_STAGING_ENVIRONMENT_ID'
         || $key === 'RAILWAY_STAGING_SERVICE_ID'
         || $key === 'RAILWAY_STAGING_MYSQL_SERVICE_ID';
       if ($isStagingIdKey && is_string($value) && preg_match(self::UUID_LITERAL_RE, $value)) {

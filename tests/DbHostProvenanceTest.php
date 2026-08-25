@@ -521,4 +521,59 @@ final class DbHostProvenanceTest extends TestCase
         // The script's own error phrasing withholds values.
         $this->assertStringContainsString('withheld', $source, 'the CLI must use value-withheld error phrasing.');
     }
+
+    // ── Query-shape pin: variables(...) REQUIRES projectId ─────────────────────
+
+    public function testRailwayVariablesQueryCarriesProjectIdEnvironmentIdAndServiceId(): void
+    {
+        // REGRESSION PIN for the provenance-400 outage (live-confirmed
+        // 2026-08-26): Railway's variables(...) read REQUIRES projectId — the
+        // API rejects the request with a bare HTTP 400 (before the GraphQL
+        // error layer, so no error CODE ever surfaced) when it is omitted. The
+        // original query shipped without it and the pre-flight failed closed on
+        // every run. No test pinned the query shape, which is exactly how the
+        // omission survived to the first live run. This pin makes removing any
+        // of the three variables — or their non-null (String!) declarations —
+        // DIE here instead of as an opaque 400 in CI.
+        $query = DbHostProvenance::RAILWAY_SERVICE_VARIABLES_QUERY;
+        foreach (['projectId', 'environmentId', 'serviceId'] as $var) {
+            $this->assertStringContainsString(
+                '$' . $var . ': String!',
+                $query,
+                "the variables(...) query must DECLARE \${$var} as a required (String!) operation variable."
+            );
+            $this->assertStringContainsString(
+                $var . ': $' . $var,
+                $query,
+                "the variables(...) query must PASS {$var} to the variables(...) field — Railway 400s without it."
+            );
+        }
+    }
+
+    public function testPreflightCliSendsProjectIdInTheRailwayRequestVariables(): void
+    {
+        // Wiring pin (defence against a declared-but-unfed variable): the CLI
+        // shell must actually read RAILWAY_STAGING_PROJECT_ID and place
+        // projectId in the request's variables map. A query that declares
+        // $projectId but whose caller never supplies it fails identically to
+        // the original bug (Railway rejects the request), so pin BOTH halves.
+        $source = file_get_contents(__DIR__ . '/../scripts/preflight-db-host.php');
+        $this->assertIsString($source);
+
+        $this->assertStringContainsString(
+            "preflight_env('RAILWAY_STAGING_PROJECT_ID')",
+            $source,
+            'the CLI must read RAILWAY_STAGING_PROJECT_ID from the environment.'
+        );
+        $this->assertStringContainsString(
+            "'projectId' => \$projectId",
+            $source,
+            'the CLI must place projectId in the Railway request variables map — Railway 400s without it.'
+        );
+        $this->assertStringContainsString(
+            'RAILWAY_STAGING_PROJECT_ID(workflow env constant)',
+            $source,
+            'a missing RAILWAY_STAGING_PROJECT_ID must be named in the fail-closed missing-inputs message.'
+        );
+    }
 }
