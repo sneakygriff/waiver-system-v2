@@ -141,9 +141,9 @@ env:
   # refuse to start while any they need is blank. The MYSQL id's VALUE is filled
   # in the same §5 arming commit as the pair (M5 operator runbook) — its absence
   # is a first-step fail-fast, never a silent skip.
-  RAILWAY_STAGING_ENVIRONMENT_ID: ""
-  RAILWAY_STAGING_SERVICE_ID: ""
-  RAILWAY_STAGING_MYSQL_SERVICE_ID: ""
+  RAILWAY_STAGING_ENVIRONMENT_ID: "0822d017-f803-4c30-91e1-f8af8a5be73a"
+  RAILWAY_STAGING_SERVICE_ID: "fbd34460-41ea-48da-a220-cff76a34b065"
+  RAILWAY_STAGING_MYSQL_SERVICE_ID: "1e98170b-0346-42b4-9db1-4ad61e4b7ffd"
   RAILWAY_API_URL: https://backboard.railway.app/graphql/v2
 
   # ── The health gate (AC4.3) ───────────────────────────────────────────────
