@@ -141,6 +141,10 @@ env:
   # M5 operator runbook §3.4). While any id a job needs is blank, the
   # provenance/migrate/deploy jobs refuse to start — a first-step fail-fast,
   # never a silent skip.
+  # The staging project id — required by the provenance job's variables(...)
+  # read (confirmed-live 2026-08-26: that Railway query needs projectId; the
+  # serviceInstance reads elsewhere do not). Non-secret identifier, staging only.
+  RAILWAY_STAGING_PROJECT_ID: "7add388a-82d2-49b1-a63f-27134cc1eba2"
   RAILWAY_STAGING_ENVIRONMENT_ID: "0822d017-f803-4c30-91e1-f8af8a5be73a"
   RAILWAY_STAGING_SERVICE_ID: "fbd34460-41ea-48da-a220-cff76a34b065"
   RAILWAY_STAGING_MYSQL_SERVICE_ID: "1e98170b-0346-42b4-9db1-4ad61e4b7ffd"
@@ -701,6 +705,7 @@ jobs:
           missing=""
           [ -n "${STAGING_WAIVER_DB_URL:-}" ] || missing="${missing} STAGING_WAIVER_DB_URL"
           [ -n "${RAILWAY_TOKEN:-}" ] || missing="${missing} RAILWAY_STAGING_TOKEN"
+          [ -n "${RAILWAY_STAGING_PROJECT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_PROJECT_ID(workflow env constant)"
           [ -n "${RAILWAY_STAGING_ENVIRONMENT_ID:-}" ] || missing="${missing} RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)"
           [ -n "${RAILWAY_STAGING_MYSQL_SERVICE_ID:-}" ] || missing="${missing} RAILWAY_STAGING_MYSQL_SERVICE_ID(workflow env constant)"
           if [ -n "$missing" ]; then

@@ -88,6 +88,7 @@ function preflight_env(string $name): ?string
 $dbUrl          = preflight_env('STAGING_WAIVER_DB_URL');
 $railwayToken   = preflight_env('RAILWAY_TOKEN');
 $railwayApiUrl  = preflight_env('RAILWAY_API_URL');
+$projectId      = preflight_env('RAILWAY_STAGING_PROJECT_ID');
 $environmentId  = preflight_env('RAILWAY_STAGING_ENVIRONMENT_ID');
 $mysqlServiceId = preflight_env('RAILWAY_STAGING_MYSQL_SERVICE_ID');
 
@@ -100,6 +101,9 @@ if ($railwayToken === null) {
 }
 if ($railwayApiUrl === null) {
     $missing[] = 'RAILWAY_API_URL(workflow env constant)';
+}
+if ($projectId === null) {
+    $missing[] = 'RAILWAY_STAGING_PROJECT_ID(workflow env constant)';
 }
 if ($environmentId === null) {
     $missing[] = 'RAILWAY_STAGING_ENVIRONMENT_ID(workflow env constant)';
@@ -154,7 +158,7 @@ $urlAuthority = DbHostProvenance::parseAuthorityFromUrl($dbUrl);
 // table entirely (strictly less exposure than a curl command line).
 $payload = json_encode([
     'query'     => DbHostProvenance::RAILWAY_SERVICE_VARIABLES_QUERY,
-    'variables' => ['environmentId' => $environmentId, 'serviceId' => $mysqlServiceId],
+    'variables' => ['projectId' => $projectId, 'environmentId' => $environmentId, 'serviceId' => $mysqlServiceId],
 ], JSON_UNESCAPED_SLASHES);
 if ($payload === false) {
     preflight_fail('Could not encode the Railway request (internal) — refusing to access the staging DB.');

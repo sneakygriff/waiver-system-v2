@@ -84,21 +84,22 @@ namespace App\Preflight;
 final class DbHostProvenance
 {
     /**
-     * UNVERIFIED-LIVE (M5.9 first-run confirmation owed): the Railway GraphQL
-     * shape that reads one service instance's variable map as a JSON SCALAR (no
-     * sub-selection). The fork holds a Railway PROJECT token (staging-scoped),
-     * which — like the migrate job's already-live-verified
-     * `serviceInstance(environmentId, serviceId)` baseline read — is implicitly
-     * scoped to one project, so this shape passes `environmentId` + `serviceId`
-     * WITHOUT a `projectId` (the fork deliberately holds no project id). If the
-     * live field name, its argument set, or its scalar-vs-selection shape differs,
-     * this query fails GraphQL validation LOUDLY → an `errors` array →
-     * `parseRailwayVariables` returns `null` → the verdict fails closed. A wrong
-     * shape can therefore only ever produce a re-runnable red, never a silent
-     * pass. M5.9 pins the confirmed shape, exactly as M3's §6e residuals did.
+     * CONFIRMED-LIVE 2026-08-26 (was UNVERIFIED-LIVE): the Railway GraphQL shape
+     * that reads one service instance's variable map as a JSON SCALAR (no
+     * sub-selection). Live probing against backboard.railway.app/graphql/v2 with
+     * the staging PROJECT token proved `variables(...)` REQUIRES `projectId`:
+     * omitting it returns a bare HTTP 400 (request rejected before the GraphQL
+     * error layer), while `variables(projectId, environmentId, serviceId)`
+     * returns the service's variable map. (This differs from the
+     * `serviceInstance(environmentId, serviceId)` baseline read the migrate/
+     * discover jobs use, which needs no projectId.) `projectId` is supplied from
+     * the RAILWAY_STAGING_PROJECT_ID workflow env constant. A wrong shape still
+     * fails GraphQL validation LOUDLY → an `errors` array → `parseRailwayVariables`
+     * returns `null` → the verdict fails closed (re-runnable red, never a silent
+     * pass).
      */
     public const RAILWAY_SERVICE_VARIABLES_QUERY =
-        'query ($environmentId: String!, $serviceId: String!) { variables(environmentId: $environmentId, serviceId: $serviceId) }';
+        'query ($projectId: String!, $environmentId: String!, $serviceId: String!) { variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) }';
 
     /**
      * mysql-family DSN schemes — the fork's OWN URL contract (`migrations/run.php`
