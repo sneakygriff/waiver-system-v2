@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS waiver_responses (
   hash_sha256 CHAR(64) NOT NULL,
   pdf_path VARCHAR(512) NULL,
   signature_path VARCHAR(512) NULL,
+  -- [T5] baked in from 005_evidence_fields.sql, same convention 002/003's
+  -- ALTERs already follow here -- a fresh install never needs to run 005 for
+  -- real; an EXISTING (pre-005) database still applies it via migrations/run.php.
+  evidence_sha256 CHAR(64) NULL,
+  evidence_object_key VARCHAR(512) NULL,
+  evidence_blob_key VARCHAR(512) NULL,
+  evidence_blob_url TEXT NULL,
   created_at DATETIME NOT NULL,
   INDEX (signed_at),
   INDEX (waiver_instance_id)

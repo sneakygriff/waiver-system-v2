@@ -873,6 +873,69 @@ final class MigrationRunnerTest extends TestCase
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 19. [T5 / waiver-coverage step 5] The REAL committed 005_evidence_fields.sql
+    //     applies cleanly via the ledger runner, on top of a baselined 001..004
+    //     -- unlike every test above, this points --dir= at the repo's actual
+    //     migrations/ directory rather than a tests/fixtures/migrations-*
+    //     copy, so it proves the committed file itself (not a stand-in) is
+    //     valid SQL the runner can apply end to end.
+    // -----------------------------------------------------------------------
+
+    public function testReal005EvidenceFieldsMigrationAppliesCleanlyOnAnExistingPreO05Database(): void
+    {
+        // Simulates the REAL ops target T5 describes: staging/prod already
+        // has 001-004 applied (the OLD, pre-005 waiver_responses shape --
+        // built before 001_init.sql was updated to bake 005's columns in for
+        // FRESH installs, per that file's own "[T5] baked in from
+        // 005_evidence_fields.sql" comment). A scratch schema bootstrapped by
+        // actually EXECUTING the current 001_init.sql would already carry
+        // 005's columns and make the real 005 file duplicate-column instead
+        // of proving anything -- so this builds the OLD (pre-005)
+        // waiver_responses shape by hand and baselines 001..004 (ledger-only,
+        // no DDL executed -- mirrors createLegacyLedger()/testBaselineMarks...
+        // above), leaving 005 as the one genuinely PENDING file.
+        $this->createLegacyWaiverResponsesTableMissingEvidenceColumns();
+
+        $realMigrationsDir = \dirname(__DIR__) . '/migrations';
+        $this->assertFileExists($realMigrationsDir . '/005_evidence_fields.sql', 'this test must exercise the real, committed T5 migration file');
+
+        $baseline = $this->migrate(['--dir=' . $realMigrationsDir, '--baseline', '--through=004']);
+        $this->assertExit(0, $baseline, 'baselining the real 001..004 against a schema shaped like an existing pre-005 database');
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill'],
+            $this->appliedVersions()
+        );
+        foreach (['evidence_sha256', 'evidence_object_key', 'evidence_blob_key', 'evidence_blob_url'] as $col) {
+            $this->assertFalse($this->columnExists('waiver_responses', $col), "sanity: $col must NOT exist yet -- baselining executes no DDL");
+        }
+
+        $r = $this->migrate(['--dir=' . $realMigrationsDir]);
+        $this->assertExit(0, $r, 'the real 005_evidence_fields.sql must apply cleanly on top of a baselined 001..004');
+        $this->assertStringContainsString('005_evidence_fields: APPLIED (1 statement(s))', $r['out']);
+        $this->assertStringContainsString('summary: files_applied=1 statements_executed=1 already_applied=4', $r['out']);
+
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill', '005_evidence_fields'],
+            $this->appliedVersions()
+        );
+        foreach (['evidence_sha256', 'evidence_object_key', 'evidence_blob_key', 'evidence_blob_url'] as $col) {
+            $this->assertTrue($this->columnExists('waiver_responses', $col), "005 must add $col to waiver_responses");
+        }
+        // The pre-existing columns 005 places its ADD COLUMNs AFTER must
+        // survive untouched -- 005 only ever adds, never modifies/drops.
+        $this->assertTrue($this->columnExists('waiver_responses', 'signature_path'));
+        $this->assertTrue($this->columnExists('waiver_responses', 'hash_sha256'));
+
+        // Idempotent re-run over the now-fully-applied real chain: a no-op,
+        // not an error -- same "already applied" contract as every fixture
+        // test above, now proven against the real file.
+        $second = $this->migrate(['--dir=' . $realMigrationsDir]);
+        $this->assertExit(0, $second, 're-running the real migrations dir once fully applied must be a no-op');
+        $this->assertStringContainsString('005_evidence_fields: already applied', $second['out']);
+        $this->assertStringContainsString('summary: files_applied=0 statements_executed=0 already_applied=5', $second['out']);
+    }
+
     // =======================================================================
     // Helpers
     // =======================================================================
@@ -995,6 +1058,38 @@ final class MigrationRunnerTest extends TestCase
                applied_at DATETIME NOT NULL
              ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
         );
+    }
+
+    /**
+     * [T5] `waiver_responses` exactly as 001_init.sql shaped it BEFORE the T5
+     * bake-in (i.e. the real shape of an existing staging/prod database that
+     * has 001-004 applied but not yet 005) -- ending at `signature_path` /
+     * `created_at`, none of 005's four evidence columns present. Used only by
+     * testReal005EvidenceFieldsMigrationAppliesCleanlyOnAnExistingPreO05Database
+     * so the real 005_evidence_fields.sql has a genuine pre-005 target to
+     * ALTER, rather than a schema that already has the columns (which would
+     * make 005 duplicate-column instead of proving anything).
+     */
+    private function createLegacyWaiverResponsesTableMissingEvidenceColumns(): void
+    {
+        $ddl = 'CREATE TABLE waiver_responses ('
+            . 'id BIGINT PRIMARY KEY AUTO_INCREMENT, '
+            . 'waiver_instance_id BIGINT NOT NULL UNIQUE, '
+            . 'answers_json JSON NOT NULL, '
+            . 'signature_png LONGBLOB NULL, '
+            . 'signer_full_name VARCHAR(255) NULL, '
+            . 'signer_initials VARCHAR(16) NULL, '
+            . 'signed_at DATETIME NOT NULL, '
+            . 'signer_ip VARCHAR(45) NULL, '
+            . 'signer_user_agent TEXT NULL, '
+            . 'hash_sha256 CHAR(64) NOT NULL, '
+            . 'pdf_path VARCHAR(512) NULL, '
+            . 'signature_path VARCHAR(512) NULL, '
+            . 'created_at DATETIME NOT NULL, '
+            . 'INDEX (signed_at), '
+            . 'INDEX (waiver_instance_id)'
+            . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
+        $this->db->prepare($ddl)->execute();
     }
 
     /** @return list<string> */

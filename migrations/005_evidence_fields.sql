@@ -1,0 +1,65 @@
+-- 005_evidence_fields.sql
+-- [T5 / waiver-coverage step 5] Persist the evidence-relay identifiers that
+-- WaiverController::uploadEvidence() already computes/receives from
+-- BookingV2's /api/waiver/evidence relay but previously DROPPED on the floor
+-- (never written to waiver_responses, never returned by get_status). Without
+-- these columns get_status() has nothing to return for evidence, so
+-- BookingV2's reconcile path (waiver-reconcile.ts's toCompletionFields, which
+-- ALREADY maps evidence_sha256/evidence_object_key/evidence_blob_key/
+-- evidence_blob_url) receives nothing to map -- this was the fork-only half
+-- of the go-live evidence gap (docs/designs/waiver-coverage.md, step 5, on
+-- the BookingV2 side; T5 brief's "KEY DISCOVERY").
+--
+-- Column meanings (deliberately named identically to BookingV2's
+-- prisma/schema.prisma WaiverCompletionEvent model, so reconcile's field
+-- mapping is a straight passthrough -- see toCompletionFields):
+--   evidence_sha256     SHA-256 of the exact PDF bytes uploaded (Gap2).
+--   evidence_object_key the Vercel Blob key for the stored PDF -- the
+--                       evidence relay's top-level `blob_key` in its JSON
+--                       response. This is the SAME identifier the real-time
+--                       completion webhook already carries today under this
+--                       exact field name (notifyBookingV2Completion's
+--                       `evidence_object_key`) -- unchanged by this migration.
+--   evidence_blob_key   the Blob pathname the relay stored the PDF bytes
+--                       under (BookingV2's BK-T15a naming) -- the SAME value
+--                       as evidence_object_key. Kept as its own column
+--                       because BookingV2's ledger (WaiverCompletionEvent)
+--                       has a separate column of this name that reconcile
+--                       maps independently; duplicating rather than aliasing
+--                       avoids inventing a second, possibly-diverging
+--                       identifier where only one exists on the relay side.
+--   evidence_blob_url   the Blob-returned public URL for the PDF -- the
+--                       relay's top-level `blob_url`. Previously computed by
+--                       the relay but never read back by uploadEvidence().
+--
+-- All four are NULLable: a row completed before this migration ships, or
+-- whose relay upload never confirmed (uploadEvidence's `$none`/failure
+-- paths), has no evidence to report -- get_status() must return null for
+-- these, never a fabricated value. Existing rows are backfilled to NULL
+-- implicitly (no UPDATE needed); the one-off repair for fork
+-- waiver_instances 19/21 is a SEPARATE, manual re-push through the (now
+-- origin-verified) evidence route plus BookingV2's guarded
+-- scripts/backfill-waiver-evidence.ts -- not part of this migration.
+--
+-- LEDGER NOTE (departs from 002/003's older hand-apply convention): this
+-- file contains ONLY DDL. Do NOT add a manual
+-- `INSERT INTO schema_migrations (...)` statement here the way 002/003 do --
+-- those predate migrations/run.php (the per-statement ledger runner). The
+-- runner records file completion itself, via recordFileApplied(), once every
+-- statement below has executed successfully; a duplicate manual INSERT here
+-- would collide with that on schema_migrations' `version` primary key and
+-- fail the apply with a duplicate-key error.
+--
+-- FRESH-INSTALL NOTE: these four columns are ALSO baked directly into
+-- 001_init.sql's waiver_responses CREATE TABLE (same convention 002/003
+-- already follow there) -- a fresh install never needs to run this file for
+-- real; applying it to a schema built from the current 001_init.sql will
+-- emit a harmless "Duplicate column name" error, exactly like re-running
+-- 002/003 on a fresh schema (see tests/README.md). This file's real job is
+-- an EXISTING (pre-005) database -- staging/prod -- via migrations/run.php.
+
+ALTER TABLE waiver_responses
+  ADD COLUMN evidence_sha256     CHAR(64)     NULL AFTER signature_path,
+  ADD COLUMN evidence_object_key VARCHAR(512) NULL AFTER evidence_sha256,
+  ADD COLUMN evidence_blob_key   VARCHAR(512) NULL AFTER evidence_object_key,
+  ADD COLUMN evidence_blob_url   TEXT         NULL AFTER evidence_blob_key;

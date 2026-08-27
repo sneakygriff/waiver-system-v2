@@ -66,9 +66,21 @@ class TestDatabase {
     return (int)$pdo->lastInsertId();
   }
 
-  public static function seedResponse(PDO $pdo, int $instanceId, array $answers = ['full_name'=>'Test Guest']): int {
-    $stmt = $pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?,?,?,UTC_TIMESTAMP())');
-    $stmt->execute([$instanceId, json_encode($answers), null, 'Test Guest', '127.0.0.1', 'phpunit', hash('sha256', 'x'), null, null]);
+  /**
+   * @param array{evidence_sha256?:?string,evidence_object_key?:?string,evidence_blob_key?:?string,evidence_blob_url?:?string} $evidence
+   *   [T5] Optional evidence-field overrides (migrations/005_evidence_fields.sql).
+   *   Default omits them entirely -> all four NULL, i.e. the "legacy row"
+   *   shape get_status() must still return nulls for.
+   */
+  public static function seedResponse(PDO $pdo, int $instanceId, array $answers = ['full_name'=>'Test Guest'], array $evidence = []): int {
+    $stmt = $pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, evidence_sha256, evidence_object_key, evidence_blob_key, evidence_blob_url, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?,?,?,?,?,?,?,UTC_TIMESTAMP())');
+    $stmt->execute([
+      $instanceId, json_encode($answers), null, 'Test Guest', '127.0.0.1', 'phpunit', hash('sha256', 'x'), null, null,
+      $evidence['evidence_sha256'] ?? null,
+      $evidence['evidence_object_key'] ?? null,
+      $evidence['evidence_blob_key'] ?? null,
+      $evidence['evidence_blob_url'] ?? null,
+    ]);
     return (int)$pdo->lastInsertId();
   }
 
