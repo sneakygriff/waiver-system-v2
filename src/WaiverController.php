@@ -108,6 +108,13 @@ class WaiverController {
   //   verbatim in answers_json (only the derived _computed_age is), so it is
   //   always null here -- fine, since BookingV2's ingestion only consumes
   //   computed_age/parental_consent_name for the age-gate re-check.
+  // - evidence_sha256/evidence_object_key/evidence_blob_key/evidence_blob_url
+  //   [T5 / migrations/005_evidence_fields.sql]: read straight off the
+  //   waiver_responses row (persisted by submitGuestForm once uploadEvidence()
+  //   confirms -- see there). All four are null for a row completed before
+  //   005 shipped, or whose relay upload never confirmed -- BookingV2's
+  //   toCompletionFields maps `?? undefined` for each, which is the correct,
+  //   already-supported shape (waiver-reconcile.ts is unchanged by T5).
   private function statusRow(array $row): array {
     $answers = [];
     if (isset($row['answers_json']) && $row['answers_json'] !== null) {
@@ -127,7 +134,11 @@ class WaiverController {
       'minor'                  => isset($answers['_minor']) ? (bool)$answers['_minor'] : null,
       'parental_consent_name'  => $answers['_parental_consent_name'] ?? null,
       'waiver_consent_granted' => ($answers[self::CONSENT_ANSWER_KEY] ?? null) === true ? true : null,
-      'evidence_sha256'        => null, // [Gap2] populated once T15 object-store upload lands.
+      // [T5] real value now (was hardcoded null pre-005) -- see doc above.
+      'evidence_sha256'        => isset($row['evidence_sha256']) && $row['evidence_sha256'] !== null ? (string)$row['evidence_sha256'] : null,
+      'evidence_object_key'    => isset($row['evidence_object_key']) && $row['evidence_object_key'] !== null ? (string)$row['evidence_object_key'] : null,
+      'evidence_blob_key'      => isset($row['evidence_blob_key']) && $row['evidence_blob_key'] !== null ? (string)$row['evidence_blob_key'] : null,
+      'evidence_blob_url'      => isset($row['evidence_blob_url']) && $row['evidence_blob_url'] !== null ? (string)$row['evidence_blob_url'] : null,
       'answers_hash'           => isset($row['hash_sha256']) && $row['hash_sha256'] !== null ? (string)$row['hash_sha256'] : null,
       'signer_full_name'       => $row['signer_full_name'] ?? null,
       // [waiver-program D14/T5] mirrors the completion webhook's form_version
@@ -143,7 +154,10 @@ class WaiverController {
   // "converge on identical semantics", so a webhook that's lost and later
   // picked up by reconciliation must not silently fall back to "assume
   // current version" when the fork actually knows better.
-  private const STATUS_SELECT = 'SELECT wi.id, wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wi.booking_group_id, wtv.version as form_version, wr.hash_sha256, wr.answers_json, wr.signer_full_name
+  // [T5] wr.evidence_sha256/evidence_object_key/evidence_blob_key/
+  // evidence_blob_url added (migrations/005_evidence_fields.sql) so
+  // statusRow() can return them instead of a hardcoded null -- see there.
+  private const STATUS_SELECT = 'SELECT wi.id, wi.link_token, wi.status, wi.completed_at, wi.participant_id, wi.customer_id, wi.booking_group_id, wtv.version as form_version, wr.hash_sha256, wr.answers_json, wr.signer_full_name, wr.evidence_sha256, wr.evidence_object_key, wr.evidence_blob_key, wr.evidence_blob_url
      FROM waiver_instances wi
      JOIN waiver_template_versions wtv ON wi.template_version_id = wtv.id
      LEFT JOIN waiver_responses wr ON wr.waiver_instance_id = wi.id';
@@ -510,8 +524,14 @@ class WaiverController {
       // the erase reports success. A stale path after manual backfill/removal
       // is harmless: erase's unlink is is_file()-guarded.
       $retained = $evidence['evidence_object_key'] === null;
-      $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, UTC_TIMESTAMP())');
-      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $retained ? $artifact : null, $retained ? $sigFile : null]);
+      // [T5 / migrations/005_evidence_fields.sql] Persist the evidence
+      // identifiers uploadEvidence() returned -- previously computed/received
+      // and then dropped (the "KEY DISCOVERY": the fork never persisted
+      // these). Written unconditionally (all four null when the relay never
+      // confirmed, matching $none) so a single INSERT covers both outcomes;
+      // get_status()/statusRow() read them straight back via STATUS_SELECT.
+      $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, evidence_sha256, evidence_object_key, evidence_blob_key, evidence_blob_url, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())');
+      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $retained ? $artifact : null, $retained ? $sigFile : null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $evidence['evidence_blob_key'], $evidence['evidence_blob_url']]);
       $this->audit('response', $instance['id'], 'submitted', $payload);
 
       // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
@@ -649,8 +669,16 @@ class WaiverController {
   // evidence_sha256 is computed over the EXACT bytes placed in the request
   // body (the PDF bytes) -- per spec Gap2 this must be the hash of the
   // object-store bytes as uploaded, not the answers-payload hash.
+  //
+  // [T5 / migrations/005_evidence_fields.sql] Return shape widened from
+  // {evidence_sha256, evidence_object_key} to also carry evidence_blob_key
+  // (same value as evidence_object_key -- see the migration's doc comment
+  // for why both exist) and evidence_blob_url (the relay's top-level
+  // `blob_url`, previously computed by BookingV2 but never read back here).
+  // submitGuestForm persists all four on the waiver_responses row once this
+  // returns a non-null evidence_object_key.
   private function uploadEvidence(array $instance, ?string $artifactPath, ?string $sigFile): array {
-    $none = ['evidence_sha256'=>null, 'evidence_object_key'=>null];
+    $none = ['evidence_sha256'=>null, 'evidence_object_key'=>null, 'evidence_blob_key'=>null, 'evidence_blob_url'=>null];
     try {
       $cb = $this->cfg['callback'] ?? null;
       if (!is_array($cb) || empty($cb['base_url']) || empty($cb['outbound_secret']) || empty($cb['outbound_key_id'])) {
@@ -679,9 +707,7 @@ class WaiverController {
       ];
       $rawBody = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-      $url = !empty($cb['evidence_url'])
-        ? (string)$cb['evidence_url']
-        : rtrim((string)$cb['base_url'], '/').'/api/waiver/evidence';
+      $url = self::evidenceUrlFor($cb);
 
       $result = $this->postSignedEnvelopeWithResponse($url, $rawBody, (string)$cb['outbound_key_id'], (string)$cb['outbound_secret']);
       if (!$result['ok']) {
@@ -689,7 +715,7 @@ class WaiverController {
         // Evidence can be back-filled later (reconciliation/manual re-upload)
         // -- still report the locally-computed hash so the completion
         // webhook at least carries evidence_sha256 even without a blob key.
-        return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>null];
+        return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>null, 'evidence_blob_key'=>null, 'evidence_blob_url'=>null];
       }
 
       $decoded = json_decode((string)$result['body'], true);
@@ -698,10 +724,16 @@ class WaiverController {
         // 2xx but no usable blob_key in the body -- treat as a failed upload
         // for wiring purposes (nothing to reference), but keep the hash.
         $this->audit('instance', (int)$instance['id'], 'evidence_upload_failed', ['reason'=>'missing_blob_key']);
-        return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>null];
+        return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>null, 'evidence_blob_key'=>null, 'evidence_blob_url'=>null];
       }
+      // [T5] the relay's top-level blob_url, alongside blob_key -- see the
+      // route's doc comment ("Response carries BOTH shapes"). A scalar check
+      // mirrors blob_key's own defensive parse; a missing/non-scalar
+      // blob_url is left null rather than failing the whole upload (the key
+      // alone is still a fully usable, durable reference).
+      $blobUrl = (is_array($decoded) && isset($decoded['blob_url']) && is_scalar($decoded['blob_url'])) ? (string)$decoded['blob_url'] : null;
 
-      return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>$blobKey];
+      return ['evidence_sha256'=>$evidenceSha256, 'evidence_object_key'=>$blobKey, 'evidence_blob_key'=>$blobKey, 'evidence_blob_url'=>$blobUrl];
     } catch (\Throwable $e) {
       // Belt-and-suspenders: never let an unexpected error here escape and
       // hit submitGuestForm's catch, which would wrongly revert a real
@@ -711,6 +743,23 @@ class WaiverController {
       } catch (\Throwable $e2) { /* best-effort only */ }
       return $none;
     }
+  }
+
+  // [T5-evidence-verify] Derive the evidence-relay POST URL from the
+  // callback config: an explicit callback.evidence_url wins when set, else
+  // derive "<callback.base_url>/api/waiver/evidence" -- the SAME origin the
+  // completion webhook posts to (notifyBookingV2Completion, below). Pulled
+  // out of uploadEvidence() into its own named, directly-testable unit so
+  // this can be phpunit-PINNED (tests/WaiverControllerEvidenceTest.php): the
+  // T5 plan's "evidence-POST origin verify" line found the evidence POST
+  // ALREADY targets callback.base_url (CALLBACK_BASE_URL) -- this is a
+  // verification + regression pin, not a behavior change. `public` (not
+  // `private`) specifically so the pin can call it directly without
+  // reflection.
+  public static function evidenceUrlFor(array $callbackConfig): string {
+    return !empty($callbackConfig['evidence_url'])
+      ? (string)$callbackConfig['evidence_url']
+      : rtrim((string)($callbackConfig['base_url'] ?? ''), '/').'/api/waiver/evidence';
   }
 
   // [FK-T8] Fire the outbound completion webhook (spec G1b) for a

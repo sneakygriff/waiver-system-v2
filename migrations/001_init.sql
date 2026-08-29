@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS waiver_responses (
   hash_sha256 CHAR(64) NOT NULL,
   pdf_path VARCHAR(512) NULL,
   signature_path VARCHAR(512) NULL,
+  -- [T5] baked in from 005_evidence_fields.sql, same convention 002/003's
+  -- ALTERs already follow here -- a fresh install never needs to run 005 for
+  -- real (005's own guarded ALTERs no-op here since these columns already
+  -- exist -- M5 gate fold F6); an EXISTING (pre-005) database still applies
+  -- it via migrations/run.php. Types MUST stay identical to 005's guarded
+  -- ALTER statements -- object_key/blob_key are TEXT, not VARCHAR(512)
+  -- (M5 gate fold F7 -- see 005_evidence_fields.sql's header for why).
+  evidence_sha256 CHAR(64) NULL,
+  evidence_object_key TEXT NULL,
+  evidence_blob_key TEXT NULL,
+  evidence_blob_url TEXT NULL,
   created_at DATETIME NOT NULL,
   INDEX (signed_at),
   INDEX (waiver_instance_id)

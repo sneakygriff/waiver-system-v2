@@ -873,6 +873,137 @@ final class MigrationRunnerTest extends TestCase
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 19. [T5 / waiver-coverage step 5] The REAL committed 005_evidence_fields.sql
+    //     applies cleanly via the ledger runner, on top of a baselined 001..004
+    //     -- unlike every test above, this points --dir= at the repo's actual
+    //     migrations/ directory rather than a tests/fixtures/migrations-*
+    //     copy, so it proves the committed file itself (not a stand-in) is
+    //     valid SQL the runner can apply end to end.
+    // -----------------------------------------------------------------------
+
+    public function testReal005EvidenceFieldsMigrationAppliesCleanlyOnAnExistingPreO05Database(): void
+    {
+        // Simulates the REAL ops target T5 describes: staging/prod already
+        // has 001-004 applied (the OLD, pre-005 waiver_responses shape --
+        // built before 001_init.sql was updated to bake 005's columns in for
+        // FRESH installs, per that file's own "[T5] baked in from
+        // 005_evidence_fields.sql" comment). A scratch schema bootstrapped by
+        // actually EXECUTING the current 001_init.sql would already carry
+        // 005's columns and make the real 005 file duplicate-column instead
+        // of proving anything -- so this builds the OLD (pre-005)
+        // waiver_responses shape by hand and baselines 001..004 (ledger-only,
+        // no DDL executed -- mirrors createLegacyLedger()/testBaselineMarks...
+        // above), leaving 005 as the one genuinely PENDING file.
+        $this->createLegacyWaiverResponsesTableMissingEvidenceColumns();
+
+        $realMigrationsDir = \dirname(__DIR__) . '/migrations';
+        $this->assertFileExists($realMigrationsDir . '/005_evidence_fields.sql', 'this test must exercise the real, committed T5 migration file');
+
+        $baseline = $this->migrate(['--dir=' . $realMigrationsDir, '--baseline', '--through=004']);
+        $this->assertExit(0, $baseline, 'baselining the real 001..004 against a schema shaped like an existing pre-005 database');
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill'],
+            $this->appliedVersions()
+        );
+        foreach (['evidence_sha256', 'evidence_object_key', 'evidence_blob_key', 'evidence_blob_url'] as $col) {
+            $this->assertFalse($this->columnExists('waiver_responses', $col), "sanity: $col must NOT exist yet -- baselining executes no DDL");
+        }
+
+        $r = $this->migrate(['--dir=' . $realMigrationsDir]);
+        $this->assertExit(0, $r, 'the real 005_evidence_fields.sql must apply cleanly on top of a baselined 001..004');
+        // [M5 gate fold F6] 16 statements now, not 1 -- each of the four
+        // ADD COLUMNs is its own guarded SET/SET/PREPARE/EXECUTE quartet
+        // (INFORMATION_SCHEMA existence check compiled into a dynamic
+        // statement), the portable idempotency mechanism that replaces the
+        // old single four-clause ALTER TABLE. All 16 genuinely execute here
+        // because every column is genuinely absent from this pre-005 fixture.
+        $this->assertStringContainsString('005_evidence_fields: APPLIED (16 statement(s))', $r['out']);
+        $this->assertStringContainsString('summary: files_applied=1 statements_executed=16 already_applied=4', $r['out']);
+
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill', '005_evidence_fields'],
+            $this->appliedVersions()
+        );
+        foreach (['evidence_sha256', 'evidence_object_key', 'evidence_blob_key', 'evidence_blob_url'] as $col) {
+            $this->assertTrue($this->columnExists('waiver_responses', $col), "005 must add $col to waiver_responses");
+        }
+        // [M5 gate fold F7] object_key/blob_key are TEXT, not VARCHAR(512) --
+        // "cannot truncate" per the gate fold; sha256 stays fixed-width.
+        $this->assertSame('char', $this->columnDataType('waiver_responses', 'evidence_sha256'));
+        $this->assertSame('text', $this->columnDataType('waiver_responses', 'evidence_object_key'));
+        $this->assertSame('text', $this->columnDataType('waiver_responses', 'evidence_blob_key'));
+        $this->assertSame('text', $this->columnDataType('waiver_responses', 'evidence_blob_url'));
+        // The pre-existing columns 005 places its ADD COLUMNs AFTER must
+        // survive untouched -- 005 only ever adds, never modifies/drops.
+        $this->assertTrue($this->columnExists('waiver_responses', 'signature_path'));
+        $this->assertTrue($this->columnExists('waiver_responses', 'hash_sha256'));
+
+        // Idempotent re-run over the now-fully-applied real chain: a no-op,
+        // not an error -- same "already applied" contract as every fixture
+        // test above, now proven against the real file.
+        $second = $this->migrate(['--dir=' . $realMigrationsDir]);
+        $this->assertExit(0, $second, 're-running the real migrations dir once fully applied must be a no-op');
+        $this->assertStringContainsString('005_evidence_fields: already applied', $second['out']);
+        $this->assertStringContainsString('summary: files_applied=0 statements_executed=0 already_applied=5', $second['out']);
+    }
+
+    // 20. [M5 gate fold F6] The REAL 005_evidence_fields.sql CONVERGES on a
+    //     FRESH-INSTALL schema too -- i.e. one built from the CURRENT
+    //     001_init.sql, which already bakes the four evidence columns in.
+    //     Reproduces the exact operator footgun code-review P2-6 found: an
+    //     operator baselines a fresh-install database --through=004 (the
+    //     documented recipe for an EXISTING pre-005 database) and then runs
+    //     005 for real -- under the OLD unguarded ALTER this was a hard
+    //     `Duplicate column name` failure (EXIT_MIGRATION_FAILED, file left
+    //     unrecorded, wedged forever without a wider --baseline). The
+    //     INFORMATION_SCHEMA guard makes this a genuine, harmless no-op
+    //     instead: same recipe, same command, converges either way.
+    public function testReal005EvidenceFieldsMigrationNoOpsOnAFreshInstallSchemaThatAlreadyHasTheColumns(): void
+    {
+        $this->createFreshWaiverResponsesTableWithEvidenceColumnsAlreadyPresent();
+
+        $realMigrationsDir = \dirname(__DIR__) . '/migrations';
+
+        // The exact recipe the pre-005-database runbook documents --
+        // --through=004 -- applied here to a schema that is NOT pre-005 (it
+        // is fresh, 005's columns already baked in). This is the mismatch
+        // grok's review flagged: "the same operator recipe is correct on one
+        // class of DB and fatal ... on the other."
+        $baseline = $this->migrate(['--dir=' . $realMigrationsDir, '--baseline', '--through=004']);
+        $this->assertExit(0, $baseline, 'baselining 001..004 against a fresh-install schema');
+        foreach (['evidence_sha256', 'evidence_object_key', 'evidence_blob_key', 'evidence_blob_url'] as $col) {
+            $this->assertTrue($this->columnExists('waiver_responses', $col), 'sanity: the fresh-install fixture already has the evidence columns baked in');
+        }
+
+        $r = $this->migrate(['--dir=' . $realMigrationsDir]);
+        $this->assertExit(0, $r, '005 must converge (not duplicate-column-fail) when every column it would add already exists');
+        // All 16 statements still EXECUTE (each SET/PREPARE/EXECUTE quartet
+        // runs) -- they just each compile to a `SELECT 1` no-op rather than
+        // a real ALTER, because every existence check finds the column
+        // already present. "Executed" and "changed the schema" are not the
+        // same claim; the ledger only tracks the former, honestly.
+        $this->assertStringContainsString('005_evidence_fields: APPLIED (16 statement(s))', $r['out']);
+        $this->assertStringContainsString('summary: files_applied=1 statements_executed=16 already_applied=4', $r['out']);
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill', '005_evidence_fields'],
+            $this->appliedVersions()
+        );
+
+        // Nothing about the columns changed -- still exactly four, still the
+        // widened F7 types, not duplicated, not narrowed.
+        foreach (['evidence_sha256', 'evidence_object_key', 'evidence_blob_key', 'evidence_blob_url'] as $col) {
+            $this->assertTrue($this->columnExists('waiver_responses', $col));
+        }
+        $this->assertSame('text', $this->columnDataType('waiver_responses', 'evidence_object_key'));
+        $this->assertSame('text', $this->columnDataType('waiver_responses', 'evidence_blob_key'));
+
+        // Idempotent re-run, same as the pre-005 case above.
+        $second = $this->migrate(['--dir=' . $realMigrationsDir]);
+        $this->assertExit(0, $second, 're-running once fully applied must be a no-op');
+        $this->assertStringContainsString('005_evidence_fields: already applied', $second['out']);
+    }
+
     // =======================================================================
     // Helpers
     // =======================================================================
@@ -997,6 +1128,73 @@ final class MigrationRunnerTest extends TestCase
         );
     }
 
+    /**
+     * [T5] `waiver_responses` exactly as 001_init.sql shaped it BEFORE the T5
+     * bake-in (i.e. the real shape of an existing staging/prod database that
+     * has 001-004 applied but not yet 005) -- ending at `signature_path` /
+     * `created_at`, none of 005's four evidence columns present. Used only by
+     * testReal005EvidenceFieldsMigrationAppliesCleanlyOnAnExistingPreO05Database
+     * so the real 005_evidence_fields.sql has a genuine pre-005 target to
+     * ALTER, rather than a schema that already has the columns (which would
+     * make 005 duplicate-column instead of proving anything).
+     */
+    private function createLegacyWaiverResponsesTableMissingEvidenceColumns(): void
+    {
+        $ddl = 'CREATE TABLE waiver_responses ('
+            . 'id BIGINT PRIMARY KEY AUTO_INCREMENT, '
+            . 'waiver_instance_id BIGINT NOT NULL UNIQUE, '
+            . 'answers_json JSON NOT NULL, '
+            . 'signature_png LONGBLOB NULL, '
+            . 'signer_full_name VARCHAR(255) NULL, '
+            . 'signer_initials VARCHAR(16) NULL, '
+            . 'signed_at DATETIME NOT NULL, '
+            . 'signer_ip VARCHAR(45) NULL, '
+            . 'signer_user_agent TEXT NULL, '
+            . 'hash_sha256 CHAR(64) NOT NULL, '
+            . 'pdf_path VARCHAR(512) NULL, '
+            . 'signature_path VARCHAR(512) NULL, '
+            . 'created_at DATETIME NOT NULL, '
+            . 'INDEX (signed_at), '
+            . 'INDEX (waiver_instance_id)'
+            . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
+        $this->db->prepare($ddl)->execute();
+    }
+
+    /**
+     * [M5 gate fold F6] `waiver_responses` as a FRESH install shapes it TODAY
+     * -- i.e. exactly what the CURRENT 001_init.sql bakes in, evidence
+     * columns included (same F7-widened types: TEXT for object_key/
+     * blob_key). Used only by
+     * testReal005EvidenceFieldsMigrationNoOpsOnAFreshInstallSchemaThatAlreadyHasTheColumns
+     * to reproduce the fresh-install target where 005's four ADD COLUMNs
+     * must each converge to a no-op rather than duplicate-column-fail.
+     */
+    private function createFreshWaiverResponsesTableWithEvidenceColumnsAlreadyPresent(): void
+    {
+        $ddl = 'CREATE TABLE waiver_responses ('
+            . 'id BIGINT PRIMARY KEY AUTO_INCREMENT, '
+            . 'waiver_instance_id BIGINT NOT NULL UNIQUE, '
+            . 'answers_json JSON NOT NULL, '
+            . 'signature_png LONGBLOB NULL, '
+            . 'signer_full_name VARCHAR(255) NULL, '
+            . 'signer_initials VARCHAR(16) NULL, '
+            . 'signed_at DATETIME NOT NULL, '
+            . 'signer_ip VARCHAR(45) NULL, '
+            . 'signer_user_agent TEXT NULL, '
+            . 'hash_sha256 CHAR(64) NOT NULL, '
+            . 'pdf_path VARCHAR(512) NULL, '
+            . 'signature_path VARCHAR(512) NULL, '
+            . 'evidence_sha256 CHAR(64) NULL, '
+            . 'evidence_object_key TEXT NULL, '
+            . 'evidence_blob_key TEXT NULL, '
+            . 'evidence_blob_url TEXT NULL, '
+            . 'created_at DATETIME NOT NULL, '
+            . 'INDEX (signed_at), '
+            . 'INDEX (waiver_instance_id)'
+            . ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
+        $this->db->prepare($ddl)->execute();
+    }
+
     /** @return list<string> */
     private function tables(): array
     {
@@ -1023,6 +1221,18 @@ final class MigrationRunnerTest extends TestCase
         );
         $st->execute([$this->schema, $table, $column]);
         return (bool)$st->fetchColumn();
+    }
+
+    /** [M5 gate fold F7] Lowercased DATA_TYPE (e.g. 'text', 'char', 'varchar') for a width assertion. */
+    private function columnDataType(string $table, string $column): ?string
+    {
+        $st = $this->db->prepare(
+            'SELECT DATA_TYPE FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?'
+        );
+        $st->execute([$this->schema, $table, $column]);
+        $type = $st->fetchColumn();
+        return $type === false ? null : strtolower((string)$type);
     }
 
     private function indexExists(string $table, string $index): bool
