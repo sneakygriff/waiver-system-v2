@@ -22,6 +22,18 @@ RUN mv "$PHP_INI_DIR/php.ini-production" "$PHP_INI_DIR/php.ini"
 # before nginx even hands off.
 COPY docker/php/uploads.ini "$PHP_INI_DIR/conf.d/uploads.ini"
 
+# [post-incident 2026-08-30] Make PHP errors visible in Railway logs without
+# ever leaking them to a guest: log_errors On + error_log=/dev/stderr, with
+# display_errors hard Off. Loaded from conf.d after php.ini-production so these
+# win. See docker/php/errors.ini for the full rationale.
+COPY docker/php/errors.ini "$PHP_INI_DIR/conf.d/errors.ini"
+
+# [post-incident 2026-08-30] Pin php-fpm's worker-output forwarding
+# (catch_workers_output=yes, decorate_workers_output=no, error_log=/proc/self/fd/2)
+# so the log path survives a base-image bump. These already ship in the base
+# image's php-fpm.d/docker.conf; zz-logging.conf loads last and re-affirms them.
+COPY docker/php/fpm-logging.conf /usr/local/etc/php-fpm.d/zz-logging.conf
+
 # Stream nginx access/error logs to the container's stdout/stderr so Railway (or
 # `docker logs`) captures request/error output. (php-fpm already logs via
 # supervisord.) The base nginx package points these at files under /var/log/nginx.

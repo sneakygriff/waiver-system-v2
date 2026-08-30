@@ -62,3 +62,18 @@
 -- Insert this marker ONLY after actually running the Step 2 DELETE above:
 --
 --   INSERT INTO schema_migrations (version, applied_at) VALUES ('004_erasure_audit_events_backfill', NOW());
+--
+-- ============================================================================
+-- [review-finding #5, 2026-08-30] CAVEAT — the runner's auto-marker is NOT
+-- proof the DELETE ran. Because this file has ZERO executable statements,
+-- migrations/run.php (and therefore dev/predeploy.php) will record
+-- '004_erasure_audit_events_backfill' as "applied (0 statements)" the first
+-- time it processes it -- WITHOUT any operator having run the Step 2 DELETE.
+-- That auto-recorded ledger row therefore means ONLY "the runner processed
+-- this file", NOT "the pre-fix erasure PII was actually purged". Treat the
+-- STEP 2 DELETE as an independent MANUAL operator action whose completion is
+-- audited separately (e.g. by re-running STEP 1's read-only query and
+-- confirming a zero orphan count) -- never inferred from the presence of this
+-- version's schema_migrations row. On a FRESH database there is no pre-fix PII
+-- to purge, so the auto-marker is harmless there; the caveat matters only for
+-- an EXISTING database that predates the erasure fix.
