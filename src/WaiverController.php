@@ -530,9 +530,43 @@ class WaiverController {
       // these). Written unconditionally (all four null when the relay never
       // confirmed, matching $none) so a single INSERT covers both outcomes;
       // get_status()/statusRow() read them straight back via STATUS_SELECT.
-      $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, evidence_sha256, evidence_object_key, evidence_blob_key, evidence_blob_url, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())');
-      $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $retained ? $artifact : null, $retained ? $sigFile : null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $evidence['evidence_blob_key'], $evidence['evidence_blob_url']]);
-      $this->audit('response', $instance['id'], 'submitted', $payload);
+      // [orphan-response-fix 2026-08-30] Persist the completion ATOMICALLY: the
+      // waiver_responses INSERT and its required 'submitted' audit row commit
+      // together or not at all. waiver_responses.waiver_instance_id is UNIQUE
+      // (migrations/001_init.sql), so before this a row that committed here while
+      // a FOLLOWING statement threw (the audit insert -- or anything after the
+      // committed INSERT) survived the catch's status-revert as an ORPHAN. And
+      // because the instance was reset to 'pending', every retry then re-claimed
+      // it and died FOREVER on the duplicate-key INSERT: a permanent per-instance
+      // "could not save" outage, distinct from the migration-drift outage of the
+      // same day. Wrapping the pair in one transaction means a post-INSERT throw
+      // rolls the row back, so the catch below reverts to a genuinely clean
+      // 'pending' the guest can retry into. audit() writes through
+      // Database::pdo() -- the SAME singleton connection as $pdo -- so its insert
+      // genuinely joins this transaction (not a second, autocommitting one).
+      //
+      // SCOPE: ONLY these two fast DML statements are transactional. The early
+      // atomic status-claim above stays committed AHEAD of this on purpose -- it
+      // is the concurrency guard that must fail-fast BEFORE the expensive PDF
+      // render and evidence upload, so a losing double-submit never does that
+      // work; the outer catch's compensating UPDATE is what reverts it. And the
+      // slow network side-effects (uploadEvidence above, notifyBookingV2Completion
+      // below) stay OUTSIDE the transaction, so no DB transaction is ever held
+      // open across HTTP I/O and the completion webhook still fires strictly
+      // AFTER a durable commit.
+      $pdo->beginTransaction();
+      try {
+        $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, evidence_sha256, evidence_object_key, evidence_blob_key, evidence_blob_url, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())');
+        $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $retained ? $artifact : null, $retained ? $sigFile : null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $evidence['evidence_blob_key'], $evidence['evidence_blob_url']]);
+        $this->audit('response', $instance['id'], 'submitted', $payload);
+        $pdo->commit();
+      } catch (\Throwable $txEx) {
+        // Roll the INSERT back (mirrors eraseWaiver's transaction pattern) so no
+        // orphan row survives, then re-throw into the outer catch, which reverts
+        // the instance status to 'pending' and cleans up the local files.
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $txEx;
+      }
 
       // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
       // after the completed-status claim above succeeded AND the
