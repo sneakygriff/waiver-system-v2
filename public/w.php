@@ -19,7 +19,17 @@ $ctl = new WaiverController($cfg, $db);
 $token = $_GET['token'] ?? '';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   $res = $ctl->submitGuestForm($token, $_POST);
-  if (!empty($res['error'])) { $error = $res['error']; }
+  if (!empty($res['error'])) {
+    // [post-incident 2026-08-30 / Finding #10] An INTERNAL persistence failure
+    // (the generic ref-bearing "couldn't save" error) carries http_status=500
+    // so the outage is VISIBLE to uptime monitoring -- it previously returned
+    // HTTP 200, keeping the failure invisible. Set the 5xx BEFORE rendering,
+    // then still render the safe banner+ref below. User VALIDATION errors
+    // (Missing signature, Invalid link, Already completed, age/consent) omit
+    // http_status and keep the default 200.
+    if (!empty($res['http_status'])) { http_response_code((int)$res['http_status']); }
+    $error = $res['error'];
+  }
   else { $ok = true; $artifact = $res['artifact'] ?? null; }
 }
 

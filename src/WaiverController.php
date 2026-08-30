@@ -544,42 +544,74 @@ class WaiverController {
       // reverting the instance.
       $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $hash);
     } catch (\Throwable $e) {
-      // [post-incident 2026-08-30] Make this failure VISIBLE. The 16h outage was
-      // a swallowed DB error (a save against a schema missing migration 005's
-      // columns) that this broad catch turned into a generic HTTP-200 banner
-      // with NOTHING in the logs. Log the exception to stderr (Railway captures
-      // it -- see docker/php/errors.ini + php-fpm catch_workers_output) with a
-      // short correlation ref, FIRST, before the rollback UPDATE below (which
-      // may itself throw if the DB is the thing that's broken). Then hand the
-      // SAME ref to the guest so staff can grep the server log from what the
-      // guest shows them.
-      // NEVER log participant PII: no answers_json, no signature bytes, no
-      // name/DOB/email -- only the exception, the waiver_instance id, and the ref.
-      $ref = bin2hex(random_bytes(4));
-      $sqlState = '';
+      // [post-incident 2026-08-30] Make this failure VISIBLE and traceable
+      // without ever leaking guest PII. The 16h outage was a swallowed DB error
+      // (a save against a schema missing migration 005's columns) that this
+      // broad catch turned into a generic HTTP-200 banner with NOTHING logged.
+      //
+      // NO-THROW ORDER (Finding #9): the guest MUST always get the ref banner
+      // and the log line MUST always be written, even if the rollback UPDATE
+      // below throws (e.g. the DB itself is down). So: (1) mint the ref with a
+      // guarded fallback, (2) error_log FIRST, (3) rollback + file cleanup in
+      // an independent best-effort try/finally, (4) ALWAYS return the
+      // ref-bearing response.
+      //
+      // PII whitelist (Grok #1, supersedes the earlier "raw message for
+      // PDOException"): log ONLY non-PII structured fields -- ref,
+      // waiver_instance id, exception CLASS, SQLSTATE, numeric driver code,
+      // file:line. NEVER $e->getMessage() and NEVER the PDO driver message
+      // (errorInfo[2]): a PDO message embeds the offending VALUE, e.g.
+      // "Duplicate entry 'jane@example.com' for key ..." or bytes of an
+      // over-long full_name in a truncation error = guest PII. No answers_json,
+      // no signature bytes, no name/DOB/email, no stack trace.
+      try {
+        $ref = bin2hex(random_bytes(4));
+      } catch (\Throwable $reEx) {
+        // random_bytes() can throw if the CSPRNG is unavailable; a non-crypto
+        // ref still gives staff a correlation handle (uniqueness best-effort).
+        $ref = substr(str_pad(dechex(mt_rand() ^ (int)(microtime(true) * 1000)), 8, '0', STR_PAD_LEFT), 0, 8);
+      }
+      $sqlstate = '';
+      $driverCode = '';
       if ($e instanceof \PDOException) {
         $info = is_array($e->errorInfo ?? null) ? $e->errorInfo : [];
-        $sqlState = ' sqlstate='.($info[0] ?? (string)$e->getCode())
-          .' driver_code='.($info[1] ?? '')
-          .' driver_msg='.($info[2] ?? '');
+        // errorInfo[0] = SQLSTATE (e.g. '42S22'); errorInfo[1] = numeric driver
+        // code (e.g. 1054). NEITHER carries row values. errorInfo[2] (the driver
+        // message) is deliberately NOT read -- it embeds the offending value.
+        $sqlstate = (string)($info[0] ?? $e->getCode());
+        $driverCode = (string)($info[1] ?? '');
       }
       error_log('[WAIVER-SAVE-ERROR] ref='.$ref
         .' waiver_instance_id='.(int)$instance['id']
         .' exception='.get_class($e)
-        .' code='.$e->getCode()
-        .$sqlState
-        .' at='.$e->getFile().':'.$e->getLine()
-        .' message='.$e->getMessage());
+        .' sqlstate='.$sqlstate
+        .' driver_code='.$driverCode
+        .' at='.$e->getFile().':'.$e->getLine());
       // Roll the claim back so the guest can retry; remove any orphaned files.
-      $pdo->prepare('UPDATE waiver_instances SET status="pending", completed_at=NULL, updated_at=UTC_TIMESTAMP() WHERE id=? AND status="completed"')->execute([$instance['id']]);
-      if(is_file($sigFile)) @unlink($sigFile);
-      if($artifact && is_file($artifact)) @unlink($artifact);
+      // Best-effort and INDEPENDENT: a throw here (DB down) must NOT prevent the
+      // ref response below -- the log line above is already written.
+      try {
+        $pdo->prepare('UPDATE waiver_instances SET status="pending", completed_at=NULL, updated_at=UTC_TIMESTAMP() WHERE id=? AND status="completed"')->execute([$instance['id']]);
+      } catch (\Throwable $rbEx) {
+        // Swallow: the DB may be the very thing that's broken; the failure is
+        // already logged above, and the file cleanup below still runs.
+      } finally {
+        if(is_file($sigFile)) @unlink($sigFile);
+        if($artifact && is_file($artifact)) @unlink($artifact);
+      }
       // ONE generic message for ALL failure causes (never branch on exception
       // type, never leak internals/PII), carrying the correlation ref logged
       // above. The ref is inline in the string so w.php renders it verbatim
       // (public/w.php htmlspecialchars($error)); it is ALSO exposed as its own
-      // payload key for programmatic/test use.
-      return ['error'=>'We couldn\'t save your waiver right now (ref: '.$ref.'). Please try again. If it keeps happening, show this code to a staff member.', 'ref'=>$ref];
+      // payload key for programmatic/test use. 'http_status'=>500 (Finding #10)
+      // marks this as an INTERNAL persistence failure so public/w.php sets a
+      // 5xx (visible to uptime monitoring); user VALIDATION errors -- all
+      // returned BEFORE the try above -- omit http_status and keep the 200.
+      return [
+        'error'=>'We couldn\'t save your waiver right now (ref: '.$ref.'). Please try again. If it keeps happening, show this code to a staff member.',
+        'ref'=>$ref,
+        'http_status'=>500,
+      ];
     }
 
     // [FK-T15 / FK-evidence-keep] Stop long-term local-FS persistence: evidence
