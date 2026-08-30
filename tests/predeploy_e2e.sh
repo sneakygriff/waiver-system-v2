@@ -6,13 +6,18 @@
 #
 # Covers the seven deploy scenarios the predeploy rewrite must satisfy:
 #   (a) fresh empty DB        -> tables + baseline + apply, exit 0, evidence cols
-#   (b) prod-like DB (001..005 ledgered) -> all already-applied, exit 0
-#   (c) legacy DB, partial ledger        -> apply FAILS -> predeploy exit 1 (fail-safe)
+#   (b) PROD-SHAPE CONVERGENCE: existing DB, complete ledger 001..005 -> all
+#       already-applied, exit 0, schema assertion OK (the real prod deploy is a
+#       clean no-op; DISTINCT from the partial-ledger abort in (c))
+#   (c) legacy DB, partial ledger        -> apply FAILS -> predeploy exit 1
+#       (fail-safe) + a self-explanatory likely-cause/remediation hint
 #   (d) new pending 006 on an existing DB-> 006 applied, exit 0
 #   (e) fresh DB with an un-baked 006     -> 006's DDL EXECUTED (not baselined)
 #   (f) missing a required MYSQL* var    -> exit 1, no false success
-#   (g) hollow schema (ledger complete, a 005 column dropped) -> post-migrate
-#       schema assertion FIRES -> predeploy exit 1 (non-vacuity / mutation check)
+#   (g) hollow schema: for EACH of 005's four evidence columns INDEPENDENTLY,
+#       drop just that column (ledger left complete) -> post-migrate schema
+#       assertion FIRES naming that column -> predeploy exit 1. Proves the
+#       assertion covers the FULL 005 contract, non-vacuously, for all four.
 #
 # Usage:   bash tests/predeploy_e2e.sh
 # Env:     PHP_IMG   (default waiver-system-v2-php:latest)   php+pdo_mysql image
@@ -112,10 +117,16 @@ ensure_db; reset_db; run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
 [ "$(q "SELECT GROUP_CONCAT(version ORDER BY version) FROM schema_migrations")" = "001_init,002_waiver_integration,003_erase_waiver,004_erasure_audit_events_backfill,005_evidence_fields" ] && ok "ledger 001..005" || bad "ledger != 001..005"
 echo "$LAST_OUT" | grep -q "schema assertion OK" && ok "post-migrate schema assertion passed (fresh)" || bad "no schema assertion OK (fresh)"
 
-echo; echo "### (b) prod-like DB (001..005 ledgered) ###"
+echo; echo "### (b) PROD-SHAPE CONVERGENCE: existing DB, complete ledger 001..005 ###"
+# This is the REAL prod deploy shape: an existing DB whose schema_migrations
+# ledger already carries 001..005 in full. It MUST converge cleanly -- a pure
+# no-op: apply-mode finds every version already applied (exit 0), and the
+# post-migrate schema assertion confirms all four 005 columns are physically
+# present. This documents that the prod deploy is a no-op, DISTINCT from the
+# partial-ledger abort exercised in scenario (c) below.
 ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
 run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
-[ "$rc" = 0 ] && ok "exit 0" || bad "exit $rc (want 0)"
+[ "$rc" = 0 ] && ok "exit 0 (prod-shape converges cleanly)" || bad "exit $rc (want 0)"
 echo "$LAST_OUT" | grep -q "already applied" && ok "no-op (already applied)" || bad "not a no-op"
 echo "$LAST_OUT" | grep -q "schema assertion OK" && ok "post-migrate schema assertion passed (existing)" || bad "no schema assertion OK (existing)"
 echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && ok "reached DONE" || bad "no DONE"
@@ -126,6 +137,11 @@ run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
 [ "$rc" = 1 ] && ok "exit 1 (fail-safe)" || bad "exit $rc (want 1)"
 echo "$LAST_OUT" | grep -q "\[seed\]" && bad "seed reached (should abort first)" || ok "seed NOT reached"
 echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && bad "reached DONE (should abort)" || ok "no DONE"
+# Codex re-gate P1 #1: the abort must be SELF-EXPLANATORY -- name the likely
+# cause (incomplete ledger) and the SAFE remediation (controlled --baseline,
+# NOT a blind baseline). Assert the augmented hint is present.
+echo "$LAST_OUT" | grep -q "LIKELY CAUSE + SAFE REMEDIATION" && ok "abort names likely-cause + remediation" || bad "no self-explanatory hint"
+echo "$LAST_OUT" | grep -q "Do NOT blindly baseline" && ok "hint warns against a blind baseline" || bad "hint missing the do-not-baseline warning"
 
 echo; echo "### (d) NEW pending 006 on an existing DB ###"
 printf '%s\n' '-- 006_probe.sql (E2E fixture) — genuinely-new, NOT baked into 001_init.' \
@@ -149,22 +165,30 @@ ensure_db; reset_db; run_predeploy -MYSQLPASSWORD; rc=$?; echo "$LAST_OUT" | sed
 echo "$LAST_OUT" | grep -qi MYSQLPASSWORD && ok "names the missing var" || bad "missing var not named"
 echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && bad "reached DONE (false success!)" || ok "no false success"
 
-echo; echo "### (g) HOLLOW schema: ledger complete but a 005 column dropped -> assertion FIRES ###"
+echo; echo "### (g) HOLLOW schema: drop EACH of 005's four columns independently -> assertion FIRES ###"
 # Mutation / non-vacuity check for the post-migrate schema assertion (Grok New
-# #3): a LYING ledger. Build a prod-like DB (001..005 ledgered) then DROP 005's
-# evidence_object_key WITHOUT touching the ledger. Apply-mode is a clean no-op
-# (all versions ledgered) so the runner exits 0 -- ONLY the physical-schema
-# assertion stands between this hollow schema and a re-shipped incident. It must
-# abort with exit 1 before the admin seed / DONE. If the assertion were removed
-# or vacuous, predeploy would exit 0 here and this scenario would FAIL.
-ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
-q "ALTER TABLE waiver_responses DROP COLUMN evidence_object_key" >/dev/null
-[ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_responses' AND COLUMN_NAME='evidence_object_key'")" = 0 ] && ok "005 column physically dropped (ledger left intact)" || bad "could not drop 005 column"
-run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
-[ "$rc" = 1 ] && ok "exit 1 (schema assertion fired)" || bad "exit $rc (want 1) — hollow schema NOT caught!"
-echo "$LAST_OUT" | grep -q "schema assertion FAILED" && ok "names the schema-assertion failure" || bad "assertion failure not named"
-echo "$LAST_OUT" | grep -q "\[seed\]" && bad "seed reached (should abort at assertion)" || ok "seed NOT reached"
-echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && bad "reached DONE (hollow schema shipped!)" || ok "no DONE"
+# #3; Codex re-gate P1 #2): a LYING ledger. For EACH of 005's four evidence
+# columns independently, build a prod-like DB (001..005 ledgered), DROP just
+# that ONE column WITHOUT touching the ledger, and require predeploy to ABORT.
+# Apply-mode is a clean no-op (all versions ledgered) so the runner exits 0 --
+# ONLY the physical-schema assertion stands between this hollow schema and a
+# re-shipped incident. It must abort (exit 1, "schema assertion FAILED" naming
+# THAT column) before the admin seed / DONE, in EVERY sub-case. Dropping any one
+# of the four proves the assertion covers the FULL 005 contract (not just one
+# representative column) and is non-vacuous for each column: if the assertion
+# checked only one column, dropping a DIFFERENT one would exit 0 here and FAIL.
+for COL in evidence_sha256 evidence_object_key evidence_blob_key evidence_blob_url; do
+  echo "  -- sub-case: drop $COL --"
+  ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
+  q "ALTER TABLE waiver_responses DROP COLUMN $COL" >/dev/null
+  [ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_responses' AND COLUMN_NAME='$COL'")" = 0 ] && ok "[$COL] column physically dropped (ledger left intact)" || bad "[$COL] could not drop column"
+  run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
+  [ "$rc" = 1 ] && ok "[$COL] exit 1 (schema assertion fired)" || bad "[$COL] exit $rc (want 1) — hollow schema NOT caught!"
+  echo "$LAST_OUT" | grep -q "schema assertion FAILED" && ok "[$COL] names the schema-assertion failure" || bad "[$COL] assertion failure not named"
+  echo "$LAST_OUT" | grep -q "MISSING.*$COL" && ok "[$COL] abort names THIS missing column" || bad "[$COL] missing column not named in abort"
+  echo "$LAST_OUT" | grep -q "\[seed\]" && bad "[$COL] seed reached (should abort at assertion)" || ok "[$COL] seed NOT reached"
+  echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && bad "[$COL] reached DONE (hollow schema shipped!)" || ok "[$COL] no DONE"
+done
 
 echo; echo "======================================================"
 echo "RESULT: PASS=$PASS FAIL=$FAIL"
