@@ -8,19 +8,27 @@ use PHPUnit\Framework\TestCase;
  * [post-incident 2026-08-30] submitGuestForm()'s broad `catch (\Throwable)` used
  * to swallow a save error into a generic HTTP-200 banner with NOTHING logged --
  * the exact shape of the 16h outage (a save against a schema missing a column).
- * These tests pin the hardening that makes such a failure VISIBLE and traceable:
+ * These tests pin the hardening that makes such a failure VISIBLE and traceable
+ * WITHOUT ever leaking guest PII:
  *
- *   Fix 2a  the catch logs the exception (class/message/code/SQLSTATE/file:line)
- *           + the waiver_instance id + a fresh correlation ref via error_log(),
- *           and NEVER logs participant PII.
- *   Fix 3   the guest banner carries the SAME ref (so staff can grep the server
- *           log from what the guest shows them), one generic message for every
- *           failure cause, with no SQL/internals/PII leaked.
+ *   Fix 2a / Grok #1  the catch logs ONLY non-PII structured fields (ref,
+ *           waiver_instance_id, exception CLASS, SQLSTATE, numeric driver code,
+ *           file:line) via error_log(). It NEVER logs $e->getMessage() OR the
+ *           PDO driver message (errorInfo[2]) -- because a PDO message embeds
+ *           the offending VALUE ("Duplicate entry 'jane@example.com' ...", or
+ *           bytes of an over-long full_name), which is guest PII.
+ *   Fix #9  the handler is no-throw: the ref is minted first, the log line is
+ *           written first, and the rollback/cleanup cannot suppress the response.
+ *   Fix 3 / #10  the guest banner carries the SAME ref, one generic message,
+ *           and the internal-failure payload signals http_status=500.
  *
- * The failure is forced the incident's own way: rename a column the INSERT
- * writes, so the real submitGuestForm() INSERT throws "Unknown column" -> the
- * catch fires for real. The column is always restored (finally), so the schema
- * is left exactly as found for the rest of the suite.
+ * NON-VACUITY (Grok #4): the earlier version of this test induced an
+ * "Unknown column" failure whose driver message contains NO PII, so its no-PII
+ * assertion could not fail even if the code logged getMessage(). This version
+ * forces a DUPLICATE-ENTRY (MySQL 1062) on a canary VALUE, so the suppressed
+ * driver message LITERALLY contains the canary name/email/DOB tokens. If the
+ * handler ever logs getMessage()/errorInfo[2] again, those tokens reappear in
+ * the log and the denylist assertions below DIE -- that is the mutation guard.
  *
  * REQUIRES the `waiver_test` MySQL schema (tests/README.md); skips if it is
  * unreachable, matching this harness's DB-gated convention.
@@ -43,18 +51,30 @@ final class WaiverControllerSubmitFailureLoggingTest extends TestCase {
     $this->versionId = TestDatabase::seedPublishedTemplateVersion($this->pdo);
   }
 
-  public function testSaveFailureIsLoggedWithARefAndBannerCarriesTheSameRefWithoutLeakingPii(): void {
-    $piiName = 'Ada PII-LEAK-CANARY Lovelace';
+  public function testSaveFailureLogsOnlySafeFieldsNeverPiiAndBannerCarriesRefAnd500(): void {
+    // Canary PII, packed into full_name so the induced DUPLICATE-ENTRY driver
+    // message will contain it verbatim (MySQL 1062 echoes the offending value).
+    $canaryEmail    = 'jane.canary-pii@example.test';
+    $canaryDob      = '1988-02-29';
+    $canaryFullName = 'Ada CANARY-LEAK Lovelace '.$canaryEmail.' DOB '.$canaryDob; // < 255 chars
+    $sigBase64Prefix = 'iVBORw0KGgo'; // body prefix of the 1x1 PNG below
+
     $instanceId = TestDatabase::seedInstance($this->pdo, $this->versionId, ['customer_id' => 'cust-save-fail']);
     $token = $this->linkTokenOf($instanceId);
 
-    // Force the real waiver_responses INSERT to fail exactly like the incident:
-    // a column it writes is missing from the schema. Rename preserves the exact
-    // type so the restore in `finally` is lossless.
-    $this->pdo->exec('ALTER TABLE waiver_responses CHANGE evidence_object_key evidence_object_key_tmp TEXT NULL');
+    // Force the real waiver_responses INSERT to collide on a canary VALUE:
+    //   (1) add a temporary UNIQUE index on signer_full_name,
+    //   (2) pre-seed a row whose signer_full_name IS the canary (with an unused
+    //       waiver_instance_id so its own UNIQUE key doesn't collide first),
+    //   (3) submit full_name = the SAME canary -> 1062 Duplicate entry
+    //       '<canary>' for key 'signer_full_name'. Both the index and the seed
+    //       row are removed in `finally` so later tests see a pristine schema.
+    $this->pdo->exec('ALTER TABLE waiver_responses ADD UNIQUE KEY uniq_signer_full_name_canary (signer_full_name)');
+    $seed = $this->pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signed_at, hash_sha256, signer_full_name, created_at) VALUES (?, ?, UTC_TIMESTAMP(), ?, ?, UTC_TIMESTAMP())');
+    $seed->execute([999999, json_encode(['x' => 1]), hash('sha256', 'x'), $canaryFullName]);
 
-    // Redirect error_log() to a temp file so we can read back what Fix 2a wrote
-    // (in production this goes to /dev/stderr -> Railway; see docker/php/errors.ini).
+    // Redirect error_log() to a temp file so we can read back what the handler
+    // wrote (in production this goes to /dev/stderr -> Railway; docker/php/errors.ini).
     $logFile = tempnam(sys_get_temp_dir(), 'waiver_save_err_');
     $prevLog = ini_get('error_log');
     ini_set('error_log', $logFile);
@@ -62,40 +82,57 @@ final class WaiverControllerSubmitFailureLoggingTest extends TestCase {
     try {
       $ctl = new WaiverController($this->cfg, $this->db);
       $result = $ctl->submitGuestForm($token, [
-        'full_name' => $piiName,
+        'full_name' => $canaryFullName,
         'signature_data' => self::onePixelPngDataUri(),
       ]);
     } finally {
       ini_set('error_log', $prevLog === false ? '' : $prevLog);
-      // Restore the schema no matter what, so later tests see it untouched.
-      $this->pdo->exec('ALTER TABLE waiver_responses CHANGE evidence_object_key_tmp evidence_object_key TEXT NULL');
+      $this->pdo->exec('ALTER TABLE waiver_responses DROP KEY uniq_signer_full_name_canary');
+      $this->pdo->exec('DELETE FROM waiver_responses WHERE waiver_instance_id=999999');
     }
 
-    // --- The guest-facing payload (Fix 3) --------------------------------------
+    // --- The guest-facing payload (Fix 3 + #10) --------------------------------
     $this->assertArrayHasKey('error', $result, 'a save failure must return an error banner');
     $this->assertArrayHasKey('ref', $result, 'the error payload must carry a correlation ref');
-    $ref = $result['ref'];
-    $this->assertMatchesRegularExpression('/^[0-9a-f]{8}$/', (string)$ref, 'ref must be 8 hex chars (bin2hex(random_bytes(4)))');
-    // The SAME ref must be visible to the guest, inline in the message.
-    $this->assertStringContainsString((string)$ref, $result['error'], 'the banner must show the correlation ref');
-    // Generic + safe: no SQL internals, no column names, no PII in the banner.
-    $this->assertStringNotContainsStringIgnoringCase('sqlstate', $result['error']);
-    $this->assertStringNotContainsStringIgnoringCase('unknown column', $result['error']);
-    $this->assertStringNotContainsString('evidence_object_key', $result['error']);
-    $this->assertStringNotContainsString('PII-LEAK-CANARY', $result['error']);
+    $ref = (string)$result['ref'];
+    $this->assertMatchesRegularExpression('/^[0-9a-f]{8}$/', $ref, 'ref must be 8 hex chars');
+    $this->assertStringContainsString($ref, $result['error'], 'the banner must show the correlation ref');
+    // #10: an INTERNAL persistence failure must signal HTTP 500 (validation
+    // errors, returned before the try, must NOT set http_status).
+    $this->assertSame(500, $result['http_status'] ?? null, 'internal save failure must signal http_status=500');
+    // Generic + safe banner: no SQL internals, no canary PII.
+    $this->assertStringNotContainsStringIgnoringCase('duplicate entry', $result['error']);
+    $this->assertStringNotContainsString('signer_full_name', $result['error']);
+    $this->assertStringNotContainsString($canaryFullName, $result['error']);
+    $this->assertStringNotContainsString($canaryEmail, $result['error']);
 
-    // --- The server-side log line (Fix 2a) -------------------------------------
+    // --- The server-side log line (Fix 2a / Grok #1) ---------------------------
     $log = (string)file_get_contents($logFile);
     @unlink($logFile);
+
+    // Safe, structured fields ARE present. Asserting them proves this really is
+    // the save-failure path AND that the failure was the duplicate-entry whose
+    // driver message carried the canary -- which is what makes the no-PII
+    // assertions below NON-VACUOUS.
     $this->assertStringContainsString('[WAIVER-SAVE-ERROR]', $log, 'the catch must log a WAIVER-SAVE-ERROR line');
     $this->assertStringContainsString('ref='.$ref, $log, 'the log must carry the same ref the guest was shown');
     $this->assertStringContainsString('waiver_instance_id='.$instanceId, $log, 'the log must identify the waiver instance');
-    // It really was the schema break that fired the catch (proves the log is the
-    // save-failure path, not some incidental notice).
-    $this->assertStringContainsString('PDOException', $log);
-    // CRITICAL: the log must NOT contain participant PII.
-    $this->assertStringNotContainsString('PII-LEAK-CANARY', $log, 'the log must NOT contain the participant name');
-    $this->assertStringNotContainsString($piiName, $log);
+    $this->assertStringContainsString('exception=PDOException', $log, 'the failing class must be recorded');
+    $this->assertStringContainsString('sqlstate=23000', $log, 'SQLSTATE 23000 (integrity constraint violation) proves the dup fired');
+    $this->assertStringContainsString('driver_code=1062', $log, 'driver code 1062 (duplicate entry) proves the dup fired');
+
+    // CRITICAL (Grok #1 + #4): NONE of the canary PII tokens -- all present in
+    // the driver message we deliberately did NOT log -- may appear anywhere in
+    // the log. If the handler regresses to logging getMessage()/errorInfo[2],
+    // one of these fires.
+    foreach ([$canaryFullName, $canaryEmail, $canaryDob, 'CANARY-LEAK', 'Lovelace', $sigBase64Prefix, 'data:image/png'] as $needle) {
+      $this->assertStringNotContainsString($needle, $log, 'PII/secret leaked into the log: '.$needle);
+    }
+    // The whole driver message text, and the old raw-message/driver-message
+    // fields, must be gone.
+    $this->assertStringNotContainsString('Duplicate entry', $log, 'the driver message text must never be logged');
+    $this->assertStringNotContainsString('message=', $log, 'the raw exception-message field must be gone');
+    $this->assertStringNotContainsString('driver_msg=', $log, 'the driver-message field must be gone');
 
     // The catch also rolled the atomic claim back so the guest can retry.
     $st = $this->pdo->prepare('SELECT status FROM waiver_instances WHERE id=?');
