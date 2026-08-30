@@ -20,15 +20,26 @@ $token = $_GET['token'] ?? '';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   $res = $ctl->submitGuestForm($token, $_POST);
   if (!empty($res['error'])) {
-    // [post-incident 2026-08-30 / Finding #10] An INTERNAL persistence failure
-    // (the generic ref-bearing "couldn't save" error) carries http_status=500
-    // so the outage is VISIBLE to uptime monitoring -- it previously returned
-    // HTTP 200, keeping the failure invisible. Set the 5xx BEFORE rendering,
-    // then still render the safe banner+ref below. User VALIDATION errors
-    // (Missing signature, Invalid link, Already completed, age/consent) omit
-    // http_status and keep the default 200.
-    if (!empty($res['http_status'])) { http_response_code((int)$res['http_status']); }
     $error = $res['error'];
+    if (!empty($res['http_status'])) {
+      // [post-incident 2026-08-30 / Finding #10 + #B] An INTERNAL persistence
+      // failure carries an explicit http_status (5xx) so the outage is VISIBLE
+      // to uptime monitoring -- it previously returned HTTP 200, keeping the
+      // failure invisible. Render its ref banner AND that 5xx DIRECTLY here,
+      // then exit. We must NOT fall through to the renderGuestForm() path below:
+      // if the catch's rollback UPDATE failed to revert the instance to
+      // 'pending' (e.g. the DB is the thing that's broken), renderGuestForm()
+      // would return 'Already completed' and w.php:below would call
+      // http_response_code(404) -- DOWNGRADING the 500 and masking the outage
+      // from alerts. User VALIDATION errors (no http_status) still fall through
+      // to re-render the form so the guest can correct and retry, keeping 200.
+      http_response_code((int)$res['http_status']);
+      ?><!doctype html><html><head><meta charset="utf-8"><title>Waiver</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+      <body class="container py-4"><div class="alert alert-danger"><?=htmlspecialchars($error)?></div></body></html><?php
+      exit;
+    }
   }
   else { $ok = true; $artifact = $res['artifact'] ?? null; }
 }

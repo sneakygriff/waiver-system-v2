@@ -596,7 +596,11 @@ class WaiverController {
         // Swallow: the DB may be the very thing that's broken; the failure is
         // already logged above, and the file cleanup below still runs.
       } finally {
-        if(is_file($sigFile)) @unlink($sigFile);
+        // [Grok New #4] Guard $sigFile the same way as $artifact: is_file(null)
+        // is a PHP 8.1 deprecation. $sigFile is assigned before the try so it is
+        // a string here today, but the null-safe guard makes the cleanup robust
+        // to any future reorder and matches the $artifact pattern below.
+        if($sigFile && is_file($sigFile)) @unlink($sigFile);
         if($artifact && is_file($artifact)) @unlink($artifact);
       }
       // ONE generic message for ALL failure causes (never branch on exception

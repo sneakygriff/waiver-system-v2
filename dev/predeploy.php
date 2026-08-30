@@ -21,6 +21,16 @@ require $ROOT.'/vendor/autoload.php';
 // new migration's DDL is folded into 001_init.sql. (Finding #3.)
 const MAX_BAKED_MIGRATION = '005_evidence_fields';
 
+// A representative column that PROVES MAX_BAKED_MIGRATION's DDL physically
+// landed in the schema. BUMP THIS TOGETHER WITH MAX_BAKED_MIGRATION: pick a
+// column introduced by that migration (evidence_object_key is added by
+// 005_evidence_fields.sql). The post-migrate schema assertion below uses it as
+// belt-and-suspenders so a "complete ledger but hollow schema" -- a lying
+// ledger, or a truncated multi-statement 001_init exec -- fails LOUD at deploy
+// time (exit 1) instead of re-shipping the incident. (Finding: Grok New #3.)
+const MAX_BAKED_ASSERT_TABLE  = 'waiver_responses';
+const MAX_BAKED_ASSERT_COLUMN = 'evidence_object_key';
+
 // A core application table whose PRESENCE means "this DB already carries the app
 // schema" -- the FRESH vs EXISTING decision (Finding #2). Created by
 // 001_init.sql and never dropped, so its presence is authoritative REGARDLESS of
@@ -114,6 +124,26 @@ try {
   exit(1);
 }
 
+// --- Finding: DB-name round-trip (Claude #A / Grok New #1), defence-in-depth ---
+// PROVE predeploy is actually operating on the DB it was CONFIGURED with. The
+// DSN pins dbname=, so a connect against a nonexistent db already throws above;
+// this assertion additionally guarantees that predeploy's own target and the
+// canonical URL we hand the runner below (both derived from $name) point at the
+// physically-selected database. If they ever diverge, ABORT rather than migrate
+// the wrong DB.
+try {
+  $activeDb = (string)$pdo->query('SELECT DATABASE()')->fetchColumn();
+} catch (\Throwable $e) {
+  pd_err('[predeploy] FATAL: could not read SELECT DATABASE() ('.get_class($e).'). exit 1');
+  exit(1);
+}
+if ($activeDb !== $name) {
+  pd_err('[predeploy] FATAL: connected database "'.$activeDb.'" != configured MYSQLDATABASE "'.$name
+    .'" -- refusing to migrate the wrong DB. exit 1');
+  exit(1);
+}
+pd_out('[predeploy] connected to database "'.$activeDb.'" (matches MYSQLDATABASE)');
+
 // --- Finding #6 + operator DB-ISOLATION mandate ------------------------------
 // Derive ONE canonical mysql:// URL from the SAME discrete vars we just
 // connected with, hand it to the runner under a DEDICATED env name, and ALWAYS
@@ -129,8 +159,18 @@ try {
 // Built by concatenation (not one credential-shaped literal). user/pass are
 // rawurlencode()d so reserved characters survive parse_url() in run.php, which
 // rawurldecode()s them back.
+//
+// [Finding: DB-name round-trip — Claude #A / Grok New #1] The db NAME is
+// DELIBERATELY passed RAW (NOT rawurlencode()d). run.php's connect() derives the
+// db from `ltrim(parse_url()['path'],'/')` and -- unlike user/pass -- does NOT
+// rawurldecode() the path. So if we encoded a reserved char in the name (e.g.
+// '$' -> '%24'), predeploy would connect to '$' while the runner targeted the
+// literal '%24' -> "unknown database" -> a FALSE-abort of a healthy deploy.
+// Passing $name raw makes predeploy's target and the runner's byte-identical for
+// any legal db name. (Inert for the real prod name "waiver"; correct in general.
+// The SELECT DATABASE() assertion above independently pins predeploy's own end.)
 $predeployUrl = 'mysql://'.rawurlencode($user).':'.rawurlencode($pass)
-  .'@'.$host.':'.$port.'/'.rawurlencode($name).'?charset=utf8mb4';
+  .'@'.$host.':'.$port.'/'.$name.'?charset=utf8mb4';
 putenv('PREDEPLOY_DB_URL='.$predeployUrl);
 // Belt-and-suspenders isolation: force the runner's DEFAULT env name empty in
 // this process, so even a future edit that dropped the --url-env flag could not
@@ -155,13 +195,34 @@ if (!$coreTablePresent) {
   //    in), and it creates schema_migrations + inserts the 001_init row.
   $initSql = file_get_contents($ROOT.'/migrations/001_init.sql');
   if ($initSql === false) { pd_err('[migrate] FATAL: cannot read 001_init.sql. exit 1'); exit(1); }
+  // [Finding: multi-statement truncation — Grok New #2] 001_init.sql is a
+  // MULTI-STATEMENT script (8x CREATE TABLE + a trailing schema_migrations
+  // INSERT). PDO_MYSQL runs EVERY statement of a single exec() ONLY while
+  // MYSQL_ATTR_MULTI_STATEMENTS is enabled. It IS on by default, but
+  // App\Database does not set it explicitly and migrations/run.php deliberately
+  // DISABLES it for its own connection -- so relying on the inherited default
+  // here is fragile: a future default flip, or a copy of run.php's disable, would
+  // silently truncate the schema to just the first CREATE. Open a DEDICATED
+  // connection with the flag EXPLICITLY ON for this one full-schema exec so the
+  // guarantee is version-controlled, not inherited. (The post-migrate schema
+  // assertion further down is the independent backstop that catches a truncated
+  // exec regardless -- a hollow schema fails that assertion and aborts.)
+  $initOpts = [
+    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+  ];
+  if (defined('PDO::MYSQL_ATTR_MULTI_STATEMENTS')) {
+    $initOpts[PDO::MYSQL_ATTR_MULTI_STATEMENTS] = true;
+  }
   try {
-    $pdo->exec($initSql);
+    $initDsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=%s', $host, $port, $name, 'utf8mb4');
+    $initPdo = new PDO($initDsn, $user, $pass, $initOpts);
+    $initPdo->exec($initSql);
   } catch (\Throwable $e) {
     pd_err('[migrate] FATAL: 001_init.sql failed ('.get_class($e).'). exit 1');
     exit(1);
   }
-  pd_out('[migrate] FRESH DB: applied 001_init.sql (full current schema)');
+  pd_out('[migrate] FRESH DB: applied 001_init.sql (full current schema, multi-statement)');
 
   // 2) BASELINE the baked migrations (001..MAX_BAKED): mark them applied WITHOUT
   //    executing -- their DDL is already physically present from 001_init.sql,
@@ -186,6 +247,35 @@ if (!$coreTablePresent) {
   pd_out('[migrate] EXISTING DB (core table '.CORE_TABLE.' present): apply-mode, fail-fast');
   pd_run_runner($runner, '', 'existing apply');
 }
+
+// --- Post-migrate SCHEMA ASSERTION (Grok New #3) -----------------------------
+// The migration LEDGER now says the schema is at MAX_BAKED_MIGRATION. PROVE the
+// PHYSICAL schema agrees BEFORE seeding / declaring success: assert that a
+// representative column from MAX_BAKED_MIGRATION actually EXISTS. This is the
+// belt-and-suspenders that turns a "complete ledger but hollow schema" -- a
+// lying ledger, OR a truncated multi-statement 001_init exec -- into a LOUD
+// deploy-time abort (exit 1) instead of silently re-shipping the 16h incident
+// (code serving against a schema missing 005's columns). Runs on BOTH the fresh
+// and existing paths (control only reaches here after a clean migrate). $name is
+// the physically-selected DB (asserted == SELECT DATABASE() above).
+try {
+  $chk = $pdo->prepare(
+    'SELECT COUNT(*) FROM information_schema.COLUMNS '
+    .'WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?');
+  $chk->execute([$name, MAX_BAKED_ASSERT_TABLE, MAX_BAKED_ASSERT_COLUMN]);
+  $colPresent = (int)$chk->fetchColumn();
+} catch (\Throwable $e) {
+  pd_err('[migrate] FATAL: post-migrate schema assertion query failed ('.get_class($e).'). exit 1');
+  exit(1);
+}
+if ($colPresent < 1) {
+  pd_err('[migrate] FATAL: schema assertion FAILED -- '.MAX_BAKED_ASSERT_TABLE.'.'.MAX_BAKED_ASSERT_COLUMN
+    .' (represents '.MAX_BAKED_MIGRATION.') is MISSING from the physical schema even though the '
+    .'migration ledger reports success. Refusing to ship code against a hollow schema. exit 1');
+  exit(1);
+}
+pd_out('[migrate] schema assertion OK: '.MAX_BAKED_ASSERT_TABLE.'.'.MAX_BAKED_ASSERT_COLUMN
+  .' present (represents '.MAX_BAKED_MIGRATION.')');
 
 // --- Verify tables (diagnostic) ---
 $tables = $pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);
