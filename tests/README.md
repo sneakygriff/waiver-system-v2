@@ -58,6 +58,39 @@ silently green.
 docker compose exec php vendor/bin/phpunit --fail-on-skipped
 ```
 
+## Docker-based E2E / image smoke scripts (not part of the phpunit suite)
+
+Two standalone Docker scripts verify things the phpunit micro-harness cannot
+(a whole deploy orchestration, and the built image's effective config). Both use
+only DISPOSABLE local containers and NEVER touch prod. They need a php+pdo_mysql
+image (`waiver-system-v2-php:latest` by default) and the docker daemon.
+
+- **`tests/predeploy_e2e.sh`** — end-to-end verification of `dev/predeploy.php`
+  against a throwaway MySQL, across all six deploy scenarios: (a) fresh empty DB,
+  (b) prod-like (001..005 ledgered), (c) legacy DB with a partial ledger →
+  apply-mode fails → predeploy exits 1 (fail-safe), (d) a new pending `006` on an
+  existing DB, (e) a fresh DB with an un-baked `006` → its DDL is EXECUTED (not
+  baseline-skipped), (f) a missing required `MYSQL*` var → exit 1, no false
+  success. Runs `dev/predeploy.php` in the image with discrete `MYSQL*` env vars.
+
+  ```bash
+  bash tests/predeploy_e2e.sh                 # PHP_IMG / MYSQL_IMG overridable
+  ```
+
+- **`tests/image_error_config_smoke.sh`** — builds the image and asserts the
+  container's error-visibility contract: effective `display_errors=Off` /
+  `display_startup_errors=Off` / `log_errors=On` / `error_log=/dev/stderr`,
+  `php-fpm -tt` passes AND pins `display_errors=0` at the `[www]` pool level
+  (`php_admin_flag`, not overridable by `ini_set`), and a request that triggers a
+  controlled PHP error has the error text ABSENT from the HTTP body but PRESENT
+  on the container's stderr (`docker logs`).
+
+  ```bash
+  bash tests/image_error_config_smoke.sh                          # builds first
+  SKIP_BUILD=1 IMG=waiver-system-v2-php:latest \
+    bash tests/image_error_config_smoke.sh                        # reuse an image
+  ```
+
 ## Notes on `MigrationRunnerTest`
 
 This one needs no `waiver_test` setup, but it does need a MySQL account that can
