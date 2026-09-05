@@ -13,6 +13,17 @@ properties:
    per statement, resumes a half-applied file at the exact failed statement,
    and treats a pre-existing ledger row as "file fully applied" — see
    `MigrationRunnerTest.php` (CI/CD M4, AC4.2).
+4. `App\TemplateSeed` copies ONE operator-authored waiver template between
+   environments **preserving its id**, flips the publish gate, and cannot
+   overwrite or duplicate an existing template — see `TemplateSeedTest.php`
+   (GVS-58 follow-up; runbook in `dev/staging-repair-runbook.md`). The
+   id-preservation case is the load-bearing one: `waiver_templates.id` is
+   `AUTO_INCREMENT`, so an import into an empty database lands at 1 while
+   BookingV2 staging points at "2" — a seed that "worked" but renumbered would
+   leave staging just as broken. `testSeedNeverOverwritesAnExistingTemplate`
+   is the non-vacuous half of the safety argument: it mutates a seeded row and
+   re-seeds, asserting the mutation SURVIVES, which an `UPDATE`-based seed
+   fails and every other case in the file passes.
 
 ## One-time setup
 
@@ -72,6 +83,14 @@ image (`waiver-system-v2-php:latest` by default) and the docker daemon.
   existing DB, (e) a fresh DB with an un-baked `006` → its DDL is EXECUTED (not
   baseline-skipped), (f) a missing required `MYSQL*` var → exit 1, no false
   success. Runs `dev/predeploy.php` in the image with discrete `MYSQL*` env vars.
+
+  Scenario **(g)** additionally drops each of 005's four evidence columns
+  independently to prove the post-migrate schema assertion is non-vacuous, and
+  **(h)** covers the GVS-58 waiver-template seed end-to-end through the shipped
+  image: a re-provisioned empty DB self-heals to template id 2 with the publish
+  gate true, a redeploy is an idempotent no-op, an operator edit SURVIVES a
+  redeploy, an unarmed service writes nothing, a missing fixture warns without
+  aborting the deploy, and a database holding signed waivers is refused.
 
   ```bash
   bash tests/predeploy_e2e.sh                 # PHP_IMG / MYSQL_IMG overridable

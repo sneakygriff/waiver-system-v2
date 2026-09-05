@@ -57,6 +57,12 @@ or `callback.outbound_secret` (when `callback.base_url` is configured) — see
 values after `cp config/config.php.docker config/config.php`, not just edit
 `api_hmac_secret` as the quick-start above shows.
 
+## Staging repair / re-provisioning
+If the staging fork database is re-provisioned empty (0 templates, 0 admins),
+see `dev/staging-repair-runbook.md` — it covers the two operator steps (the
+`SEED_ADMIN_*` variables, and the id-preserving template copy armed by
+`SEED_WAIVER_TEMPLATE_FILE`) and why neither can ever touch production.
+
 ## Tests
 See `tests/README.md` for the phpunit micro-harness (setup, one-time
 `waiver_test` DB creation, and what it covers). Run with:

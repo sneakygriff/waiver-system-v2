@@ -330,4 +330,95 @@ if ($email && $adminPass) {
 } else {
   pd_out('[seed] SEED_ADMIN_EMAIL/PASSWORD unset -> skipping admin seed');
 }
+
+// --- Seed the waiver TEMPLATE (idempotent, explicitly armed) — GVS-58 --------
+// WHY THIS IS HERE. The staging fork database was re-provisioned empty on
+// 2026-08-18 and every staging waiver send has failed terminally since, because
+// BookingV2 staging asks for waiverTemplateId "2" and the fork has no template 2
+// to answer with. Re-provisioning is a thing that HAPPENS to staging; the fix is
+// only a fix if the next one self-heals. So the template copy lives here, on the
+// same preDeployCommand that already migrates and seeds the admin.
+//
+// ARMED BY ITS OWN ENV VAR, NEVER SET ON PRODUCTION. SEED_WAIVER_TEMPLATE_FILE
+// holds the PATH to the fixture (dev/template_export.php writes it). Holding the
+// path rather than a boolean means the committed fixture is INERT on its own:
+// the file shipping in every image (including production's) does nothing at all
+// until a variable on ONE service names it.
+//
+// ...AND THAT ENV VAR IS THE WEAKEST OF THREE LOCKS. The production template is
+// the legally-operative document the operator edits by hand, and a human promise
+// ("we won't set that variable on prod") is not a control. src/TemplateSeed.php
+// carries two MECHANICAL locks behind this one: the seed is INSERT-ONLY-IF-THE-
+// ID-IS-ABSENT (there is no UPDATE statement in that file, so an accidentally
+// armed production deploy finds template 2 present and writes nothing), and it
+// REFUSES any database holding waiver_responses rows (i.e. real signatures).
+// Neither depends on knowing which host is which, so neither can be defeated by
+// a bad credential rotation.
+//
+// WHY A FAILURE HERE DOES **NOT** ABORT THE DEPLOY — a deliberate asymmetry with
+// everything above this line. The migration steps abort (exit 1) because they
+// gate SCHEMA CORRECTNESS: shipping code against a hollow schema is the 16h
+// incident this file was rewritten to prevent. This is a DATA CONVENIENCE
+// bootstrap. A malformed fixture, a bad path or a target that legitimately
+// refuses the seed must not take a staging deploy down and block the very
+// release that would fix it — that would turn a nice-to-have into an outage
+// source. It fails LOUD instead: every path reports on STDERR and names itself,
+// so the reason is one grep away in the deploy log. (The admin seed above
+// follows the same rule, silently; this one says so.)
+//
+// ORDER MATTERS: this runs AFTER the admin seed on purpose, so the seeded rows
+// can be attributed to the target's OWN admin user rather than carrying a
+// created_by that references a user id from the source database. No FK is
+// declared anywhere in migrations/*.sql so a dangling value could not hard-fail,
+// but a real local id beats a lie in the column.
+$tplFileEnv = getenv('SEED_WAIVER_TEMPLATE_FILE');
+if ($tplFileEnv !== false && trim((string)$tplFileEnv) !== '') {
+  $tplFile = trim((string)$tplFileEnv);
+  // Relative paths resolve against the REPO ROOT, not the CWD — same Grok #4
+  // reasoning as $ROOT itself: a WORKDIR/mount-path drift must not silently
+  // change which file this reads.
+  $tplPath = str_starts_with($tplFile, '/') ? $tplFile : $ROOT.'/'.$tplFile;
+  try {
+    if (!is_file($tplPath)) {
+      throw new RuntimeException('no such file: '.$tplPath.' (SEED_WAIVER_TEMPLATE_FILE='.$tplFile.')');
+    }
+    $tplRaw = file_get_contents($tplPath);
+    if ($tplRaw === false) {
+      throw new RuntimeException('cannot read '.$tplPath);
+    }
+    $tplPayload = json_decode($tplRaw, true);
+    if (!is_array($tplPayload)) {
+      throw new RuntimeException($tplPath.' is not valid JSON ('.json_last_error_msg().')');
+    }
+    // Attribute to THIS database's admin (seeded immediately above) when there
+    // is one; null keeps the source value verbatim.
+    $tplAdminId = App\TemplateSeed::localAdminId($pdo);
+    $tplResult  = App\TemplateSeed::seed($pdo, $tplPayload, $tplAdminId);
+    pd_out('[tseed] '.$tplResult['result'].': '.$tplResult['detail']);
+    pd_out('[tseed] template_id='.$tplResult['template_id']
+      .' versions_inserted='.$tplResult['versions_inserted']
+      .' has_published_version='.($tplResult['verified_has_published_version'] ? 'true' : 'false')
+      .' created_by='.($tplAdminId === null ? '(source value kept)' : (string)$tplAdminId));
+    // The post-condition that actually matters to BookingV2. TemplateSeed::seed()
+    // re-runs WaiverController::hasPublishedVersion()'s EXACT query after the
+    // insert; if that still answers false we wrote rows that fix nothing, which
+    // is worth shouting about even though it does not abort.
+    if ($tplResult['result'] === App\TemplateSeed::RESULT_SEEDED
+        && !$tplResult['verified_has_published_version']) {
+      pd_err('[tseed] WARNING: template '.$tplResult['template_id'].' was seeded but '
+        .'has_published_version STILL answers false -- create_waiver will keep returning '
+        .'no_published_version. The fixture almost certainly carries only DRAFT versions '
+        .'(is_published=0). Re-export from a source where a version is actually published.');
+    }
+  } catch (\Throwable $e) {
+    pd_err('[tseed] WARNING: waiver-template seed SKIPPED ('.get_class($e).'): '.$e->getMessage());
+    pd_err('[tseed] The deploy CONTINUES on purpose: this is a data-convenience bootstrap, not a '
+      .'schema gate, and taking the release down would block the very deploy that fixes it. '
+      .'Nothing was written (TemplateSeed::seed is transactional and rolls back). '
+      .'Fix the fixture or unset SEED_WAIVER_TEMPLATE_FILE.');
+  }
+} else {
+  pd_out('[tseed] SEED_WAIVER_TEMPLATE_FILE unset -> skipping waiver-template seed');
+}
+
 pd_out('[predeploy] DONE');
