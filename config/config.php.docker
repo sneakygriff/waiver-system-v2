@@ -38,5 +38,21 @@ return [
   'storage' => [
     'signatures_path' => __DIR__ . '/../storage/signatures',
     'artifacts_path'  => __DIR__ . '/../storage/artifacts'
-  ]
+  ],
+  // [gate 89-M4 r3 P2-6 fix] Optional per-instance evidence-lock (GET_LOCK)
+  // wait times, all in whole seconds; every key is optional and defaults to
+  // the constant named below (WaiverController::evidenceLockWaitSeconds()) if
+  // this whole 'evidence_lock' array, or an individual key, is absent, or the
+  // value is not a non-negative int. Uncomment only to override a default:
+  // 'evidence_lock' => [
+  //   'submit_wait_seconds' => 2, // SUBMIT_EVIDENCE_LOCK_WAIT_SECONDS -- how long a
+  //     // guest's first submit waits for the lock before completing WITHOUT
+  //     // uploading evidence (retained locally for resend_evidence/reconcile).
+  //   'resend_wait_seconds' => 0, // RESEND_EVIDENCE_LOCK_WAIT_SECONDS -- resend_evidence
+  //     // never waits; a busy lock just means "nothing new to push right now".
+  //   'erase_wait_seconds'  => 5, // ERASE_EVIDENCE_LOCK_WAIT_SECONDS -- how long
+  //     // erase_waiver waits per instance (ascending id order, ALL locks taken
+  //     // before its transaction opens) before answering {error:'evidence_busy'}
+  //     // (503) and deleting nothing, for BookingV2's outbox to retry.
+  // ],
 ];

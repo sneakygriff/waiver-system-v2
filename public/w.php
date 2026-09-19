@@ -16,11 +16,31 @@ try {
 $db = new Database($cfg['db']);
 $ctl = new WaiverController($cfg, $db);
 
+// [GVS-89] An expired PUBLIC (reception-QR) link: 410 Gone plus a small,
+// phone-readable page in the instance's locale telling the guest to scan the
+// reception QR again (which mints a fresh link). No form, no title. ONE
+// renderer for both the GET (render gate) and the POST (submit gate, past
+// the 60-min grace) so the two can never drift apart [gate 89-M4 P2-3].
+function wv_render_expired_page(array $data): void {
+  http_response_code(410);
+  $lang = ($data['locale'] ?? 'ro') === 'en' ? 'en' : 'ro';
+  ?><!doctype html><html lang="<?=$lang?>"><head><meta charset="utf-8"><title><?=htmlspecialchars((string)($data['error_title'] ?? ''))?></title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"></head>
+  <body class="container py-4"><div class="alert alert-warning"><?=htmlspecialchars((string)$data['error'])?></div></body></html><?php
+}
+
 $token = $_GET['token'] ?? '';
 if ($_SERVER['REQUEST_METHOD']==='POST') {
   $res = $ctl->submitGuestForm($token, $_POST);
   if (!empty($res['error'])) {
     $error = $res['error'];
+    if (($res['error_code'] ?? null) === 'expired') {
+      // Past expires_at + the submit grace: the same localized 410 page a GET
+      // gets, not the generic 5xx banner below.
+      wv_render_expired_page($res);
+      exit;
+    }
     if (!empty($res['http_status'])) {
       // [post-incident 2026-08-30 / Finding #10 + #B] An INTERNAL persistence
       // failure carries an explicit http_status (5xx) so the outage is VISIBLE
@@ -55,8 +75,23 @@ if (!empty($ok)) {
   exit;
 }
 
-$data = $ctl->renderGuestForm($token);
-if (!empty($data['error'])) { http_response_code(404); echo htmlspecialchars($data['error']); exit; }
+// [gate 89-M4 P2-2] A POST the controller REJECTED with a validation error
+// ($error set, no http_status -- those exited above) re-renders the form
+// under the SUBMIT gate's expiry clock (expires_at + 60-min grace), which is
+// the one that just accepted this POST. Otherwise, inside the grace window,
+// the no-grace render gate would 410 here: masking the validation error
+// (incl. the adults-only copy) and killing a form the grace exists to keep
+// usable. A plain GET always uses the no-grace render gate.
+$data = !empty($error)
+  ? $ctl->rerenderGuestFormAfterRejectedSubmit($token)
+  : $ctl->renderGuestForm($token);
+if (!empty($data['error'])) {
+  if (($data['error_code'] ?? null) === 'expired') {
+    wv_render_expired_page($data);
+    exit;
+  }
+  http_response_code(404); echo htmlspecialchars($data['error']); exit;
+}
 $instance = $data['instance']; $fields = $data['fields'];
 ?>
 <!doctype html><html><head><meta charset="utf-8"><title><?=htmlspecialchars($instance['title'])?></title>

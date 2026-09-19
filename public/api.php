@@ -81,13 +81,59 @@ try {
     Utils::jsonResponse(200, $res);
   }
 
+  // [GVS-89] Reception-QR public instances (WaiverController doc block above
+  // createPublicInstance). invalid_request / no_published_version /
+  // template_missing_dob are 400s; link_token_conflict (the token already
+  // names a NON-public instance) is 409.
+  if ($action === 'create_public_instance') {
+    $res = $ctl->createPublicInstance($payload);
+    if (!empty($res['error'])) {
+      $status = $res['error'] === 'link_token_conflict' ? 409 : 400;
+      Utils::jsonResponse($status, $res);
+    }
+    Utils::jsonResponse(200, $res);
+  }
+
+  // [GVS-89] Status of ONE public instance by link_token. token_unknown (also
+  // the answer for a reservation-bound token) is 404, like get_status.
+  if ($action === 'public_status') {
+    $res = $ctl->publicStatus($payload);
+    if (!empty($res['error'])) {
+      $status = $res['error'] === 'token_unknown' ? 404 : 400;
+      Utils::jsonResponse($status, $res);
+    }
+    Utils::jsonResponse(200, $res);
+  }
+
+  // [GVS-89 / 89-M4.4 / §4 #14] Evidence-recovery for a completed instance
+  // whose original relay upload never confirmed. token_unknown is the one
+  // 404-shaped case (matches every other link_token lookup); a malformed
+  // token is 400 invalid_request; every other outcome -- including "nothing
+  // to push" and "an erase holds the evidence lock" -- is a 200
+  // {ok:true, pushed:bool}.
+  if ($action === 'resend_evidence') {
+    $res = $ctl->resendEvidence($payload);
+    if (!empty($res['error'])) {
+      $status = $res['error'] === 'token_unknown' ? 404 : 400;
+      Utils::jsonResponse($status, $res);
+    }
+    Utils::jsonResponse(200, $res);
+  }
+
   if ($action === 'create_walkin_group') {
     Utils::jsonResponse(200, ['group_token'=>Utils::randomToken(8)]);
   }
 
   if ($action === 'erase_waiver') {
     $res = $ctl->eraseWaiver($payload);
-    Utils::jsonResponse(empty($res['error']) ? 200 : 400, $res);
+    if (!empty($res['error'])) {
+      // [GVS-89 / gate 89-M4] evidence_busy = an in-flight resend_evidence
+      // held an instance's evidence lock past the erase's short wait; nothing
+      // was deleted. Transient -> 503 so it reads as "retry", not as a
+      // malformed request (BookingV2's erasure worker retries either way).
+      Utils::jsonResponse($res['error'] === 'evidence_busy' ? 503 : 400, $res);
+    }
+    Utils::jsonResponse(200, $res);
   }
 
   if ($action === 'link_waivers') {

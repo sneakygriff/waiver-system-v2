@@ -48,9 +48,17 @@ class WaiverController {
       // existing row and return the SAME success shape rather than a 500, so a
       // network-timeout retry from BookingV2 never double-creates or errors.
       if($e->getCode()==='23000' && $link_token!==null){
-        $existing=$pdo->prepare('SELECT id, group_token FROM waiver_instances WHERE link_token=? LIMIT 1');
+        // [GVS-89] SELECT * (not a named is_public column) so this retry path
+        // never depends on migrations/006_public_instances.sql having landed.
+        $existing=$pdo->prepare('SELECT * FROM waiver_instances WHERE link_token=? LIMIT 1');
         $existing->execute([$link_token]); $row=$existing->fetch();
         if($row){
+          // [GVS-89] One token = one kind of instance. A token that already
+          // belongs to a PUBLIC (reception-QR) instance is never "reused" as a
+          // reservation-bound one -- that would hand BookingV2 a public
+          // instance's link as a participant's (and route its completion to the
+          // public-signup path). Mirror of createPublicInstance's own guard.
+          if(!empty($row['is_public'])) return ['error'=>'link_token_conflict'];
           $link=rtrim($this->cfg['app']['base_url'],'/').'/w.php?token='.$link_token;
           return ['waiver_id'=>(int)$row['id'],'link'=>$link,'link_token'=>$link_token,'group_token'=>$row['group_token'],'reused'=>true];
         }
@@ -202,6 +210,543 @@ class WaiverController {
     return ['error'=>'Provide link_token, or booking_group_id / reservation_id for a batch lookup'];
   }
 
+  // ---------------------------------------------------------------------------
+  // [GVS-89 / 89-M4.2] Reception-QR PUBLIC instances.
+  //
+  // BookingV2's public page (/waiver/receptie) mints a walk-in signup with its
+  // own random token, then calls create_public_instance so the guest can sign on
+  // this fork's w.php. A public instance is an ordinary waiver_instances row
+  // with is_public=1, expires_at set, and NO reservation binding
+  // (reservation_id / participant_id / customer_id / booking_group_id all
+  // NULL -- they are nullable since 001_init.sql) and NO guest_email (this fork
+  // never learns the signer's email; BookingV2 keeps it on its signup row). The
+  // signup token is stored in the EXISTING link_token column, so w.php?token=,
+  // uploadEvidence() and get_status keep working unchanged
+  // (decomposition §4 DEFAULT #13); on the wire `signup_token` == link_token.
+  //
+  // Token-kind invariant: one link_token is EITHER public OR reservation-bound,
+  // never both -- createPublicInstance never "reuses" a reservation-bound row
+  // and createInstance never "reuses" a public one (link_token_conflict).
+  //
+  // Expiry (renderGuestForm): once expires_at has passed, w.php refuses to
+  // RENDER a public instance's form (410 + a localized "scan the QR again"
+  // page). public_status keeps answering after expiry -- BookingV2 reconciles a
+  // public signup until its own retention deadline R = expires_at + 7 days.
+  // ---------------------------------------------------------------------------
+
+  // Same wire charset as create_waiver's optional link_token (SPEC G1a), but
+  // anchored with \A...\z: PCRE's `$` also matches before a trailing "\n", which
+  // would let "<token>\n" through into link_token and the signing URL.
+  private const LINK_TOKEN_PATTERN = '/\A[A-Za-z0-9_-]{16,128}\z/';
+  private const PUBLIC_LOCALES = ['ro', 'en'];
+  // Sanity ceiling on expires_at (BookingV2 mints expiresAt = now + 2h). Bounds
+  // how long a leaked public link could stay renderable if a caller bug ever
+  // sent a far-future expiry; equal to BookingV2's 7-day retention window.
+  private const PUBLIC_MAX_TTL_SECONDS = 7 * 24 * 3600;
+  // [GVS-89 / orchestrator decision, 2026-09-19] Grace window for a SUBMIT
+  // (as opposed to a render) of a public instance past its expires_at: a
+  // person who opened the form before expiry must still be able to send it.
+  // The render gate (isExpiredPublicInstance) has no such grace -- a fresh
+  // GET after expires_at always 410s, which is exactly what re-mints a form
+  // via a new QR scan; this grace exists only for a form already open in a
+  // guest's hand at the moment expires_at passed.
+  private const PUBLIC_SUBMIT_GRACE_SECONDS = 60 * 60;
+  // Guest-facing copy for the expired-link page (w.php), by instance locale.
+  private const PUBLIC_EXPIRED_COPY = [
+    'ro' => ['title' => 'Link expirat', 'message' => 'Acest link a expirat — te rugăm să scanezi din nou codul QR.'],
+    'en' => ['title' => 'Link expired', 'message' => 'This link has expired — please scan the QR again.'],
+  ];
+
+  private static function invalidRequest(string $detail): array {
+    return ['error'=>'invalid_request', 'detail'=>$detail];
+  }
+
+  private function guestLink(string $linkToken): string {
+    return rtrim($this->cfg['app']['base_url'],'/').'/w.php?token='.$linkToken;
+  }
+
+  // Strict ISO-8601 instant WITH a timezone designator ('Z' or +hh:mm/-hh:mm),
+  // e.g. JS Date#toISOString() "2026-09-19T14:00:00.000Z". Returns the Unix
+  // timestamp (fractional seconds truncated) or null. A string with no zone
+  // designator is ambiguous (this app's default timezone is Europe/Bucharest,
+  // not UTC) and is rejected rather than guessed; so are impossible calendar
+  // values (2026-09-31, 24:30:00) that PHP's parser would silently roll over.
+  // `public` (like evidenceUrlFor) only so tests/WaiverControllerPublicTest.php
+  // can pin it directly without reflection.
+  public static function parseIsoInstant($raw): ?int {
+    if (!is_string($raw)) return null;
+    if (!preg_match('/\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|([+-])(\d{2}):(\d{2}))\z/', $raw, $m)) return null;
+    if (!checkdate((int)$m[2], (int)$m[3], (int)$m[1]) || (int)$m[4] > 23 || (int)$m[5] > 59 || (int)$m[6] > 59) return null;
+    $offset = '+00:00';
+    if ($m[7] !== 'Z') {
+      if ((int)$m[9] > 14 || (int)$m[10] > 59) return null;
+      $offset = $m[8].$m[9].':'.$m[10];
+    }
+    try {
+      $dt = new \DateTimeImmutable($m[1].'-'.$m[2].'-'.$m[3].'T'.$m[4].':'.$m[5].':'.$m[6].$offset);
+    } catch (\Exception $e) {
+      return null;
+    }
+    return $dt->getTimestamp();
+  }
+
+  // create_public_instance {template_id, link_token, locale, expires_at}
+  //   -> {ok:true, waiver_id, link, link_token, reused}
+  // Errors: {error:'invalid_request', detail} (400) for any malformed field;
+  // {error:'no_published_version'} (400, same published-version gate as
+  // create_waiver); {error:'template_missing_dob', detail} (400) when the
+  // published version has no date-of-birth field to age-gate on, or
+  // {error:'template_ambiguous_dob', detail} (400) when it has several date
+  // fields and no single one keyed as the DOB (adults-only fails closed --
+  // see below); {error:'link_token_conflict'} (409) when the
+  // token already belongs to a NON-public instance.
+  // IDEMPOTENT per link_token: a retry with a token that already names a public
+  // instance returns that SAME instance with reused:true and changes nothing
+  // (the stored template version / locale / expires_at win), so BookingV2's
+  // bounded transient retry can never double-create. The UNIQUE(link_token)
+  // index makes this race-safe: of two concurrent creates exactly one INSERT
+  // wins and the other takes the duplicate-key (SQLSTATE 23000) reuse path.
+  public function createPublicInstance(array $payload): array {
+    $templateId = $payload['template_id'] ?? null;
+    $linkToken  = $payload['link_token'] ?? null;
+    $locale     = $payload['locale'] ?? null;
+    $expiresRaw = $payload['expires_at'] ?? null;
+
+    if (is_bool($templateId) || !is_scalar($templateId) || !preg_match('/\A[1-9][0-9]{0,18}\z/', (string)$templateId)) {
+      return self::invalidRequest('template_id must be a positive integer');
+    }
+    if (!is_string($linkToken) || !preg_match(self::LINK_TOKEN_PATTERN, $linkToken)) {
+      return self::invalidRequest('link_token must be 16-128 characters of [A-Za-z0-9_-]');
+    }
+    if (!is_string($locale) || !in_array($locale, self::PUBLIC_LOCALES, true)) {
+      return self::invalidRequest('locale must be "ro" or "en"');
+    }
+    $expiresTs = self::parseIsoInstant($expiresRaw);
+    if ($expiresTs === null) {
+      return self::invalidRequest('expires_at must be an ISO-8601 timestamp with a timezone designator, e.g. 2026-09-19T14:00:00.000Z');
+    }
+
+    $pdo = $this->db->pdo();
+    // [GVS-89 / gate 89-M4 P2-6] ONE clock for public expiry: the DB's.
+    // The render gate and the submit gate both compare expires_at against
+    // UTC_TIMESTAMP(), so the future/ceiling checks here must too -- a
+    // PHP-process clock skewed against MySQL (Railway runs them as separate
+    // services) could otherwise accept an expires_at the gates already treat
+    // as past, minting a link that 410s on first open.
+    $now = $this->dbNowUtcTs();
+    if ($now === null) throw new \RuntimeException('could not read the database clock (UTC_TIMESTAMP)');
+    if ($expiresTs <= $now) return self::invalidRequest('expires_at must be in the future');
+    if ($expiresTs > $now + self::PUBLIC_MAX_TTL_SECONDS) return self::invalidRequest('expires_at must be at most 7 days in the future');
+    // Stored as a UTC DATETIME, independent of the app's default timezone.
+    $expiresAt = gmdate('Y-m-d H:i:s', $expiresTs);
+
+    // [Gap1] Same published-version gate as createInstance: never fall back to
+    // a draft version.
+    $v = $pdo->prepare('SELECT id, fields_json FROM waiver_template_versions WHERE template_id=? AND is_published=1 ORDER BY version DESC LIMIT 1');
+    $v->execute([(string)$templateId]);
+    $version = $v->fetch();
+    if (!$version) return ['error'=>'no_published_version'];
+
+    // [gate 89-M4 r3 P2-5 fix / Codex r2] Idempotency check BEFORE the DOB
+    // gate below. A retry of a create call that already succeeded (a lost
+    // response, a network timeout -- exactly what link_token idempotency
+    // exists for) must return reused:true for its own existing instance even
+    // if the template has SINCE been republished into an unresolvable DOB
+    // shape (missing/ambiguous). Checking DOB first would answer
+    // template_missing_dob/template_ambiguous_dob for a token that already
+    // names a perfectly good, already-minted instance -- turning a harmless
+    // retry into a hard failure over a LATER template edit unrelated to it.
+    // Mirrors the existing duplicate-key (23000) reuse path below (which the
+    // INSERT's UNIQUE(link_token) index makes race-safe for two concurrent
+    // creates of the SAME token) but runs as a plain SELECT first, since the
+    // INSERT has not been attempted yet.
+    $existingPublic = $pdo->prepare('SELECT id, is_public FROM waiver_instances WHERE link_token=? LIMIT 1');
+    $existingPublic->execute([$linkToken]);
+    if ($existingRow = $existingPublic->fetch()) {
+      if ((int)$existingRow['is_public'] !== 1) return ['error'=>'link_token_conflict'];
+      return ['ok'=>true, 'waiver_id'=>(int)$existingRow['id'], 'link'=>$this->guestLink($linkToken), 'link_token'=>$linkToken, 'reused'=>true];
+    }
+
+    // [GVS-89 / gate 89-M4 P1] Adults-only must FAIL CLOSED. The reception-QR
+    // flow is adults-only (AC4) and the only thing that can enforce it on the
+    // fork is evaluateAgeGate(), which needs the template's date-of-birth field.
+    // A published version WITHOUT one would make the gate a silent no-op
+    // (computed_age null -> any age completes, and the completion is then
+    // un-ingestible by BookingV2, whose public schema requires an integer
+    // computed_age). [gate 89-M4 r2 P1] Nor may the gate GUESS the field: with
+    // several date fields and none explicitly keyed as the DOB it could
+    // age-gate on e.g. a visit date. resolvePublicDobField() decides; refuse
+    // to mint the instance at all (template_missing_dob /
+    // template_ambiguous_dob, both 400 and terminal) when it cannot.
+    $dob = $this->resolvePublicDobField($this->normalizeFields($version['fields_json']));
+    if ($dob['error'] !== null) {
+      return ['error'=>$dob['error'], 'detail'=>$dob['detail']];
+    }
+
+    try {
+      $stmt = $pdo->prepare('INSERT INTO waiver_instances (template_version_id, reservation_id, participant_id, customer_id, booking_group_id, group_token, guest_name, guest_email, link_token, status, is_public, expires_at, locale, created_at, updated_at) VALUES (?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?,"pending",1,?,?,UTC_TIMESTAMP(),UTC_TIMESTAMP())');
+      $stmt->execute([$version['id'], $linkToken, $expiresAt, $locale]);
+    } catch (\PDOException $e) {
+      if ($e->getCode() === '23000') {
+        $existing = $pdo->prepare('SELECT id, is_public FROM waiver_instances WHERE link_token=? LIMIT 1');
+        $existing->execute([$linkToken]);
+        $row = $existing->fetch();
+        if ($row) {
+          if ((int)$row['is_public'] !== 1) return ['error'=>'link_token_conflict'];
+          return ['ok'=>true, 'waiver_id'=>(int)$row['id'], 'link'=>$this->guestLink($linkToken), 'link_token'=>$linkToken, 'reused'=>true];
+        }
+      }
+      throw $e;
+    }
+
+    $id = (int)$pdo->lastInsertId();
+    // No PII and no token in the audit row: the token is a bearer credential
+    // for the signing page, and this fork never holds the signer's email.
+    $this->audit('instance', $id, 'created', ['public'=>true, 'template_version_id'=>(int)$version['id'], 'locale'=>$locale, 'expires_at'=>$expiresAt]);
+    return ['ok'=>true, 'waiver_id'=>$id, 'link'=>$this->guestLink($linkToken), 'link_token'=>$linkToken, 'reused'=>false];
+  }
+
+  // public_status {link_token} -> the get_status single-token row shape
+  // (statusRow) with the three binding ids forced to null, plus
+  // is_public:true and expires_at (ISO-8601 UTC). Answers ONLY for public
+  // instances: a reservation-bound (or unknown) token is {error:'token_unknown'}
+  // (404), byte-identical to a token that does not exist at all, so this action
+  // is no oracle for the other token kind. Keeps answering after expires_at
+  // (BookingV2 reconciles until expires_at + 7 days).
+  public function publicStatus(array $payload): array {
+    $linkToken = $payload['link_token'] ?? null;
+    if (!is_string($linkToken) || $linkToken === '' || strlen($linkToken) > 128) {
+      return self::invalidRequest('link_token must be a non-empty string (max 128)');
+    }
+    $pdo = $this->db->pdo();
+    $gate = $pdo->prepare('SELECT id, expires_at FROM waiver_instances WHERE link_token=? AND is_public=1 LIMIT 1');
+    $gate->execute([$linkToken]);
+    $public = $gate->fetch();
+    if (!$public) return ['error'=>'token_unknown'];
+
+    $q = $pdo->prepare(self::STATUS_SELECT.' WHERE wi.id=? LIMIT 1');
+    $q->execute([(int)$public['id']]);
+    $row = $q->fetch();
+    // Erased (erase_waiver) between the two reads: same answer as unknown.
+    if (!$row) return ['error'=>'token_unknown'];
+
+    $out = $this->statusRow($row);
+    // Contract: binding ids are null on a public row. They are NULL in the
+    // table by construction; forcing them here keeps the wire guarantee even
+    // if a row were ever hand-edited, since BookingV2's public ingest rejects
+    // a body that carries a participant binding.
+    $out['participant_id'] = null;
+    $out['customer_id'] = null;
+    $out['booking_group_id'] = null;
+    $out['is_public'] = true;
+    $out['expires_at'] = $public['expires_at'] !== null ? gmdate('c', strtotime($public['expires_at'].' UTC')) : null;
+    return $out;
+  }
+
+  // [GVS-89 / 89-M4.4 / §4 #14 / AC7] resend_evidence {link_token} ->
+  // {ok:true, pushed:bool}. Evidence recovery for a completion whose
+  // ORIGINAL upload to BookingV2's evidence relay (uploadEvidence(), called
+  // from submitGuestForm at signing time) never confirmed. That failure path
+  // is exactly the one that RETAINS the signed PDF/signature PNG locally
+  // (waiver_responses.pdf_path/signature_path stay non-NULL -- see
+  // submitGuestForm's own [FK-T15 / FK-evidence-keep] doc comment) instead
+  // of deleting them, so this is the one case with real bytes left to
+  // re-push. Re-runs the SAME private uploadEvidence() helper submitGuestForm
+  // uses; on a confirmed push it updates the four evidence columns, clears
+  // pdf_path/signature_path, and deletes the local files -- mirroring
+  // submitGuestForm's own post-confirm finalization exactly, so a LATER
+  // resend_evidence call (or a fresh reconcile pass) sees "already durably
+  // stored" and no-ops cleanly rather than re-reading stale files.
+  //
+  // Not restricted to is_public=1: BookingV2's reconcile cron only ever
+  // calls this for a used public signup (89-M1.6), but the action itself is
+  // generically "re-push a completed instance's evidence", exactly as
+  // decomposition §7.4 89-M4.4 specifies -- a reservation-bound instance
+  // whose original upload failed benefits from it too, and restricting it
+  // would just be an arbitrary asymmetry with no contract behind it.
+  //
+  // pushed:false is NEVER an error -- it covers every "nothing NEW to push"
+  // case: pending/void instance (nothing was ever signed), no waiver_responses
+  // row at all (defends a hand-edited/corrupt 'completed' row), evidence
+  // already durably stored (the first upload already confirmed -- nothing
+  // retained locally), the retained file missing/unreadable on disk, or the
+  // relay still down/refusing (uploadEvidence() itself returns a null object
+  // key -- the row and any remaining files are left exactly as they were for
+  // a later attempt). Unknown token is the one 404-shaped case, matching
+  // every other link_token lookup in this file. A malformed token is
+  // {error:'invalid_request', detail} (400) -- the same envelope as the two
+  // sibling GVS-89 actions (create_public_instance, public_status).
+  //
+  // [GVS-89 / gate 89-M4 P1] SERIALIZED AGAINST GDPR ERASURE. This action
+  // reads retained evidence, pushes it OUT of this system (BookingV2's blob
+  // store) and only then records the push. Unserialized, an eraseWaiver()
+  // committing between the upload and the UPDATE would leave the signed PDF
+  // uploaded with no fork-side pointer and write an orphan 'evidence_resent'
+  // audit event for an instance that no longer exists. Both methods therefore
+  // take the SAME per-instance MySQL named lock (EVIDENCE_LOCK_NAME_SQL) around
+  // their whole read -> act -> write sequence (and so does submitGuestForm()
+  // around its first upload + record, gate 89-M4 r2):
+  //   - resend holds it from the post-lock re-read through the upload, the
+  //     UPDATE and the audit write, so an erase can never interleave: it
+  //     either ran entirely BEFORE (the re-read finds no row -> token_unknown,
+  //     nothing uploaded) or runs entirely AFTER (and then erases the rows,
+  //     the audit trail and any retained files this resend left).
+  //   - resend never WAITS for the lock (RESEND_EVIDENCE_LOCK_WAIT_SECONDS=0):
+  //     if an erase (or another resend of the same instance) holds it, this
+  //     call is a clean pushed:false and the reconcile caller retries later.
+  // A named lock (not SELECT ... FOR UPDATE) is deliberate: it is held across
+  // HTTP I/O without keeping a DB transaction -- and its row locks -- open for
+  // the upload's retry budget, which this file never does (see
+  // submitGuestForm's SCOPE note). MySQL releases it if the process dies.
+  // Belt-and-suspenders for a deletion that bypasses the lock (manual SQL):
+  // the final UPDATE is conditional and its rowCount is checked, so a vanished
+  // row never gets an audit event (see below).
+  public function resendEvidence(array $payload): array {
+    $linkToken = $payload['link_token'] ?? null;
+    if (!is_string($linkToken) || $linkToken === '' || strlen($linkToken) > 128) {
+      return self::invalidRequest('link_token must be a non-empty string (max 128)');
+    }
+
+    $pdo = $this->db->pdo();
+    $find = $pdo->prepare('SELECT id FROM waiver_instances WHERE link_token=? LIMIT 1');
+    $find->execute([$linkToken]);
+    $found = $find->fetch();
+    if (!$found) return ['error'=>'token_unknown'];
+    $instanceId = (int)$found['id'];
+
+    if (!$this->acquireEvidenceLock($instanceId, $this->evidenceLockWaitSeconds('resend_wait_seconds', self::RESEND_EVIDENCE_LOCK_WAIT_SECONDS))) {
+      // An erase (or a concurrent resend of this same instance) is in
+      // flight. Nothing pushed by THIS call; the caller retries later and
+      // will then see either the finished push or token_unknown.
+      return ['ok'=>true, 'pushed'=>false];
+    }
+    try {
+      // Re-read UNDER the lock: this is the authoritative state -- an erase
+      // that won the race before we got here has deleted the row.
+      $q = $pdo->prepare('SELECT wi.id, wi.link_token, wi.status, wr.id AS response_id, wr.pdf_path, wr.signature_path, wr.evidence_object_key
+        FROM waiver_instances wi LEFT JOIN waiver_responses wr ON wr.waiver_instance_id = wi.id
+        WHERE wi.id=? LIMIT 1');
+      $q->execute([$instanceId]);
+      $row = $q->fetch();
+      if (!$row) return ['error'=>'token_unknown'];
+
+      // Pending/void (never signed) or a 'completed' row with no response row
+      // at all (should not happen, but a hand-edited/corrupt row must not
+      // fatal this action) -> nothing to push.
+      if ($row['status'] !== 'completed' || $row['response_id'] === null) {
+        return ['ok'=>true, 'pushed'=>false];
+      }
+      // The FIRST upload already confirmed -- nothing retained locally to
+      // re-push (submitGuestForm nulls pdf_path/signature_path exactly when
+      // evidence_object_key gets set).
+      if (!empty($row['evidence_object_key'])) {
+        return ['ok'=>true, 'pushed'=>false];
+      }
+
+      $pdfPath = $row['pdf_path'] ?? null;
+      if ($pdfPath === null || !is_file($pdfPath)) {
+        return ['ok'=>true, 'pushed'=>false];
+      }
+      $sigPath = $row['signature_path'] ?? null;
+      if ($sigPath !== null && !is_file($sigPath)) $sigPath = null;
+
+      $evidence = $this->uploadEvidence(['id'=>$instanceId, 'link_token'=>(string)$row['link_token']], $pdfPath, $sigPath);
+      if ($evidence['evidence_object_key'] === null) {
+        // Still down/refusing -- leave the row and the retained files exactly
+        // as they were for a later attempt.
+        return ['ok'=>true, 'pushed'=>false];
+      }
+
+      // Conditional on the row still being the one we read (present, not yet
+      // durably stored); the push record and its audit event commit together.
+      $pdo->beginTransaction();
+      try {
+        $upd = $pdo->prepare('UPDATE waiver_responses SET evidence_sha256=?, evidence_object_key=?, evidence_blob_key=?, evidence_blob_url=?, pdf_path=NULL, signature_path=NULL WHERE id=? AND waiver_instance_id=? AND evidence_object_key IS NULL');
+        $upd->execute([$evidence['evidence_sha256'], $evidence['evidence_object_key'], $evidence['evidence_blob_key'], $evidence['evidence_blob_url'], (int)$row['response_id'], $instanceId]);
+        $recorded = $upd->rowCount() === 1;
+        if ($recorded) {
+          $this->audit('instance', $instanceId, 'evidence_resent', ['response_id'=>(int)$row['response_id']]);
+        }
+        $pdo->commit();
+      } catch (\Throwable $txEx) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $txEx;
+      }
+
+      if (!$recorded) {
+        // The response row vanished (or changed) between the re-read and the
+        // UPDATE -- only possible for a deletion that bypassed the evidence
+        // lock. Never write an audit event for it (it would outlive the
+        // erasure as an orphan). If the row is GONE, the retained files are
+        // now unreachable orphans of an erased subject: remove them. If it
+        // still exists, it still points at them: leave them alone.
+        $still = $pdo->prepare('SELECT 1 FROM waiver_responses WHERE id=? LIMIT 1');
+        $still->execute([(int)$row['response_id']]);
+        if ($still->fetch()) return ['ok'=>true, 'pushed'=>false];
+        if (is_file($pdfPath)) @unlink($pdfPath);
+        if ($sigPath !== null && is_file($sigPath)) @unlink($sigPath);
+        return ['error'=>'token_unknown'];
+      }
+
+      // Durably stored now -- remove the retained local copies, exactly like
+      // submitGuestForm's own post-confirm cleanup.
+      if (is_file($pdfPath)) @unlink($pdfPath);
+      if ($sigPath !== null && is_file($sigPath)) @unlink($sigPath);
+      return ['ok'=>true, 'pushed'=>true];
+    } finally {
+      $this->releaseEvidenceLock($instanceId);
+    }
+  }
+
+  // [GVS-89 / gate 89-M4 P1] Per-instance evidence lock shared by
+  // resendEvidence(), submitGuestForm() and eraseWaiver() -- see
+  // resendEvidence()'s and submitGuestForm()'s docs. MySQL
+  // named locks are SERVER-wide (not per schema), so the name is scoped by a
+  // hash of DATABASE(): two schemas on one server (e.g. waiver_db and
+  // waiver_test in compose) never contend on the same instance id. The name
+  // stays well under MySQL's 64-character limit. Built server-side from the
+  // instance id (the one bound parameter) so acquire and release can never
+  // disagree on it.
+  private const EVIDENCE_LOCK_NAME_SQL = "CONCAT('wvr_evidence:', LEFT(SHA1(DATABASE()), 16), ':', ?)";
+  private const RESEND_EVIDENCE_LOCK_WAIT_SECONDS = 0;
+  // Erase waits a little for an in-flight resend to finish (one resend holds
+  // the lock for at most one uploadEvidence() retry budget, ~16 s when the
+  // relay is down). Kept BELOW BookingV2's 8 s fork request timeout so the
+  // caller gets a real answer: on timeout erase answers {error:'evidence_busy'}
+  // (503) and deletes nothing; BookingV2's erasure worker retries the whole
+  // call on its outbox backoff.
+  private const ERASE_EVIDENCE_LOCK_WAIT_SECONDS = 5;
+  // [gate 89-M4 r2] submitGuestForm's wait: long enough for the usual holder
+  // (an erase transaction, or a resend with nothing to push) to finish, short
+  // enough not to stall a guest's POST behind an erase that is waiting on
+  // other instances' locks. See submitGuestForm().
+  private const SUBMIT_EVIDENCE_LOCK_WAIT_SECONDS = 2;
+
+  private function evidenceLockWaitSeconds(string $key, int $default): int {
+    $v = $this->cfg['evidence_lock'][$key] ?? null;
+    return is_int($v) && $v >= 0 ? $v : $default;
+  }
+
+  private function acquireEvidenceLock(int $instanceId, int $waitSeconds): bool {
+    $q = $this->db->pdo()->prepare('SELECT GET_LOCK('.self::EVIDENCE_LOCK_NAME_SQL.', ?)');
+    $q->execute([(string)$instanceId, $waitSeconds]);
+    return (int)$q->fetchColumn() === 1;
+  }
+
+  private function releaseEvidenceLock(int $instanceId): void {
+    try {
+      $q = $this->db->pdo()->prepare('SELECT RELEASE_LOCK('.self::EVIDENCE_LOCK_NAME_SQL.')');
+      $q->execute([(string)$instanceId]);
+    } catch (\Throwable $e) {
+      // Best-effort: a dead connection has already released every named lock
+      // it held (MySQL drops them with the session).
+    }
+  }
+
+  // [GVS-89 / gate 89-M4 P2-6] The DB clock (UTC_TIMESTAMP()) as a Unix
+  // timestamp -- the same clock the render/submit expiry gates read.
+  private function dbNowUtcTs(): ?int {
+    $raw = $this->db->pdo()->query('SELECT UTC_TIMESTAMP() AS now_utc')->fetchColumn();
+    if (!is_string($raw)) return null;
+    $dt = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $raw, new \DateTimeZone('UTC'));
+    return $dt === false ? null : $dt->getTimestamp();
+  }
+
+  // Shared UTC parse for the two public-expiry gates below (render and
+  // submit). Returns [expiresDt, nowDt], or null if $row has no expires_at,
+  // no db_now_utc, or either value is unparseable -- both callers treat null
+  // as fail-closed (expired), so neither has to repeat this parsing.
+  // [gate 89-M4 P2-6] "now" is ONLY ever the DB clock (db_now_utc, selected
+  // as UTC_TIMESTAMP() by the caller's own query); there is deliberately no
+  // PHP-clock fallback, so a caller that forgets to select it fails closed
+  // instead of silently mixing clocks.
+  private function parsePublicExpiryClock(array $row): ?array {
+    $expires = $row['expires_at'] ?? null;
+    $nowRaw = $row['db_now_utc'] ?? null;
+    if ($expires === null || $expires === '' || $nowRaw === null || $nowRaw === '') return null;
+    $utc = new \DateTimeZone('UTC');
+    $expiresDt = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', (string)$expires, $utc);
+    $nowDt = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', (string)$nowRaw, $utc);
+    if ($expiresDt === false || $nowDt === false) return null;
+    return [$expiresDt, $nowDt];
+  }
+
+  // Render gate for a PUBLIC instance: expired iff expires_at < now (UTC, the
+  // DB clock -- $row['db_now_utc'] from renderGuestForm's own SELECT). Fails
+  // CLOSED: a public row with no expires_at, or an unparseable value, counts as
+  // expired. Non-public rows (and a schema that predates 006, where the column
+  // is simply absent from wi.*) are never expiry-gated.
+  private function isExpiredPublicInstance(array $row): bool {
+    if (empty($row['is_public'])) return false;
+    $clock = $this->parsePublicExpiryClock($row);
+    if ($clock === null) return true;
+    [$expiresDt, $nowDt] = $clock;
+    return $expiresDt < $nowDt;
+  }
+
+  // [GVS-89 / orchestrator decision, 2026-09-19] Submit-time counterpart to
+  // isExpiredPublicInstance(): a public instance's SUBMIT (as opposed to
+  // render) is refused only once now is past expires_at PLUS
+  // PUBLIC_SUBMIT_GRACE_SECONDS -- a person who already opened the form
+  // before expires_at can still send it within the grace window, even
+  // though a fresh GET at that same moment would already 410. Deliberately
+  // its own method rather than isExpiredPublicInstance() with a $grace
+  // parameter: render (w.php GET) and submit (w.php POST) must compare
+  // against genuinely different instants, and a shared parameterized method
+  // would let a future call site accidentally pass the wrong one -- e.g.
+  // rendering an already-past-expiry-but-within-grace form (never
+  // intended: the render gate exists precisely to force a fresh QR scan)
+  // or refusing a submit the render gate itself already allowed. Same
+  // fail-closed rule as the render gate: unparseable/missing expires_at
+  // counts as expired.
+  private function isSubmitExpiredPublicInstance(array $row): bool {
+    if (empty($row['is_public'])) return false;
+    $clock = $this->parsePublicExpiryClock($row);
+    if ($clock === null) return true;
+    [$expiresDt, $nowDt] = $clock;
+    return $expiresDt->modify('+'.self::PUBLIC_SUBMIT_GRACE_SECONDS.' seconds') < $nowDt;
+  }
+
+  // Localized copy for the expired-link page; any locale other than 'en'
+  // (including NULL) falls back to Romanian, BookingV2's default mint locale.
+  public static function publicExpiredCopy(?string $locale): array {
+    $lang = $locale === 'en' ? 'en' : 'ro';
+    return self::PUBLIC_EXPIRED_COPY[$lang] + ['locale' => $lang];
+  }
+
+  // [GVS-89 / 89-M4.3] Guest-facing copy for submitGuestForm()'s adults-only
+  // public refusal ('minor_requires_staff') -- same fallback rule as
+  // publicExpiredCopy (anything other than 'en', including NULL, is
+  // Romanian). Unlike the expired page, this renders inside w.php's ordinary
+  // "re-show the form with an error banner" path (a public row's locale, not
+  // a separate standalone page), so only a message is needed here.
+  private const PUBLIC_MINOR_STAFF_COPY = [
+    'ro' => ['message' => 'Acest formular este disponibil doar pentru persoane cu vârsta de 18 ani sau peste. Te rugăm să te adresezi unui membru al echipei.'],
+    'en' => ['message' => 'This form is only available to signers 18 or older. Please ask a staff member for help.'],
+  ];
+
+  // `public` (like publicExpiredCopy) so tests can pin it directly.
+  public static function publicMinorStaffCopy(?string $locale): array {
+    $lang = $locale === 'en' ? 'en' : 'ro';
+    return self::PUBLIC_MINOR_STAFF_COPY[$lang] + ['locale' => $lang];
+  }
+
+  // [GVS-89 / gate 89-M4 P1] Guest-facing copy for the fail-closed
+  // 'age_unverifiable' refusal: a PUBLIC instance whose template version has
+  // no (unambiguous) date-of-birth field to age-gate on (create_public_instance refuses to
+  // mint such an instance, so this is defense in depth for a template edited
+  // after minting). The signer cannot fix that, so route them to staff --
+  // without claiming they are under 18.
+  private const PUBLIC_AGE_UNVERIFIABLE_COPY = [
+    'ro' => ['message' => 'Nu putem verifica vârsta pe acest formular. Te rugăm să te adresezi unui membru al echipei.'],
+    'en' => ['message' => "We can't verify your age on this form. Please ask a staff member for help."],
+  ];
+
+  public static function publicAgeUnverifiableCopy(?string $locale): array {
+    $lang = $locale === 'en' ? 'en' : 'ro';
+    return self::PUBLIC_AGE_UNVERIFIABLE_COPY[$lang] + ['locale' => $lang];
+  }
+
   // [FK-void / SPEC D-1 rotate] void_waiver: mark a waiver_instances row
   // status='void' by link_token so a rotated/superseded token can never be
   // signed, even if the old signing link is still floating around (email
@@ -321,8 +866,35 @@ class WaiverController {
     return $out;
   }
 
+  // w.php GET: render the signing form. A PUBLIC instance past its
+  // expires_at is refused (410) with NO grace -- a fresh open after expiry
+  // must go back through the reception QR, which mints a new link.
   public function renderGuestForm(string $token): array {
-    $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.title, wtv.description, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
+    return $this->loadGuestForm($token, false);
+  }
+
+  // [GVS-89 / gate 89-M4 P2-2] w.php POST that submitGuestForm() REJECTED
+  // with a validation error (missing field, bad DOB, minor_requires_staff,
+  // ...): re-render the SAME form with that error. For a public instance the
+  // expiry check here is the SUBMIT gate (expires_at + 60-min grace) that
+  // just accepted this POST, not the no-grace render gate: otherwise a guest
+  // whose form was opened before expiry and who is inside the grace window
+  // the submit gate grants would get a 410 "scan the QR again" instead of
+  // their validation error (masking it, incl. the adults-only copy) and lose
+  // the open form. It widens rendering only to POSTs that the submit gate
+  // itself accepts -- past the grace the submit gate 410s first and w.php
+  // never reaches this. Separately named (not a bool on renderGuestForm) so
+  // a GET call site can never pick the grace clock by accident.
+  public function rerenderGuestFormAfterRejectedSubmit(string $token): array {
+    return $this->loadGuestForm($token, true);
+  }
+
+  private function loadGuestForm(string $token, bool $afterRejectedSubmit): array {
+    // [GVS-89] UTC_TIMESTAMP() rides along so the public-expiry gate compares
+    // against the DB clock (the same clock that stamps created_at/updated_at).
+    // The new 006 columns are read through wi.* -- never named here -- so this
+    // query cannot break on a schema that predates 006.
+    $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.title, wtv.description, wtv.fields_json, wtv.content_html, wtv.print_css, UTC_TIMESTAMP() AS db_now_utc FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $row=$q->fetch();
     if(!$row) return ['error'=>'Invalid link'];
     if($row['status']==='completed') return ['error'=>'This waiver has already been completed.'];
@@ -330,7 +902,23 @@ class WaiverController {
     // even render a signable form -- distinct message from "completed" so a
     // guest opening a stale/rotated link understands to use their newest link.
     if($row['status']==='void') return ['error'=>'This waiver link is no longer valid. Please use the most recent link you were sent.'];
+    // [GVS-89] A PUBLIC (reception-QR) instance past its expires_at never
+    // renders a signable form: w.php answers 410 with a localized "scan the QR
+    // again" page instead. Nothing about the instance (title, fields) is
+    // returned on this path.
+    $expired = $afterRejectedSubmit ? $this->isSubmitExpiredPublicInstance($row) : $this->isExpiredPublicInstance($row);
+    if($expired){
+      return self::publicExpiredResult(isset($row['locale']) ? (string)$row['locale'] : null);
+    }
+    unset($row['db_now_utc']);
     return ['instance'=>$row,'fields'=>$this->normalizeFields($row['fields_json'])];
+  }
+
+  // The ONE shape both expiry gates (render and submit) answer with, so w.php
+  // renders the same localized 410 page for a GET and a POST.
+  private static function publicExpiredResult(?string $locale): array {
+    $copy = self::publicExpiredCopy($locale);
+    return ['error'=>$copy['message'],'error_code'=>'expired','error_title'=>$copy['title'],'locale'=>$copy['locale'],'http_status'=>410];
   }
 
   // [FK-T10 / Gap4] SPEC §12.2 age thresholds, enforced at capture time.
@@ -349,21 +937,67 @@ class WaiverController {
   }
 
   // [FK-T10 / Gap4] Age-gate the submission BEFORE the atomic completion
-  // claim and BEFORE any completion webhook. Looks for the template's DOB
-  // field (the first field of type=date in fields_json) and, if present,
-  // parses+validates it:
+  // claim and BEFORE any completion webhook. Given the template's DOB field
+  // ($dobField, chosen by the caller -- see below), parses+validates it:
   //   - unparsable/future DOB                       -> reject (invalid_birth_date)
   //   - age < AGE_MIN_HARD_REJECT                    -> reject (age_below_minimum), no exceptions
   //   - age < AGE_PARENTAL_CONSENT_BELOW and no       -> reject (minor_parental_consent_missing)
   //     affirmatively-set parental-consent field
   //   - otherwise                                    -> pass
-  // No type=date field in the template at all -> age-gating does not apply
-  // to this template (nothing to gate on); pass through.
+  // No DOB field ($dobField null) -> age-gating does not apply to this
+  // template (nothing to gate on); pass through. WHICH field is the DOB is
+  // the caller's decision (see firstDateField / resolvePublicDobField).
   // Returns ['ok'=>true, 'birth_date'=>?string, 'computed_age'=>?int, 'minor'=>?bool,
   //          'parental_consent_name'=>?string] on pass, or ['ok'=>false,'error'=>string] on reject.
-  private function evaluateAgeGate(array $fields, array $post): array {
-    $dobField = null;
-    foreach ($fields as $f) { if ($f['type'] === 'date') { $dobField = $f; break; } }
+  //
+  // RESERVATION-BOUND rule (UNCHANGED since FK-T10): the template's FIRST
+  // type=date field is its date of birth. Known limitation, deliberately NOT
+  // changed here (gate 89-M4 r2 scoped the fix to public instances): a
+  // reservation-bound template with another date field BEFORE its DOB field
+  // age-gates on that other field.
+  private function firstDateField(array $fields): ?array {
+    foreach ($fields as $f) { if ($f['type'] === 'date') return $f; }
+    return null;
+  }
+
+  // [GVS-89 / gate 89-M4 r2 P1] Field keys that EXPLICITLY mark a type=date
+  // field as the date of birth. The template schema (fields_json objects:
+  // key/label/type/required/options/maxLength -- see normalizeFields() and
+  // admin.php's publish form) has no semantic-role attribute, so the field
+  // KEY is the operator-controlled marker -- the same convention parental
+  // consent already relies on (the conventional 'parental_consent_name' key).
+  // Compared case-insensitively with '-' folded to '_' (DocxImportService
+  // admits '-' in keys). 'date_of_birth' is the seeded production template's
+  // key; 'birth_date' is the completion wire's own name for the value;
+  // 'data_nasterii' is the Romanian spelling.
+  private const DOB_FIELD_KEYS = ['date_of_birth', 'dob', 'birth_date', 'birthdate', 'data_nasterii'];
+
+  // [GVS-89 / gate 89-M4 r2 P1] The date-of-birth field of a PUBLIC
+  // (adults-only) instance's template, resolved STRICTLY -- never "the first
+  // date field", which would age-gate on e.g. a visit date listed before the
+  // real DOB field:
+  //   - exactly ONE type=date field keyed as a DOB (DOB_FIELD_KEYS) -> it;
+  //   - no such field, and exactly ONE type=date field in total -> it (there
+  //     is no other date it could be confused with);
+  //   - no type=date field at all -> error 'template_missing_dob';
+  //   - otherwise (several date fields and none keyed as the DOB, or several
+  //     keyed as the DOB) -> error 'template_ambiguous_dob'.
+  // The single definition shared by createPublicInstance() (which refuses to
+  // mint on an error) and submitGuestForm() (which fails closed as
+  // 'age_unverifiable' on one), so the two can never disagree.
+  // @return array{field:?array, error:?string, detail:?string}
+  private function resolvePublicDobField(array $fields): array {
+    $dates = array_values(array_filter($fields, static fn(array $f): bool => $f['type'] === 'date'));
+    $marked = array_values(array_filter($dates, static fn(array $f): bool => in_array(str_replace('-', '_', strtolower($f['key'])), self::DOB_FIELD_KEYS, true)));
+    if (count($marked) === 1) return ['field'=>$marked[0], 'error'=>null, 'detail'=>null];
+    if (count($marked) === 0 && count($dates) === 1) return ['field'=>$dates[0], 'error'=>null, 'detail'=>null];
+    if (count($dates) === 0) {
+      return ['field'=>null, 'error'=>'template_missing_dob', 'detail'=>'the published template version has no date-of-birth (type=date) field; public instances are adults-only and must be age-gated'];
+    }
+    return ['field'=>null, 'error'=>'template_ambiguous_dob', 'detail'=>'the published template version has several type=date fields and not exactly one of them is keyed as the date of birth ('.implode(', ', self::DOB_FIELD_KEYS).'); public instances are adults-only and must age-gate on an unambiguous date-of-birth field'];
+  }
+
+  private function evaluateAgeGate(array $fields, array $post, ?array $dobField): array {
     if ($dobField === null) return ['ok'=>true, 'birth_date'=>null, 'computed_age'=>null, 'minor'=>null, 'parental_consent_name'=>null];
 
     $raw = $post[$dobField['key']] ?? null;
@@ -414,7 +1048,10 @@ class WaiverController {
     // [waiver-program D14/T5] wtv.version (the numeric, per-template-published
     // version this instance was minted against) is now selected too, so it can
     // be echoed back on the completion webhook -- see notifyBookingV2Completion.
-    $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.version as form_version, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
+    // [GVS-89 / orchestrator decision] db_now_utc rides along (same as
+    // renderGuestForm's own SELECT) so the submit-time expiry+grace gate
+    // below compares against the DB clock, not this process's clock.
+    $q=$this->db->pdo()->prepare('SELECT wi.*, wtv.id as version_id, wtv.version as form_version, wtv.title, wtv.fields_json, wtv.content_html, wtv.print_css, UTC_TIMESTAMP() AS db_now_utc FROM waiver_instances wi JOIN waiver_template_versions wtv ON wi.template_version_id=wtv.id WHERE link_token=? LIMIT 1');
     $q->execute([$token]); $instance=$q->fetch(); if(!$instance) return ['error'=>'Invalid link'];
     if($instance['status']==='completed') return ['error'=>'Already completed'];
     // [FK-void] Reject a voided instance up front with its own message
@@ -422,6 +1059,24 @@ class WaiverController {
     // the atomic claim below, which already refuses to flip a non-'pending'
     // row to 'completed' regardless of this early check.
     if($instance['status']==='void') return ['error'=>'This waiver link is no longer valid.'];
+    // [GVS-89 / orchestrator decision, 2026-09-19] The render gate
+    // (renderGuestForm/isExpiredPublicInstance) only ever stopped a GET from
+    // showing the form -- a crafted POST straight to this endpoint with an
+    // expired public token still completed the waiver (flagged as an open
+    // gap by the 89-M4.1/M4.2 report). Refuse a submit whose PUBLIC instance
+    // is older than expires_at + a 60-minute grace, with the SAME 410
+    // semantics/message as the render gate, BEFORE any age-gate/claim/file
+    // I/O -- a completed/void instance above still gets ITS OWN message
+    // (checked first), never masked by this. Within the grace window a
+    // person who opened the form before expiry can still submit -- see
+    // isSubmitExpiredPublicInstance()'s doc comment for why this is a
+    // SEPARATE method from the render gate rather than a parameterized one.
+    // [gate 89-M4 P2-3] Same result shape as the render gate (incl.
+    // error_title + locale), so w.php shows the identical localized 410 page
+    // for a late POST as for a late GET.
+    if ($this->isSubmitExpiredPublicInstance($instance)) {
+      return self::publicExpiredResult(isset($instance['locale']) ? (string)$instance['locale'] : null);
+    }
     $fields=$this->normalizeFields($instance['fields_json']); $answers=[];
     foreach($fields as $f){
       $key=$f['key']; $val=$post[$key]??null;
@@ -444,9 +1099,62 @@ class WaiverController {
 
     // [FK-T10 / Gap4] Age-gate BEFORE the atomic completed-status claim and
     // BEFORE any completion webhook: a failure here must flip nothing.
-    $ageGate = $this->evaluateAgeGate($fields, $post);
+    // [gate 89-M4 r2 P1] WHICH field is the date of birth: on a PUBLIC
+    // instance it is resolved strictly (resolvePublicDobField -- an
+    // explicitly keyed DOB field, or the template's ONLY date field; a missing
+    // or ambiguous one yields null, which fails closed as 'age_unverifiable'
+    // below). A reservation-bound instance keeps its unchanged rule (the
+    // first type=date field -- see firstDateField()).
+    $isPublicInstance = !empty($instance['is_public']);
+    $dobField = $isPublicInstance ? $this->resolvePublicDobField($fields)['field'] : $this->firstDateField($fields);
+    $ageGate = $this->evaluateAgeGate($fields, $post, $dobField);
+    // [GVS-89 / 89-M4.3 / AC4] Adults-only on a PUBLIC (reception-QR)
+    // instance (operator decision Q12, reconfirmed 2026-09-19): the
+    // reception-QR flow has no guardian workflow -- there is no staff member
+    // physically adding a minor participant here, just a walk-in scanning a
+    // standing QR alone -- so a signer under 18 is NEVER signable on a public
+    // instance, not even the case evaluateAgeGate() would otherwise ACCEPT
+    // (age 7-17 with a filled parental-consent field). Uniformly relabel
+    // every "signer is under 18" outcome -- the <7 hard reject, the
+    // missing-parental-consent reject, and the accept-with-consent case -- as
+    // 'minor_requires_staff' and stop here, BEFORE any claim/notify (no
+    // waiver_responses row, no webhook). Genuine input-format errors (missing
+    // DOB, unparsable date, future date) are left untouched so a guest
+    // fixing a typo still gets useful feedback.
+    //
+    // [gate 89-M4 P1] FAIL CLOSED when the age cannot be computed at all:
+    // evaluateAgeGate() passes with computed_age=null when there is no DOB
+    // field to gate on (none, or -- r2 -- no unambiguous one). On a public
+    // instance that would silently disable adults-only (and yield a
+    // completion BookingV2's public ingest rejects, since it requires an
+    // integer computed_age), so refuse it as 'age_unverifiable' -- same
+    // no-claim/no-notify position as the minor refusal. create_public_instance
+    // already refuses such templates; this covers a template edited after the
+    // instance was minted.
+    if ($isPublicInstance) {
+      if (!$ageGate['ok'] && in_array($ageGate['error'], ['age_below_minimum', 'minor_parental_consent_missing'], true)) {
+        $ageGate = ['ok'=>false, 'error'=>'minor_requires_staff'];
+      } elseif ($ageGate['ok'] && $ageGate['computed_age'] === null) {
+        $ageGate = ['ok'=>false, 'error'=>'age_unverifiable'];
+      } elseif ($ageGate['ok'] && $ageGate['computed_age'] < 18) {
+        $ageGate = ['ok'=>false, 'error'=>'minor_requires_staff'];
+      }
+    }
     if (!$ageGate['ok']) {
       $this->audit('instance', (int)$instance['id'], 'age_gate_rejected', ['reason'=>$ageGate['error']]);
+      if ($ageGate['error'] === 'minor_requires_staff') {
+        // Localized, guest-facing copy (not the bare error code): w.php's
+        // existing fallback re-renders the form with this text in the
+        // generic error banner -- the SAME path every other validation
+        // rejection here already takes -- so no template change is needed
+        // there. See publicMinorStaffCopy()'s doc comment.
+        $copy = self::publicMinorStaffCopy(isset($instance['locale']) ? (string)$instance['locale'] : null);
+        return ['error'=>$copy['message'], 'error_code'=>'minor_requires_staff'];
+      }
+      if ($ageGate['error'] === 'age_unverifiable') {
+        $copy = self::publicAgeUnverifiableCopy(isset($instance['locale']) ? (string)$instance['locale'] : null);
+        return ['error'=>$copy['message'], 'error_code'=>'age_unverifiable'];
+      }
       return ['error'=>$ageGate['error']];
     }
     if ($ageGate['computed_age'] !== null) {
@@ -467,9 +1175,74 @@ class WaiverController {
     $claim->execute([$instance['id']]);
     if($claim->rowCount()===0) return ['error'=>'Already completed'];
 
+    // [GVS-89 / gate 89-M4 r2 P1] SERIALIZED AGAINST GDPR ERASURE, exactly
+    // like resendEvidence(): from here on this request pushes the signed
+    // evidence OUT of this system (uploadEvidence -> BookingV2's blob store)
+    // and then records it (the waiver_responses INSERT and its pointers), and
+    // there is no foreign key from waiver_responses to waiver_instances. An
+    // eraseWaiver() interleaving with that sequence would leave a blob at
+    // BookingV2 with no pointer anywhere and/or a waiver_responses row (full
+    // PII) for an instance that no longer exists -- unreachable by any later
+    // erasure. So the rest of the submission runs under the SAME per-instance
+    // evidence lock, held until it returns (incl. the completion webhook, so
+    // once an erase answers ok nothing about the instance is still in flight
+    // to BookingV2).
+    //
+    // Taken AFTER the claim, so a double-submit still loses fast on the claim
+    // and never waits here. A SHORT wait (SUBMIT_EVIDENCE_LOCK_WAIT_SECONDS),
+    // not resend's zero: the usual holder is an erase transaction or a resend
+    // that finds nothing to push (both milliseconds), and waiting them out
+    // lets the re-read below see the authoritative state -- erased: stop,
+    // nothing uploaded or written; still ours: proceed fully serialized. It is
+    // bounded because a guest's POST must not hang behind an erase that is
+    // itself waiting on OTHER instances' locks. If the lock still cannot be
+    // taken the waiver is COMPLETED anyway (the signature is never lost) but
+    // WITHOUT the upload: the evidence is retained locally with its pointers
+    // (the same state as a relay outage) for resend_evidence / reconcile to
+    // push later under the lock.
+    $instanceId=(int)$instance['id'];
+    try {
+      $evidenceLocked=$this->acquireEvidenceLock($instanceId, $this->evidenceLockWaitSeconds('submit_wait_seconds', self::SUBMIT_EVIDENCE_LOCK_WAIT_SECONDS));
+    } catch (\Throwable $lockEx) {
+      // The claim above is already committed: a throw escaping here would
+      // strand the instance 'completed' with no response. Treat it as "not
+      // acquired"; if the DB is really gone, the persist step below fails
+      // into its catch, which reverts the claim and logs.
+      $evidenceLocked=false;
+    }
+    try {
+      return $this->persistClaimedSubmission($instance, $post, $answers, $ageGate, $png, $evidenceLocked);
+    } finally {
+      if ($evidenceLocked) $this->releaseEvidenceLock($instanceId);
+    }
+  }
+
+  // [gate 89-M4 r3, TEST SEAM] No-op in production. Called once by
+  // persistClaimedSubmission() right after its guarded commit, before the
+  // completion webhook / audit that follow on the lock-busy fallback. Exists
+  // SOLELY so tests/WaiverControllerPublicTest.php can deterministically run
+  // a bypass-the-lock deletion (via an anonymous subclass override) at that
+  // exact point, instead of racing real wall-clock timing against a second
+  // process. WaiverController is intentionally not `final` for this reason;
+  // no production code may override it.
+  protected function afterSubmitCommitForTesting(int $instanceId): void {}
+
+  // submitGuestForm()'s post-claim half: render + upload the evidence, persist
+  // the response, notify BookingV2. Runs with the instance's evidence lock
+  // held when $evidenceLocked (see the caller); without it the upload is
+  // skipped and the evidence is left to resend_evidence.
+  private function persistClaimedSubmission(array $instance, array $post, array $answers, array $ageGate, string $png, bool $evidenceLocked): array {
+    $pdo=$this->db->pdo();
     $sigDir=$this->cfg['storage']['signatures_path']; if(!is_dir($sigDir)) @mkdir($sigDir,0775,true);
     $sigFile=$sigDir.'/'.Utils::randomToken(16).'.png'; $artifact=null;
     try {
+      // [gate 89-M4 r2 P1] Re-read after the lock attempt: an erase that ran
+      // between the claim and here has deleted the row. Nothing has been
+      // written or uploaded yet -- stop, exactly as for an unknown token.
+      $alive=$pdo->prepare("SELECT 1 FROM waiver_instances WHERE id=? AND status='completed'");
+      $alive->execute([(int)$instance['id']]);
+      if(!$alive->fetchColumn()) return ['error'=>'Invalid link'];
+
       file_put_contents($sigFile,$png);
       $signedAt=gmdate('c'); $payload=[ 'template_version_id'=>(int)$instance['version_id'], 'instance_id'=>(int)$instance['id'], 'answers'=>$answers, 'signed_at'=>$signedAt, 'signer_ip'=>$_SERVER['REMOTE_ADDR']??null, 'ua'=>$_SERVER['HTTP_USER_AGENT']??null ];
       $hash=hash('sha256', json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES));
@@ -494,7 +1267,13 @@ class WaiverController {
       // at locally going forward) and evidence_sha256/evidence_object_key are
       // ready to hand to notifyBookingV2Completion. Upload failures are
       // swallowed here (logged, non-blocking) -- see uploadEvidence() doc.
-      $evidence = $this->uploadEvidence($instance, $artifact, $sigFile);
+      // [gate 89-M4 r2 P1] ONLY under the evidence lock: without it an erase
+      // could be deleting this instance right now, and a blob pushed now
+      // would outlive it. Skipped otherwise -- the evidence is then retained
+      // locally below (pointers persisted) for resend_evidence to push later.
+      $evidence = $evidenceLocked
+        ? $this->uploadEvidence($instance, $artifact, $sigFile)
+        : ['evidence_sha256'=>null, 'evidence_object_key'=>null, 'evidence_blob_key'=>null, 'evidence_blob_url'=>null];
       // [FK-evidence-keep] One full retry of the relay before giving up: a
       // transient failure (BookingV2 cold start, brief network blip) that
       // outlives postSignedEnvelopeWithResponse's inline 3-attempt budget
@@ -505,7 +1284,7 @@ class WaiverController {
       // one. When the relay is unconfigured or the artifact is unreadable
       // the retry is a near-instant no-op (uploadEvidence short-circuits),
       // so this adds latency only in the genuinely-degraded case.
-      if ($evidence['evidence_object_key'] === null) {
+      if ($evidenceLocked && $evidence['evidence_object_key'] === null) {
         $evidence = $this->uploadEvidence($instance, $artifact, $sigFile);
       }
 
@@ -524,6 +1303,15 @@ class WaiverController {
       // the erase reports success. A stale path after manual backfill/removal
       // is harmless: erase's unlink is is_file()-guarded.
       $retained = $evidence['evidence_object_key'] === null;
+      // [gate 89-M4 r3 P2-2 fix] Precompute the retained-evidence audit
+      // metadata now (it needs only $artifact/$sigFile/$evidenceLocked,
+      // already known) so the INSERT below can happen INSIDE the guarded
+      // transaction -- see the comment at that INSERT for why.
+      $retainedMeta = null;
+      if ($retained) {
+        $retainedMeta = ['pdf_path'=>$artifact, 'signature_path'=>$sigFile];
+        if (!$evidenceLocked) $retainedMeta['deferred'] = 'evidence_lock_busy';
+      }
       // [T5 / migrations/005_evidence_fields.sql] Persist the evidence
       // identifiers uploadEvidence() returned -- previously computed/received
       // and then dropped (the "KEY DISCOVERY": the fork never persisted
@@ -555,11 +1343,44 @@ class WaiverController {
       // open across HTTP I/O and the completion webhook still fires strictly
       // AFTER a durable commit.
       $pdo->beginTransaction();
+      $vanished = false;
       try {
         $stmt=$pdo->prepare('INSERT INTO waiver_responses (waiver_instance_id, answers_json, signature_png, signer_full_name, signed_at, signer_ip, signer_user_agent, hash_sha256, pdf_path, signature_path, evidence_sha256, evidence_object_key, evidence_blob_key, evidence_blob_url, created_at) VALUES (?,?,?,?,UTC_TIMESTAMP(),?,?,?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())');
         $stmt->execute([$instance['id'], json_encode($answers, JSON_UNESCAPED_UNICODE), $png, $post['full_name']??null, $_SERVER['REMOTE_ADDR']??null, $_SERVER['HTTP_USER_AGENT']??null, $hash, $retained ? $artifact : null, $retained ? $sigFile : null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $evidence['evidence_blob_key'], $evidence['evidence_blob_url']]);
         $this->audit('response', $instance['id'], 'submitted', $payload);
-        $pdo->commit();
+        // [gate 89-M4 r3 P2-2 fix / Codex r3 P1-1] Write the retained-evidence
+        // bookkeeping audit row HERE, inside the SAME guarded transaction as
+        // the response row, instead of afterwards (unlocked, past the commit
+        // point) as before. Rationale: this row is only ever written on the
+        // lock-busy fallback (no upload attempted), which is exactly the one
+        // case where nothing serializes this request against a concurrent
+        // erase. Writing it post-commit meant it could still be INSERTed
+        // after an erase had already deleted this instance's audit trail --
+        // a fresh, un-erasable orphan row (paths only, no PII, but an
+        // erasure-completeness gap). Putting it here ties its fate to the
+        // SAME $still check and rollback as the response row below: if the
+        // instance vanished, this row is rolled back with everything else and
+        // never exists to begin with.
+        if ($retainedMeta !== null) {
+          $this->audit('instance', (int)$instance['id'], 'evidence_retained_locally', $retainedMeta);
+        }
+        // [gate 89-M4 r2 P1] Commit ONLY if the instance is still ours, and
+        // pin it (row lock) until the commit. There is no FK from
+        // waiver_responses to waiver_instances, so without this a deletion
+        // that did not take the evidence lock (the lock-busy path above, or
+        // manual SQL) would leave this PII-bearing row and its audit event
+        // orphaned, unreachable by any erasure. Checked AFTER the inserts, in
+        // eraseWaiver's own lock order (responses -> audit -> instance), so a
+        // concurrent erase serializes with this transaction instead of
+        // deadlocking against it.
+        $still=$pdo->prepare("SELECT 1 FROM waiver_instances WHERE id=? AND status='completed' FOR UPDATE");
+        $still->execute([$instance['id']]);
+        if ($still->fetchColumn()) {
+          $pdo->commit();
+        } else {
+          $pdo->rollBack();
+          $vanished = true;
+        }
       } catch (\Throwable $txEx) {
         // Roll the INSERT back (mirrors eraseWaiver's transaction pattern) so no
         // orphan row survives, then re-throw into the outer catch, which reverts
@@ -567,6 +1388,45 @@ class WaiverController {
         if ($pdo->inTransaction()) $pdo->rollBack();
         throw $txEx;
       }
+      if ($vanished) {
+        // Erased mid-submit: nothing of this submission may survive it --
+        // no row (rolled back above), no local files, no webhook, no audit
+        // (it would be an orphan). Same answer as for an unknown token.
+        error_log('[WAIVER-SUBMIT-ERASED] waiver_instance_id='.(int)$instance['id'].' vanished before its response committed (erased mid-submit); nothing persisted');
+        // [gate 89-M4 r3 Codex P1-2 fix] If the upload ALREADY succeeded
+        // (evidence_object_key non-null) before this rollback, BookingV2's
+        // evidence relay is now holding a real blob with NO fork-side pointer
+        // to it (the row that would have carried evidence_object_key was just
+        // rolled back). This fork has no credentials or endpoint to delete a
+        // BookingV2 blob -- it cannot compensate the upload -- so the two
+        // things it CAN do are: never claim the upload succeeded in any
+        // return value or persisted row (it does not, above), and leave an
+        // opaque, non-PII trace of the orphan so it is not silently
+        // unaccounted for. The blob itself is NOT permanently unreachable:
+        // BookingV2's erasure sweep deletes the WHOLE public/<signupId>/ (or
+        // equivalent) object-store PREFIX for this instance independent of
+        // any pointer this fork ever recorded (89-M3.1,
+        // waiver-erasure-worker.ts's listPublicSignupEvidence), so it is
+        // reclaimed once BookingV2 next erases/sweeps this subject -- this
+        // log line is only the fork-side breadcrumb until then.
+        if ($evidence['evidence_object_key'] !== null) {
+          error_log('[WAIVER-EVIDENCE-ORPHANED] waiver_instance_id='.(int)$instance['id']
+            .' evidence_object_key='.$evidence['evidence_object_key']
+            .' uploaded to BookingV2 before the instance vanished mid-submit; no fork-side'
+            .' pointer was persisted (rolled back) -- relies on BookingV2\'s erasure/sweep'
+            .' of this subject\'s object-store prefix (89-M3.1) to reclaim it');
+        }
+        if(is_file($sigFile)) @unlink($sigFile);
+        if($artifact && is_file($artifact)) @unlink($artifact);
+        return ['error'=>'Invalid link'];
+      }
+
+      // [gate 89-M4 r3, TEST SEAM] No-op in production; exists ONLY so a test
+      // can deterministically land a concurrent mutation (e.g. an erase that
+      // bypasses the evidence lock) in the otherwise-timing-dependent gap
+      // between the guarded commit above and the webhook/audit below, without
+      // a flaky real-clock race. Never overridden outside tests.
+      $this->afterSubmitCommitForTesting((int)$instance['id']);
 
       // [FK-T8] Fire the outbound completion webhook to BookingV2 ONLY here --
       // after the completed-status claim above succeeded AND the
@@ -576,7 +1436,31 @@ class WaiverController {
       // "pending"). A failed delivery is logged (webhook_failed audit row)
       // and left to the reconciliation sweep (spec G1c) -- never retried by
       // reverting the instance.
-      $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $hash);
+      //
+      // [gate 89-M4 r3 P2-2 fix / Codex r3 P1-1] When this submission held the
+      // evidence lock all the way through the commit above ($evidenceLocked),
+      // no erase of THIS instance could have started in the meantime (erase
+      // needs the same lock BEFORE it opens its own transaction) -- send
+      // unconditionally, exactly as before. On the LOCK-BUSY fallback
+      // ($evidenceLocked === false) nothing has serialized this request
+      // against a concurrent erase since the claim, so re-check existence
+      // IMMEDIATELY before sending: an erase that bypassed the busy lock (or
+      // ran once the original holder released it) between the commit above
+      // and here must not be followed by a completion webhook carrying full
+      // PII (name, DOB, answers) for an instance whose erasure has already
+      // been reported done -- and reconcile/get_status (spec G1c) already
+      // recovers a genuine completion the erase merely raced past.
+      if ($evidenceLocked) {
+        $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $hash);
+      } else {
+        $stillForWebhook = $pdo->prepare("SELECT 1 FROM waiver_instances WHERE id=? AND status='completed'");
+        $stillForWebhook->execute([$instance['id']]);
+        if ($stillForWebhook->fetchColumn()) {
+          $this->notifyBookingV2Completion($instance, $ageGate, $answers, $post['full_name']??null, $evidence['evidence_sha256'], $evidence['evidence_object_key'], $hash);
+        } else {
+          error_log('[WAIVER-WEBHOOK-SKIPPED-ERASED] waiver_instance_id='.(int)$instance['id'].' erased between the guarded commit and the deferred completion webhook; not notifying BookingV2 (reconcile/get_status covers a genuine completion)');
+        }
+      }
     } catch (\Throwable $e) {
       // [post-incident 2026-08-30] Make this failure VISIBLE and traceable
       // without ever leaking guest PII. The 16h outage was a swallowed DB error
@@ -676,13 +1560,14 @@ class WaiverController {
         .' -- keeping local files: pdf='.($artifact !== null ? $artifact : '(none)')
         .' signature='.$sigFile
         .' (back-fill via reconciliation/manual re-upload, then remove)');
-      // Mirror the relay-failure trail in audit_events (the file's standard
-      // error channel) so the retained paths are queryable, not just grep-able
-      // in container logs. Swallow any failure: this bookkeeping must never
-      // turn a successfully-completed submission into a guest-facing error.
-      try {
-        $this->audit('instance', (int)$instance['id'], 'evidence_retained_locally', ['pdf_path'=>$artifact, 'signature_path'=>$sigFile]);
-      } catch (\Throwable $e) { /* best-effort only */ }
+      // [gate 89-M4 r3 P2-2 fix] The 'evidence_retained_locally' audit row
+      // itself was ALREADY written above, inside the guarded transaction
+      // alongside the response row (see the comment there) -- not here.
+      // Writing it again here would double it, and doing it here at all was
+      // the P2-2 gap: unlocked, well after the commit, it could still land
+      // after a concurrent erase had already purged this instance's audit
+      // trail, leaving an orphan. This branch now only logs (non-PII,
+      // container-log-only bookkeeping for the retained files).
     }
 
     return ['ok'=>true,'artifact'=>$artifact];
@@ -891,9 +1776,18 @@ class WaiverController {
       // completion on this).
       $waiverInstanceId = (int)$instance['id'];
       $linkToken = (string)$instance['link_token'];
+      // [GVS-89 §7.0] A PUBLIC (reception-QR) completion notifies a DISTINCT
+      // BookingV2 route under a distinct event name, with signup_token
+      // (≡ link_token on the wire) ADDED -- see the URL/body-completion
+      // below. The four binding-id fields already come out null for a
+      // public instance (its row never carries them -- createPublicInstance
+      // inserts them NULL and they are never set afterwards), so nothing
+      // needs to be REMOVED to satisfy BookingV2's
+      // PublicCompletionFieldsSchema; only signup_token needs adding.
+      $isPublic = !empty($instance['is_public']);
 
       $body = [
-        'event' => 'waiver.completed',
+        'event' => $isPublic ? 'waiver.public_completed' : 'waiver.completed',
         'idempotency_key' => 'wvr-'.$waiverInstanceId.'-'.$linkToken,
         'waiver_instance_id' => $waiverInstanceId,
         'link_token' => $linkToken,
@@ -921,6 +1815,24 @@ class WaiverController {
         // to a published waiver_template_versions row at createInstance time).
         'form_version' => isset($instance['form_version']) ? (int)$instance['form_version'] : null,
       ];
+      // [GVS-89 §7.0] signup_token is the ONE field ADDED for a public
+      // completion (equal to link_token on the wire -- BookingV2 resolves
+      // the waiver_public_signups row by it). Added last so the base body
+      // above stays byte-identical to the reservation-bound shape apart from
+      // 'event' and this one key.
+      if ($isPublic) {
+        $body['signup_token'] = $linkToken;
+        // [gate 89-M4 Grok P2 / Codex P2] The contract says a public
+        // completion carries NO binding. The row never gets one by
+        // construction (createPublicInstance inserts NULLs; link_waivers now
+        // skips public instances), and -- like publicStatus() -- the wire
+        // guarantee is enforced here too, so a hand-edited row can never make
+        // BookingV2's public ingest (which rejects any binding) refuse this
+        // completion.
+        foreach (['reservation_id', 'booking_group_id', 'participant_id', 'customer_id'] as $bindingKey) {
+          $body[$bindingKey] = null;
+        }
+      }
       // [Gap3] waiver_consent_granted is a Wave-2 field: the fork's current
       // form has no consent checkbox on most templates, so this key is
       // included ONLY when the guest actually ticked one (present === true).
@@ -931,7 +1843,11 @@ class WaiverController {
       }
 
       $rawBody = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-      $url = rtrim((string)$cb['base_url'], '/').'/api/waiver/complete';
+      // [GVS-89 §7.0] A public completion posts to a DISTINCT route
+      // (BookingV2's PublicCompletionFieldsSchema / applyPublicWaiverCompletion)
+      // so the two ingestion paths can never be confused server-side even if
+      // 'event' were somehow lost.
+      $url = rtrim((string)$cb['base_url'], '/').($isPublic ? '/api/waiver/public-complete' : '/api/waiver/complete');
 
       $ok = $this->postSignedEnvelope($url, $rawBody, (string)$cb['outbound_key_id'], (string)$cb['outbound_secret']);
       if (!$ok) {
@@ -953,14 +1869,22 @@ class WaiverController {
     if(empty($waiverIds) && !$groupToken) return ['error'=>'Provide waiver_ids or group_token'];
     // 'void' instances are NEVER eligible; pending only when include_pending=true.
     $statusClause=' AND status IN ("completed"'.($includePending?',"pending"':'').')';
+    // [GVS-89 / gate 89-M4 Grok+Codex P2] PUBLIC (reception-QR) instances are
+    // NEVER eligible either: a public instance carries no reservation binding
+    // by contract (its completion goes to BookingV2's public ingest, which
+    // rejects any binding, and BookingV2 attaches it by email instead).
+    // Silently skipped, exactly like a void instance. Filtered in PHP via
+    // SELECT * (is_public read only if present) so this path never depends on
+    // migrations/006_public_instances.sql having landed.
     if($groupToken){
-      $sql='SELECT id FROM waiver_instances WHERE group_token=?'.$statusClause;
-      $sel=$this->db->pdo()->prepare($sql); $sel->execute([$groupToken]); $ids=array_column($sel->fetchAll(),'id');
+      $sql='SELECT * FROM waiver_instances WHERE group_token=?'.$statusClause;
+      $sel=$this->db->pdo()->prepare($sql); $sel->execute([$groupToken]); $rows=$sel->fetchAll();
     } else {
       $ids=array_values(array_filter(array_map('intval',$waiverIds))); if(!$ids) return ['error'=>'No valid waiver_ids'];
-      $in=implode(',',array_fill(0,count($ids),'?')); $sql='SELECT id FROM waiver_instances WHERE id IN ('.$in.')'.$statusClause;
-      $sel=$this->db->pdo()->prepare($sql); $sel->execute($ids); $ids=array_column($sel->fetchAll(),'id');
+      $in=implode(',',array_fill(0,count($ids),'?')); $sql='SELECT * FROM waiver_instances WHERE id IN ('.$in.')'.$statusClause;
+      $sel=$this->db->pdo()->prepare($sql); $sel->execute($ids); $rows=$sel->fetchAll();
     }
+    $ids=array_column(array_values(array_filter($rows, static fn(array $r): bool => empty($r['is_public']))),'id');
     if(!$ids) return ['updated'=>0,'ids'=>[]];
     $in=implode(',',array_fill(0,count($ids),'?')); $upd=$this->db->pdo()->prepare('UPDATE waiver_instances SET reservation_id=?, updated_at=UTC_TIMESTAMP() WHERE id IN ('.$in.')'); $upd->execute(array_merge([$reservationId],$ids));
     foreach($ids as $id){ $this->audit('instance',(int)$id,'linked_to_reservation',['reservation_id'=>$reservationId]); }
@@ -1077,6 +2001,76 @@ class WaiverController {
       return ['instances_deleted'=>0, 'responses_deleted'=>0, 'files_deleted'=>0, 'audit_events_deleted'=>0];
     }
 
+    // [GVS-89 / gate 89-M4 P1] Serialize against resend_evidence (and, r2,
+    // against submitGuestForm's first upload + record): take EVERY
+    // matched instance's evidence lock (ascending id order, all BEFORE the
+    // transaction opens, so a waiting erase holds no row locks a resend could
+    // need -- no deadlock) and keep them until the erasure has committed.
+    // Guarantees: (1) no resend/submit upload is in flight while we erase -- if one
+    // is, we wait for it to finish recording (or give up, below), and then
+    // erase what it left; (2) once this returns success, no resend or submit for these
+    // instances can START (each re-reads under the same lock and finds no row).
+    // That is what lets BookingV2 run "fork erase_waiver FIRST, then delete
+    // the evidence blobs" with nothing able to re-create a blob afterwards.
+    // If a resend holds a lock past ERASE_EVIDENCE_LOCK_WAIT_SECONDS, NOTHING
+    // is deleted and {error:'evidence_busy'} (503) is returned: a transient
+    // refusal the erasure worker retries, never a partial erasure.
+    $locked = [];
+    try {
+      $lockWait = $this->evidenceLockWaitSeconds('erase_wait_seconds', self::ERASE_EVIDENCE_LOCK_WAIT_SECONDS);
+      foreach ($instanceIds as $id) {
+        if (!$this->acquireEvidenceLock($id, $lockWait)) {
+          return ['error'=>'evidence_busy'];
+        }
+        $locked[] = $id;
+      }
+      return $this->eraseLockedInstances($pdo, $instanceIds);
+    } finally {
+      foreach ($locked as $id) $this->releaseEvidenceLock($id);
+    }
+  }
+
+  // [gate 89-M4 r3, TEST SEAM] No-op in production. See the call site inside
+  // eraseLockedInstances() for what it is for; WaiverController is
+  // intentionally not `final` for this and afterSubmitCommitForTesting()
+  // above. $paths is the FOR UPDATE read's own fetchAll() result (a list of
+  // ['pdf_path'=>..., 'signature_path'=>...] rows) for this chunk. $pdo is
+  // erase's OWN connection/open transaction -- passed through so a test can
+  // deterministically inject a same-transaction state change between this
+  // read and the DELETE below (proving the rowCount-mismatch guard fires)
+  // without needing a genuinely separate, precisely-timed session.
+  protected function afterErasePathsReadForTesting(array $instanceIds, array $paths, \PDO $pdo): void {}
+
+  // eraseWaiver()'s delete phase, run only while every instance's evidence
+  // lock is held (see there).
+  private function eraseLockedInstances(\PDO $pdo, array $instanceIds): array {
+    // [gate 89-M4 r3 P2-1 fix] Pin the isolation level before opening this
+    // transaction. The "an unlocked writer either commits first (and its
+    // files are seen by the FOR UPDATE read below) or waits for this erasure
+    // to finish" guarantee this method's own comments rest on depends on
+    // REPEATABLE READ's gap locking: under READ COMMITTED, a
+    // `SELECT ... FOR UPDATE` over a waiver_instance_id with NO current
+    // response row takes no gap lock, so a concurrent unlocked submit's
+    // INSERT could land, commit, and then be removed by the DELETE below (a
+    // current read) with its retained files never seen by the paths-read
+    // above -- stranding them on disk while this erasure still reports
+    // success. MySQL defaults to REPEATABLE READ, but nothing before this
+    // pinned it, so a host configured with transaction_isolation=READ-
+    // COMMITTED would silently lose the guarantee.
+    //
+    // `SET TRANSACTION ISOLATION LEVEL` with neither GLOBAL nor SESSION is
+    // documented as a "next transaction only" pin, but verified empirically
+    // against this fork's MySQL 8.0.46 (both via PDO and the mysql CLI,
+    // several ways) NOT to take effect: `@@transaction_isolation` read
+    // inside the very next START TRANSACTION/COMMIT still shows the prior
+    // session default, every time. `SET SESSION TRANSACTION ISOLATION
+    // LEVEL`, verified to work reliably the same way, is used instead. It
+    // pins this CONNECTION for the rest of its life, not just this one
+    // transaction -- harmless here: `Database::pdo()` is one short-lived,
+    // non-persistent PDO connection per HTTP request (never pooled/reused
+    // across requests), and this method's caller (eraseWaiver) is the last
+    // and only transactional action such a request ever runs.
+    $pdo->exec('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
     $pdo->beginTransaction();
     try {
       $filesDeleted = 0;
@@ -1092,9 +2086,23 @@ class WaiverController {
         $in = implode(',', array_fill(0, count($chunk), '?'));
 
         // Fetch file paths BEFORE deleting the rows that reference them.
-        $pathsQ = $pdo->prepare('SELECT pdf_path, signature_path FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
+        // [gate 89-M4 r2] A LOCKING read (FOR UPDATE), not a snapshot: a
+        // response row a writer that does not hold the evidence lock (a
+        // submit on its lock-busy path) commits after this read would
+        // otherwise still be removed by the DELETE below -- which reads
+        // current data -- while its retained files, never seen here, stay
+        // on disk unreferenced. Locking makes such a writer either commit
+        // first (and be seen here) or wait for this erasure to finish.
+        $pathsQ = $pdo->prepare('SELECT pdf_path, signature_path FROM waiver_responses WHERE waiver_instance_id IN ('.$in.') FOR UPDATE');
         $pathsQ->execute($chunk);
         $paths = $pathsQ->fetchAll();
+
+        // [gate 89-M4 r3, TEST SEAM] No-op in production. Lets a test land a
+        // concurrent, genuinely-separate-session write inside the exact
+        // window this method's isolation-level pin (above) and rowCount
+        // assertion (below) both exist to guard, deterministically instead
+        // of racing real wall-clock timing. Never overridden outside tests.
+        $this->afterErasePathsReadForTesting($chunk, $paths, $pdo);
 
         foreach ($paths as $row) {
           foreach (['pdf_path', 'signature_path'] as $col) {
@@ -1110,7 +2118,29 @@ class WaiverController {
         // unlink above, is what removes that PII from the DB).
         $delResp = $pdo->prepare('DELETE FROM waiver_responses WHERE waiver_instance_id IN ('.$in.')');
         $delResp->execute($chunk);
-        $responsesDeleted += $delResp->rowCount();
+        $chunkResponsesDeleted = $delResp->rowCount();
+        $responsesDeleted += $chunkResponsesDeleted;
+        // [gate 89-M4 r3 P2-1 fix] Assert the DELETE removed EXACTLY the rows
+        // whose paths were just read (and, above, unlinked) -- not more, not
+        // fewer. Within one transaction and one connection, a row this
+        // erasure's own FOR UPDATE read already locked or gap-locked cannot
+        // gain or lose siblings before this DELETE runs, so a mismatch means
+        // the isolation-level guarantee this method's safety analysis rests
+        // on did not hold here (e.g. a pooler/proxy silently overrode the
+        // SET TRANSACTION ISOLATION LEVEL above, or a future refactor
+        // reorders these two statements) -- exactly the scenario that can
+        // strand a signed PDF on disk while this call still reports success.
+        // Fail LOUD and abort the whole erasure (rolled back below) for the
+        // caller to retry, rather than silently report success over a
+        // possible stranded-file gap.
+        if ($chunkResponsesDeleted !== count($paths)) {
+          error_log('[WAIVER-ERASE-PATHS-MISMATCH] instance_ids='.implode(',', $chunk)
+            .' paths_read='.count($paths).' responses_deleted='.$chunkResponsesDeleted
+            .' -- aborting this erase for retry (see eraseLockedInstances doc comment)');
+          throw new \RuntimeException('erase paths/rows mismatch: read '.count($paths)
+            .' response path row(s) for waiver_instance_id IN ('.implode(',', $chunk).') but deleted '
+            .$chunkResponsesDeleted.' -- see the preceding [WAIVER-ERASE-PATHS-MISMATCH] log line');
+        }
 
         // [W2 / audit_events PII] Delete every audit_events row keyed to
         // these instances -- entity_type IN ('instance','response') with

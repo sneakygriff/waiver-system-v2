@@ -19,25 +19,41 @@ require $ROOT.'/vendor/autoload.php';
 // fresh bootstrap these are BASELINED (marked applied, executed nothing) --
 // executing their ALTERs would raise "Duplicate column". BUMP THIS whenever a
 // new migration's DDL is folded into 001_init.sql. (Finding #3.)
-const MAX_BAKED_MIGRATION = '005_evidence_fields';
+// [GVS-89] Bumped 005 -> 006: 006_public_instances.sql's columns + index are
+// baked into 001_init.sql's waiver_instances.
+const MAX_BAKED_MIGRATION = '006_public_instances';
 
-// The COMPLETE set of columns that PROVE MAX_BAKED_MIGRATION's DDL physically
-// landed in the schema. BUMP THIS TOGETHER WITH MAX_BAKED_MIGRATION: list EVERY
-// column that migration adds (005_evidence_fields.sql adds all four below to
-// waiver_responses). The post-migrate schema assertion further down requires
-// ALL of them to exist as belt-and-suspenders, so a "complete ledger but hollow
-// schema" -- a lying ledger, a truncated multi-statement 001_init exec, or a
-// PARTIALLY-applied 005 (some columns present, others not) -- fails LOUD at
-// deploy time (exit 1) instead of re-shipping the incident. Asserting only ONE
-// representative column was insufficient: a partial-005 schema with just that
-// one column present would PASS the guard while every save (INSERT/get_status
-// touch all four) still fails. (Findings: Grok New #3; Codex re-gate P1 #2.)
-const MAX_BAKED_ASSERT_TABLE   = 'waiver_responses';
-const MAX_BAKED_ASSERT_COLUMNS = [
-  'evidence_sha256',
-  'evidence_object_key',
-  'evidence_blob_key',
-  'evidence_blob_url',
+// The COMPLETE set of columns, PER TABLE, that PROVE the baked migrations' DDL
+// physically landed in the schema. EXTEND THIS TOGETHER WITH
+// MAX_BAKED_MIGRATION: list EVERY column each baked column-adding migration
+// adds. The post-migrate schema assertion further down requires ALL of them to
+// exist as belt-and-suspenders, so a "complete ledger but hollow schema" -- a
+// lying ledger, a truncated multi-statement 001_init exec, or a
+// PARTIALLY-applied migration (some columns present, others not) -- fails LOUD
+// at deploy time (exit 1) instead of re-shipping the incident. Asserting only
+// ONE representative column was insufficient: a partial-005 schema with just
+// that one column present would PASS the guard while every save (INSERT/
+// get_status touch all four) still fails. (Findings: Grok New #3; Codex re-gate
+// P1 #2.)
+// [GVS-89] A table => columns MAP (was a single table): bumping
+// MAX_BAKED_MIGRATION to 006 must NOT drop 005's contract from the assertion --
+// the 16h incident was exactly a schema missing 005's columns -- so BOTH
+// migrations' columns stay asserted. 006's three columns are read by
+// create_public_instance / public_status and by the w.php public-expiry gate.
+const BAKED_ASSERT_COLUMNS = [
+  // 005_evidence_fields.sql
+  'waiver_responses' => [
+    'evidence_sha256',
+    'evidence_object_key',
+    'evidence_blob_key',
+    'evidence_blob_url',
+  ],
+  // 006_public_instances.sql
+  'waiver_instances' => [
+    'is_public',
+    'expires_at',
+    'locale',
+  ],
 ];
 
 // A core application table whose PRESENCE means "this DB already carries the app
@@ -246,14 +262,17 @@ if (!$coreTablePresent) {
     'fresh baseline through '.MAX_BAKED_MIGRATION);
 
   // 3) APPLY: a genuinely-new migration whose DDL is NOT yet baked into 001_init
-  //    (006+) is left PENDING by step 2 and is EXECUTED FOR REAL here (scenario
-  //    e). A fresh DB carrying only 001..005 files no-ops (all baselined).
-  pd_run_runner($runner, '', 'fresh apply (un-baked 006+)');
+  //    (anything above MAX_BAKED_MIGRATION -- 007+ since GVS-89) is left PENDING
+  //    by step 2 and is EXECUTED FOR REAL here (scenario e). A fresh DB carrying
+  //    only the baked files (001..MAX_BAKED) no-ops (all baselined).
+  pd_run_runner($runner, '', 'fresh apply (un-baked, above '.MAX_BAKED_MIGRATION.')');
 } else {
   // ===== EXISTING DB (tables present) — Finding #4 ==========================
   // Apply-mode ONLY. NEVER auto-baseline an unverified existing DB. For prod
-  // (001..005 already ledgered) this is a clean no-op: the runner reports each
-  // "already applied" and exits 0. A legacy/odd DB that cannot cleanly apply
+  // (001..005 already ledgered) the first deploy after GVS-89 applies 006 for
+  // real (its guarded ALTERs genuinely add the columns); every deploy after
+  // that is a clean no-op: the runner reports each "already applied" and exits
+  // 0. A legacy/odd DB that cannot cleanly apply
   // (e.g. a baked ALTER hits "Duplicate column" because its ledger is missing
   // that row) makes the runner exit non-zero -> we exit 1 and BLOCK the deploy
   // for a human. That fail-SAFE is the whole point: the original bug silently
@@ -279,35 +298,43 @@ if (!$coreTablePresent) {
 // schema missing 005's columns). Checking a SINGLE column was not enough: a
 // partial-005 schema with only that one column would PASS while every save --
 // which INSERTs and get_status()-selects ALL FOUR -- still fails. We now require
-// the FULL 005 contract (all columns in MAX_BAKED_ASSERT_COLUMNS). Runs on BOTH
-// the fresh and existing paths (control only reaches here after a clean
-// migrate). $name is the physically-selected DB (asserted == SELECT DATABASE()
-// above). We SELECT the present column names (not just COUNT) so the abort can
-// name EXACTLY which columns are missing.
-$expectedCols = MAX_BAKED_ASSERT_COLUMNS;
-try {
-  $placeholders = implode(',', array_fill(0, count($expectedCols), '?'));
-  $chk = $pdo->prepare(
-    'SELECT COLUMN_NAME FROM information_schema.COLUMNS '
-    .'WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME IN ('.$placeholders.')');
-  $chk->execute(array_merge([$name, MAX_BAKED_ASSERT_TABLE], $expectedCols));
-  $presentCols = $chk->fetchAll(PDO::FETCH_COLUMN);
-} catch (\Throwable $e) {
-  pd_err('[migrate] FATAL: post-migrate schema assertion query failed ('.get_class($e).'). exit 1');
+// the FULL contract of every baked column-adding migration (every column of
+// every table in BAKED_ASSERT_COLUMNS -- 005's four on waiver_responses and,
+// since GVS-89, 006's three on waiver_instances). Runs on BOTH the fresh and
+// existing paths (control only reaches here after a clean migrate). $name is
+// the physically-selected DB (asserted == SELECT DATABASE() above). We SELECT
+// the present column names (not just COUNT) so the abort can name EXACTLY which
+// columns are missing -- per table, every table checked before aborting.
+$assertFailures = [];
+$assertOkParts  = [];
+foreach (BAKED_ASSERT_COLUMNS as $assertTable => $expectedCols) {
+  try {
+    $placeholders = implode(',', array_fill(0, count($expectedCols), '?'));
+    $chk = $pdo->prepare(
+      'SELECT COLUMN_NAME FROM information_schema.COLUMNS '
+      .'WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME IN ('.$placeholders.')');
+    $chk->execute(array_merge([$name, $assertTable], $expectedCols));
+    $presentCols = $chk->fetchAll(PDO::FETCH_COLUMN);
+  } catch (\Throwable $e) {
+    pd_err('[migrate] FATAL: post-migrate schema assertion query failed ('.get_class($e).'). exit 1');
+    exit(1);
+  }
+  if (count($presentCols) < count($expectedCols)) {
+    $missing = array_values(array_diff($expectedCols, $presentCols));
+    $assertFailures[] = $assertTable.' is MISSING '.count($missing).' of '.count($expectedCols)
+      .' column(s): '.implode(', ', $missing)
+      .' (present: '.($presentCols !== [] ? implode(', ', $presentCols) : 'none of them').')';
+  } else {
+    $assertOkParts[] = $assertTable.' has all '.count($expectedCols).' ('.implode(', ', $expectedCols).')';
+  }
+}
+if ($assertFailures !== []) {
+  pd_err('[migrate] FATAL: schema assertion FAILED -- '.implode('; ', $assertFailures)
+    .' -- columns the baked migrations (through '.MAX_BAKED_MIGRATION.') must add, even though '
+    .'the migration ledger reports success. Refusing to ship code against a hollow schema. exit 1');
   exit(1);
 }
-if (count($presentCols) < count($expectedCols)) {
-  $missing = array_values(array_diff($expectedCols, $presentCols));
-  pd_err('[migrate] FATAL: schema assertion FAILED -- '.MAX_BAKED_ASSERT_TABLE
-    .' is MISSING '.count($missing).' of '.count($expectedCols).' column(s) that '
-    .MAX_BAKED_MIGRATION.' must add: '.implode(', ', $missing)
-    .' (present: '.($presentCols !== [] ? implode(', ', $presentCols) : 'none of them')
-    .') even though the migration ledger reports success. Refusing to ship code against a '
-    .'hollow schema. exit 1');
-  exit(1);
-}
-pd_out('[migrate] schema assertion OK: '.MAX_BAKED_ASSERT_TABLE.' has all '.count($expectedCols)
-  .' '.MAX_BAKED_MIGRATION.' columns ('.implode(', ', $expectedCols).')');
+pd_out('[migrate] schema assertion OK (through '.MAX_BAKED_MIGRATION.'): '.implode('; ', $assertOkParts));
 
 // --- Verify tables (diagnostic) ---
 $tables = $pdo->query('SHOW TABLES')->fetchAll(PDO::FETCH_COLUMN);

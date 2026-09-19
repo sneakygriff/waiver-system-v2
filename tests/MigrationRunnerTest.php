@@ -897,8 +897,11 @@ final class MigrationRunnerTest extends TestCase
         // above), leaving 005 as the one genuinely PENDING file.
         $this->createLegacyWaiverResponsesTableMissingEvidenceColumns();
 
-        $realMigrationsDir = \dirname(__DIR__) . '/migrations';
-        $this->assertFileExists($realMigrationsDir . '/005_evidence_fields.sql', 'this test must exercise the real, committed T5 migration file');
+        $this->assertFileExists(\dirname(__DIR__) . '/migrations/005_evidence_fields.sql', 'this test must exercise the real, committed T5 migration file');
+        // [GVS-89] The REAL committed 001..005 files, byte-identical copies --
+        // bounded at 005 so this 005 test is not coupled to later migrations
+        // (see stageRealMigrationsThrough()).
+        $realMigrationsDir = $this->stageRealMigrationsThrough(5);
 
         $baseline = $this->migrate(['--dir=' . $realMigrationsDir, '--baseline', '--through=004']);
         $this->assertExit(0, $baseline, 'baselining the real 001..004 against a schema shaped like an existing pre-005 database');
@@ -963,7 +966,8 @@ final class MigrationRunnerTest extends TestCase
     {
         $this->createFreshWaiverResponsesTableWithEvidenceColumnsAlreadyPresent();
 
-        $realMigrationsDir = \dirname(__DIR__) . '/migrations';
+        // [GVS-89] Real committed 001..005 only -- see test 19 / stageRealMigrationsThrough().
+        $realMigrationsDir = $this->stageRealMigrationsThrough(5);
 
         // The exact recipe the pre-005-database runbook documents --
         // --through=004 -- applied here to a schema that is NOT pre-005 (it
@@ -1004,9 +1008,339 @@ final class MigrationRunnerTest extends TestCase
         $this->assertStringContainsString('005_evidence_fields: already applied', $second['out']);
     }
 
+    // 21. [GVS-89] The REAL committed 006_public_instances.sql applies on an
+    //     EXISTING pre-006 database -- the one-time prod/staging upgrade shape:
+    //     001..005 ledgered, waiver_instances WITHOUT the three public-instance
+    //     columns or their index, and live rows already in it. Then proves the
+    //     file "applies cleanly twice": a normal re-run is a ledger no-op, and a
+    //     crash-window REPLAY (ledger rows gone, schema already migrated -- the
+    //     runner's one irreducible gap) re-executes all 6 statements with the
+    //     ALTER compiled to `DO 0` instead of `Duplicate column name` /
+    //     `Duplicate key name`.
+    // -----------------------------------------------------------------------
+
+    public function testReal006PublicInstancesMigrationAppliesOnAPre006DatabaseAndReplaysHarmlessly(): void
+    {
+        $this->createLegacyWaiverInstancesTableWithoutPublicColumns();
+        $this->db->exec("INSERT INTO waiver_instances (template_version_id, customer_id, link_token, status, created_at, updated_at)
+                         VALUES (1, 'cust-pre006', 'pre006-token-00000000000001', 'completed', UTC_TIMESTAMP(), UTC_TIMESTAMP())");
+
+        $this->assertFileExists(\dirname(__DIR__) . '/migrations/006_public_instances.sql', 'this test must exercise the real, committed GVS-89 migration file');
+        $dir = $this->stageRealMigrationsThrough(6);
+
+        $baseline = $this->migrate(['--dir=' . $dir, '--baseline', '--through=005']);
+        $this->assertExit(0, $baseline, 'baselining the real 001..005 against a pre-006 waiver_instances');
+        foreach (['is_public', 'expires_at', 'locale'] as $col) {
+            $this->assertFalse($this->columnExists('waiver_instances', $col), "sanity: $col must NOT exist yet");
+        }
+        $this->assertFalse($this->indexExists('waiver_instances', 'idx_public_expires'), 'sanity: no index yet');
+
+        $r = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $r, 'the real 006_public_instances.sql must apply cleanly on top of a baselined 001..005');
+        // [gate 89-M4] ONE guarded ALTER: SET lock_wait_timeout, two SETs
+        // building the DDL from what is missing, PREPARE, EXECUTE, restore.
+        $this->assertStringContainsString('006_public_instances: APPLIED (6 statement(s))', $r['out']);
+        $this->assertStringContainsString('summary: files_applied=1 statements_executed=6 already_applied=5', $r['out']);
+        // The online guarantee is REQUESTED (MySQL errors instead of silently
+        // choosing a blocking table copy); the bounded MDL wait is proven
+        // behaviourally by test 23.
+        $this->assertStringContainsString("ALGORITHM=INPLACE, LOCK=NONE')", (string)file_get_contents(\dirname(__DIR__) . '/migrations/006_public_instances.sql'));
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill', '005_evidence_fields', '006_public_instances'],
+            $this->appliedVersions()
+        );
+        $this->assertPublicInstanceColumnsAndIndexShape();
+        // The pre-existing row is backfilled NON-public by the column DEFAULT --
+        // every reservation-bound instance keeps its exact current behaviour.
+        $pre = $this->rows("SELECT is_public, expires_at, locale, customer_id, status FROM waiver_instances WHERE link_token = 'pre006-token-00000000000001'");
+        $this->assertCount(1, $pre);
+        $this->assertSame(0, (int)$pre[0]['is_public']);
+        $this->assertNull($pre[0]['expires_at']);
+        $this->assertNull($pre[0]['locale']);
+        $this->assertSame(['cust-pre006', 'completed'], [$pre[0]['customer_id'], $pre[0]['status']], 'the row is otherwise untouched');
+
+        // (a) Ordinary re-run: a ledger no-op.
+        $second = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $second, 're-running once fully applied must be a no-op');
+        $this->assertStringContainsString('006_public_instances: already applied', $second['out']);
+        $this->assertStringContainsString('summary: files_applied=0 statements_executed=0 already_applied=6', $second['out']);
+
+        // (b) Crash-window replay: the DDL landed but the ledger never recorded
+        // it. The guard finds every object present -> the ALTER is `DO 0`.
+        $this->db->exec("DELETE FROM schema_migration_statements WHERE version = '006_public_instances'");
+        $this->db->exec("DELETE FROM schema_migrations WHERE version = '006_public_instances'");
+        $replay = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $replay, 'a replay over an already-migrated schema must converge, not duplicate-column/-key fail');
+        $this->assertStringContainsString('006_public_instances: APPLIED (6 statement(s))', $replay['out']);
+        $this->assertPublicInstanceColumnsAndIndexShape();
+    }
+
+    // 22. [GVS-89] The CURRENT 001_init.sql bakes 006 in, and the real 006 file
+    //     then CONVERGES as a no-op on that fresh-install schema. The schema is
+    //     built by actually EXECUTING the committed 001_init.sql (the way
+    //     compose initdb, CI's waiver_test setup and dev/predeploy.php's fresh
+    //     path all do), so this also pins the bake itself: 001_init.sql and the
+    //     006 ALTERs are held to the SAME column/index expectation
+    //     (assertPublicInstanceColumnsAndIndexShape), and any drift between the
+    //     two fails one of tests 21/22.
+    public function testCurrent001InitBakes006AndTheReal006ConvergesAsANoOpOnIt(): void
+    {
+        $this->executeReal001InitSql();
+        $this->assertPublicInstanceColumnsAndIndexShape();
+
+        $dir = $this->stageRealMigrationsThrough(6);
+        // The pre-006 recipe (--through=005) applied to a schema that is NOT
+        // pre-006 -- the mismatch 005's F6 fold guarded against, now for 006.
+        $baseline = $this->migrate(['--dir=' . $dir, '--baseline', '--through=005']);
+        $this->assertExit(0, $baseline, 'baselining 001..005 against a fresh-install schema');
+
+        $r = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $r, '006 must converge (no Duplicate column/key) when 001_init.sql already baked it');
+        $this->assertStringContainsString('006_public_instances: APPLIED (6 statement(s))', $r['out']);
+        $this->assertSame(
+            ['001_init', '002_waiver_integration', '003_erase_waiver', '004_erasure_audit_events_backfill', '005_evidence_fields', '006_public_instances'],
+            $this->appliedVersions()
+        );
+        $this->assertPublicInstanceColumnsAndIndexShape();
+    }
+
+    // 23. [GVS-89 / gate 89-M4, Codex P2 x2] The real 006 is BOUNDED and
+    //     RESUMABLE under metadata-lock contention -- the production failure
+    //     mode of an ALTER: another session's open transaction holds a shared
+    //     metadata lock on waiver_instances. The ALTER must give up after the
+    //     migration's own 10 s lock_wait_timeout (not the server default of
+    //     one YEAR, during which every guest-page query would queue behind
+    //     it), change nothing (a failed DDL is atomic), and a plain re-run
+    //     must then resume at the EXECUTE by re-establishing the session state
+    //     (SET @ddl / PREPARE) its first connection took with it.
+    public function testReal006GivesUpOnABlockedMetadataLockWithinItsOwnTimeoutAndThenResumesCleanly(): void
+    {
+        $this->createLegacyWaiverInstancesTableWithoutPublicColumns();
+        $dir = $this->stageRealMigrationsThrough(6);
+        $this->assertExit(0, $this->migrate(['--dir=' . $dir, '--baseline', '--through=005']), 'baselining 001..005');
+
+        // Hold a shared metadata lock on waiver_instances for the whole run.
+        $this->db->beginTransaction();
+        $this->db->query('SELECT COUNT(*) FROM waiver_instances')->fetchAll();
+        $t0 = microtime(true);
+        try {
+            $blocked = $this->migrate(['--dir=' . $dir]);
+        } finally {
+            $elapsed = microtime(true) - $t0;
+            $this->db->rollBack();
+        }
+
+        $this->assertExit(1, $blocked, 'a metadata-lock-blocked ALTER must fail the run (exit 1), not hang');
+        $this->assertStringContainsString('FAILED 006_public_instances#4', $blocked['err']);
+        $this->assertStringContainsString('1205', $blocked['err'], 'MySQL "Lock wait timeout exceeded"');
+        $this->assertGreaterThanOrEqual(9.0, $elapsed, 'it waited for the lock (the timeout is really in force, not an unrelated error)');
+        $this->assertLessThan(30.0, $elapsed, 'bounded by the migration\'s own lock_wait_timeout = 10, not the server default');
+        foreach (['is_public', 'expires_at', 'locale'] as $col) {
+            $this->assertFalse($this->columnExists('waiver_instances', $col), "a failed ALTER changes nothing ($col)");
+        }
+        $this->assertSame(
+            array_map(static fn (int $i): array => ['version' => '006_public_instances', 'statement_index' => $i], range(0, 3)),
+            array_values(array_filter($this->statementIndexes(), static fn (array $r): bool => $r['version'] === '006_public_instances')),
+            'exactly the session-state statements #0..#3 are ledgered; the failed EXECUTE (#4) is not'
+        );
+
+        $resumed = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $resumed, 'the re-run must resume at the EXECUTE, not die on "Unknown prepared statement handler" (MySQL 1243)');
+        $this->assertStringContainsString('006_public_instances: 6 statement(s), resuming at index 4 (4 already applied)', $resumed['out']);
+        $this->assertStringContainsString('re-establishing session state: replaying 006_public_instances#0..#3', $resumed['out']);
+        $this->assertStringContainsString('006_public_instances: APPLIED (6 statement(s))', $resumed['out']);
+        $this->assertStringContainsString('summary: files_applied=1 statements_executed=2 already_applied=5', $resumed['out']);
+        $this->assertPublicInstanceColumnsAndIndexShape();
+    }
+
+    // 24. [GVS-89 / gate 89-M4, Codex P2] The runner's SESSION-STATE REPLAY in
+    //     isolation, on a minimal fixture: a failure at an EXECUTE whose
+    //     `SET @var` + `PREPARE` are already ledgered resumes cleanly, and the
+    //     replayed statements are re-executed WITHOUT being re-recorded.
+    public function testResumingAtAnExecuteReplaysThePrecedingSessionStateFirst(): void
+    {
+        $dir = $this->stageFixture('session-state-resume');
+
+        $first = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(1, $first, 'the EXECUTE must fail while its target table is missing');
+        $this->assertStringContainsString('FAILED 001_session_state#2', $first['err']);
+        $ledgered = [['version' => '001_session_state', 'statement_index' => 0], ['version' => '001_session_state', 'statement_index' => 1]];
+        $this->assertSame($ledgered, $this->statementIndexes());
+        $ledgerAfterFirst = $this->statementLedgerWithTimestamps();
+
+        $this->db->exec('CREATE TABLE f2_resume_target (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB');
+
+        $second = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $second, 'resume at the EXECUTE must re-establish @probe_ddl and the prepared handle first');
+        $this->assertStringContainsString('001_session_state: 3 statement(s), resuming at index 2 (2 already applied)', $second['out']);
+        $this->assertStringContainsString('re-establishing session state: replaying 001_session_state#0..#1', $second['out']);
+        $this->assertStringContainsString('  001_session_state#2 ok', $second['out']);
+        $this->assertStringContainsString('summary: files_applied=1 statements_executed=1 already_applied=0', $second['out']);
+        $this->assertTrue($this->columnExists('f2_resume_target', 'added_on_resume'));
+        $this->assertSame(['001_session_state'], $this->appliedVersions());
+        $this->assertSame(array_merge($ledgered, [['version' => '001_session_state', 'statement_index' => 2]]), $this->statementIndexes());
+        $this->assertSame(\array_slice($this->statementLedgerWithTimestamps(), 0, 2), $ledgerAfterFirst, 'replayed statements are NOT re-recorded');
+    }
+
+    // 25. [GVS-89 / gate 89-M4 r2, Fable P2-1] A `DEALLOCATE PREPARE` in the
+    //     replay window is walked over but never re-executed: the handle it
+    //     released (#1, prepared BEFORE the window) does not exist in the new
+    //     connection, so re-running it would fail 1243 on every retry; and a
+    //     DEALLOCATE in the MIDDLE of the window (#6) must not cut it short,
+    //     or the EXECUTE's @var/handle would not be re-established.
+    public function testResumeReplayWalksOverButNeverReExecutesADeallocate(): void
+    {
+        $dir = $this->stageFixture('session-state-deallocate');
+
+        $first = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(1, $first, 'the EXECUTE must fail while its target table is missing');
+        $this->assertStringContainsString('FAILED 001_deallocate#8', $first['err']);
+        $this->assertSame(range(0, 7), array_column($this->statementIndexes(), 'statement_index'));
+        $ledgerAfterFirst = $this->statementLedgerWithTimestamps();
+        $this->assertTrue($this->tableExists('f2_dealloc_made'), 'run 1 executed #0..#3 for real');
+
+        $this->db->exec('CREATE TABLE f2_dealloc_target (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB');
+
+        $second = $this->migrate(['--dir=' . $dir]);
+        $this->assertExit(0, $second, 'a DEALLOCATE in the replay window must not wedge the resume');
+        $this->assertStringContainsString('001_deallocate: 9 statement(s), resuming at index 8 (8 already applied)', $second['out']);
+        $this->assertStringContainsString('re-establishing session state: replaying 001_deallocate#3..#7', $second['out']);
+        $this->assertStringContainsString('  001_deallocate#3 replay skipped', $second['out']);
+        $this->assertStringContainsString('  001_deallocate#4 replayed', $second['out']);
+        $this->assertStringContainsString('  001_deallocate#6 replay skipped', $second['out']);
+        $this->assertStringContainsString('  001_deallocate#7 replayed', $second['out']);
+        $this->assertStringContainsString('  001_deallocate#8 ok', $second['out']);
+        $this->assertTrue($this->columnExists('f2_dealloc_target', 'added_on_resume'));
+        $this->assertSame(['001_deallocate'], $this->appliedVersions());
+        $this->assertSame(range(0, 8), array_column($this->statementIndexes(), 'statement_index'));
+        $this->assertSame(\array_slice($this->statementLedgerWithTimestamps(), 0, 8), $ledgerAfterFirst, 'replayed/skipped statements are NOT re-recorded');
+    }
+
     // =======================================================================
     // Helpers
     // =======================================================================
+
+    /**
+     * [GVS-89] Copy the REAL committed `NNN_*.sql` files whose numeric prefix is
+     * <= $throughPrefix into a fresh temp dir (byte-identical, asserted).
+     * Tests 19/20 are about 005 and tests 21/22 about 006; pointing them at the
+     * whole live migrations/ dir coupled their exact-summary assertions (and
+     * their deliberately minimal scratch schemas) to every LATER migration --
+     * tests 19/20 broke the moment 006 (which ALTERs waiver_instances, a table
+     * their schemas do not have) was committed.
+     */
+    private function stageRealMigrationsThrough(int $throughPrefix): string
+    {
+        $src = \dirname(__DIR__) . '/migrations';
+        $dst = sys_get_temp_dir() . '/f2-migreal-' . bin2hex(random_bytes(6));
+        if (!mkdir($dst, 0o777, true) && !is_dir($dst)) {
+            $this->fail('could not create temp dir ' . $dst);
+        }
+        $this->tempDirs[] = $dst;
+
+        $prefixes = [];
+        foreach (scandir($src) ?: [] as $entry) {
+            if (!preg_match('/^(\d+)_[A-Za-z0-9_]+\.sql$/', $entry, $m) || (int)$m[1] > $throughPrefix) { continue; }
+            copy($src . '/' . $entry, $dst . '/' . $entry);
+            $this->assertSame(hash_file('sha256', $src . '/' . $entry), hash_file('sha256', $dst . '/' . $entry), "$entry must be a byte-identical copy");
+            $prefixes[] = (int)$m[1];
+        }
+        sort($prefixes);
+        $this->assertSame(range(1, $throughPrefix), $prefixes, 'every real migration 001..' . $throughPrefix . ' must be staged');
+
+        return $dst;
+    }
+
+    /**
+     * [GVS-89] `waiver_instances` exactly as 001_init.sql shaped it BEFORE the
+     * GVS-89 bake-in (i.e. the real shape of an existing staging/prod database
+     * at 005): no is_public / expires_at / locale, no idx_public_expires.
+     */
+    private function createLegacyWaiverInstancesTableWithoutPublicColumns(): void
+    {
+        $this->db->exec(
+            "CREATE TABLE waiver_instances (
+               id BIGINT PRIMARY KEY AUTO_INCREMENT,
+               template_version_id BIGINT NOT NULL,
+               reservation_id VARCHAR(64) NULL,
+               participant_id VARCHAR(64) NULL,
+               customer_id VARCHAR(64) NULL,
+               booking_group_id VARCHAR(64) NULL,
+               guest_name VARCHAR(255) NULL,
+               guest_email VARCHAR(255) NULL,
+               link_token VARCHAR(128) NOT NULL UNIQUE,
+               group_token CHAR(16) NULL,
+               status ENUM('pending','completed','void') NOT NULL DEFAULT 'pending',
+               created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+               completed_at DATETIME NULL,
+               INDEX (reservation_id), INDEX (status), INDEX (group_token),
+               INDEX idx_participant (participant_id),
+               INDEX idx_customer (customer_id),
+               INDEX idx_booking_group (booking_group_id)
+             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
+    }
+
+    /**
+     * [GVS-89] Execute the REAL committed 001_init.sql against the scratch
+     * schema as one multi-statement script, draining every result set so a
+     * failure in ANY statement (not just the first) surfaces as an exception.
+     */
+    private function executeReal001InitSql(): void
+    {
+        $sql = file_get_contents(\dirname(__DIR__) . '/migrations/001_init.sql');
+        $this->assertIsString($sql);
+        $opts = [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION];
+        if (\defined('PDO::MYSQL_ATTR_MULTI_STATEMENTS')) {
+            $opts[\PDO::MYSQL_ATTR_MULTI_STATEMENTS] = true;
+        }
+        $pdo = new \PDO(
+            sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $this->host, $this->port, $this->schema),
+            self::RUNNER_USER,
+            self::RUNNER_PASS,
+            $opts
+        );
+        $stmt = $pdo->query($sql);
+        do { /* drain */ } while ($stmt->nextRowset());
+        $stmt->closeCursor();
+        foreach (['waiver_instances', 'waiver_responses', 'schema_migrations'] as $table) {
+            $this->assertTrue($this->tableExists($table), "001_init.sql must create $table");
+        }
+    }
+
+    /**
+     * [GVS-89] The ONE expectation both the 006 ALTERs (test 21) and the
+     * 001_init.sql bake (test 22) are held to: exact type, nullability and
+     * default of each public-instance column, and the composite index in
+     * column order.
+     */
+    private function assertPublicInstanceColumnsAndIndexShape(): void
+    {
+        $cols = $this->rows(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA = " . $this->db->quote($this->schema) . " AND TABLE_NAME = 'waiver_instances'
+                AND COLUMN_NAME IN ('is_public', 'expires_at', 'locale')
+              ORDER BY COLUMN_NAME"
+        );
+        $this->assertSame([
+            ['COLUMN_NAME' => 'expires_at', 'COLUMN_TYPE' => 'datetime',   'IS_NULLABLE' => 'YES', 'COLUMN_DEFAULT' => null],
+            ['COLUMN_NAME' => 'is_public',  'COLUMN_TYPE' => 'tinyint(1)', 'IS_NULLABLE' => 'NO',  'COLUMN_DEFAULT' => '0'],
+            ['COLUMN_NAME' => 'locale',     'COLUMN_TYPE' => 'varchar(2)', 'IS_NULLABLE' => 'YES', 'COLUMN_DEFAULT' => null],
+        ], $cols);
+
+        $idx = $this->rows(
+            "SELECT COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE FROM information_schema.STATISTICS
+              WHERE TABLE_SCHEMA = " . $this->db->quote($this->schema) . " AND TABLE_NAME = 'waiver_instances'
+                AND INDEX_NAME = 'idx_public_expires'
+              ORDER BY SEQ_IN_INDEX"
+        );
+        $this->assertSame([
+            ['COLUMN_NAME' => 'is_public',  'SEQ_IN_INDEX' => 1, 'NON_UNIQUE' => 1],
+            ['COLUMN_NAME' => 'expires_at', 'SEQ_IN_INDEX' => 2, 'NON_UNIQUE' => 1],
+        ], array_map(static fn (array $r): array => [
+            'COLUMN_NAME' => (string)$r['COLUMN_NAME'], 'SEQ_IN_INDEX' => (int)$r['SEQ_IN_INDEX'], 'NON_UNIQUE' => (int)$r['NON_UNIQUE'],
+        ], $idx));
+    }
 
     /**
      * Run the real runner as a child process.
