@@ -6,18 +6,24 @@
 #
 # Covers the eight deploy scenarios the predeploy rewrite must satisfy:
 #   (a) fresh empty DB        -> tables + baseline + apply, exit 0, evidence cols
-#   (b) PROD-SHAPE CONVERGENCE: existing DB, complete ledger 001..005 -> all
-#       already-applied, exit 0, schema assertion OK (the real prod deploy is a
-#       clean no-op; DISTINCT from the partial-ledger abort in (c))
+#   (b) PROD-SHAPE CONVERGENCE: existing DB, complete ledger 001..MAX_BAKED ->
+#       all already-applied, exit 0, schema assertion OK (the steady-state prod
+#       deploy is a clean no-op; DISTINCT from the partial-ledger abort in (c))
+#   (b2) [GVS-89] PROD-SHAPE UPGRADE: existing DB ledgered only through 005 with
+#       the PRE-006 waiver_instances shape -> 006_public_instances is EXECUTED
+#       for real (its guarded ALTERs add the columns + index), exit 0
 #   (c) legacy DB, partial ledger        -> apply FAILS -> predeploy exit 1
 #       (fail-safe) + a self-explanatory likely-cause/remediation hint
-#   (d) new pending 006 on an existing DB-> 006 applied, exit 0
-#   (e) fresh DB with an un-baked 006     -> 006's DDL EXECUTED (not baselined)
+#   (d) new pending probe on an existing DB -> probe applied, exit 0
+#   (e) fresh DB with an un-baked probe    -> probe's DDL EXECUTED (not baselined)
+#       (the probe takes the NEXT UNUSED numeric prefix -- 007 since GVS-89's
+#       real 006 -- because the runner hard-errors on a duplicate prefix)
 #   (f) missing a required MYSQL* var    -> exit 1, no false success
-#   (g) hollow schema: for EACH of 005's four evidence columns INDEPENDENTLY,
-#       drop just that column (ledger left complete) -> post-migrate schema
-#       assertion FIRES naming that column -> predeploy exit 1. Proves the
-#       assertion covers the FULL 005 contract, non-vacuously, for all four.
+#   (g) hollow schema: for EACH of 005's four evidence columns AND 006's three
+#       public-instance columns INDEPENDENTLY, drop just that column (ledger
+#       left complete) -> post-migrate schema assertion FIRES naming that column
+#       -> predeploy exit 1. Proves the assertion covers the FULL 005 + 006
+#       contract, non-vacuously, for all seven.
 #   (h) [GVS-58] the gated waiver-TEMPLATE seed: a re-provisioned (empty) staging
 #       DB self-heals to template id 2 with the publish gate TRUE; re-running is
 #       a no-op; unarmed does nothing; a broken fixture WARNS without aborting
@@ -74,9 +80,24 @@ ensure_db() {
   echo "  mysql stopped answering — aborting suite"; docker logs "$DBC" 2>&1 | tail -20; exit 2
 }
 
-echo "=== writable repo copy (so a 006 fixture can be added) ==="
+echo "=== writable repo copy (so a probe migration fixture can be added) ==="
 for d in vendor src dev migrations config composer.json composer.lock; do cp -R "$REPO/$d" "$WORK/$d"; done
-rm -f "$WORK/migrations/006_probe.sql"
+
+# [GVS-89] Derived from the repo, never hardcoded: the highest migration baked
+# into 001_init.sql (dev/predeploy.php's MAX_BAKED_MIGRATION), the full expected
+# ledger (every committed NNN_*.sql, in order), and the probe's prefix -- the
+# NEXT UNUSED number. A hardcoded `006_probe` collided with the real
+# 006_public_instances.sql the moment it shipped (the runner rejects two files
+# sharing a numeric prefix), so the probe now always sits one past the last
+# real migration.
+MAX_BAKED="$(sed -n "s/^const MAX_BAKED_MIGRATION = '\([^']*\)';.*/\1/p" "$REPO/dev/predeploy.php")"
+[ -n "$MAX_BAKED" ] || { echo "could not read MAX_BAKED_MIGRATION from dev/predeploy.php"; exit 2; }
+EXPECTED_LEDGER="$(ls "$REPO/migrations" | sed -n 's/^\([0-9][0-9]*_[A-Za-z0-9_]*\)\.sql$/\1/p' | sort -n | paste -sd, -)"
+LAST_PREFIX="$(ls "$REPO/migrations" | sed -n 's/^\([0-9][0-9]*\)[_.].*sql$/\1/p' | sort -n | tail -1)"
+PROBE="$(printf '%03d' $((10#$LAST_PREFIX + 1)))_probe"
+PROBE_TABLE="predeploy_probe_$PROBE"
+echo "MAX_BAKED=$MAX_BAKED  PROBE=$PROBE  EXPECTED_LEDGER=$EXPECTED_LEDGER"
+rm -f "$WORK/migrations/$PROBE.sql"
 
 echo "=== disposable MySQL ($MYSQL_IMG) ==="
 docker network create "$NET" >/dev/null
@@ -124,22 +145,44 @@ ensure_db; reset_db; run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
 # first statement. If MULTI_STATEMENTS were off/broken, this column would be
 # absent and this check (plus the predeploy schema assertion) would fail.
 [ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_responses' AND COLUMN_NAME='evidence_object_key'")" = 1 ] && ok "evidence_object_key (late object) exists" || bad "no evidence_object_key"
-[ "$(q "SELECT GROUP_CONCAT(version ORDER BY version) FROM schema_migrations")" = "001_init,002_waiver_integration,003_erase_waiver,004_erasure_audit_events_backfill,005_evidence_fields" ] && ok "ledger 001..005" || bad "ledger != 001..005"
+[ "$(q "SELECT GROUP_CONCAT(version ORDER BY version) FROM schema_migrations")" = "$EXPECTED_LEDGER" ] && ok "ledger = every committed migration ($EXPECTED_LEDGER)" || bad "ledger != $EXPECTED_LEDGER"
 echo "$LAST_OUT" | grep -q "schema assertion OK" && ok "post-migrate schema assertion passed (fresh)" || bad "no schema assertion OK (fresh)"
+# [GVS-89] 006 is BAKED: a fresh DB gets its columns from 001_init.sql and the
+# runner BASELINES it (zero per-statement rows) -- proves the MAX_BAKED bump.
+[ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_instances' AND COLUMN_NAME IN ('is_public','expires_at','locale')")" = 3 ] && ok "006 public-instance columns exist (baked)" || bad "006 columns missing on fresh"
+[ "$(q "SELECT COUNT(*) FROM schema_migration_statements WHERE version='006_public_instances'")" = 0 ] && ok "006 baselined on fresh (not executed)" || bad "006 executed on fresh (MAX_BAKED not bumped?)"
 
-echo; echo "### (b) PROD-SHAPE CONVERGENCE: existing DB, complete ledger 001..005 ###"
-# This is the REAL prod deploy shape: an existing DB whose schema_migrations
-# ledger already carries 001..005 in full. It MUST converge cleanly -- a pure
-# no-op: apply-mode finds every version already applied (exit 0), and the
-# post-migrate schema assertion confirms all four 005 columns are physically
-# present. This documents that the prod deploy is a no-op, DISTINCT from the
-# partial-ledger abort exercised in scenario (c) below.
-ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
+echo; echo "### (b) PROD-SHAPE CONVERGENCE: existing DB, complete ledger 001..$MAX_BAKED ###"
+# This is the STEADY-STATE prod deploy shape: an existing DB whose
+# schema_migrations ledger already carries every baked migration in full. It
+# MUST converge cleanly -- a pure no-op: apply-mode finds every version already
+# applied (exit 0), and the post-migrate schema assertion confirms every
+# asserted column is physically present. This documents that the prod deploy is
+# a no-op, DISTINCT from the partial-ledger abort exercised in scenario (c).
+ensure_db; reset_db; apply_init; run_runner --baseline --through="$MAX_BAKED" >/dev/null
 run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
 [ "$rc" = 0 ] && ok "exit 0 (prod-shape converges cleanly)" || bad "exit $rc (want 0)"
 echo "$LAST_OUT" | grep -q "already applied" && ok "no-op (already applied)" || bad "not a no-op"
 echo "$LAST_OUT" | grep -q "schema assertion OK" && ok "post-migrate schema assertion passed (existing)" || bad "no schema assertion OK (existing)"
 echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && ok "reached DONE" || bad "no DONE"
+
+echo; echo "### (b2) [GVS-89] PROD-SHAPE UPGRADE: ledger through 005, pre-006 schema ###"
+# The ONE-TIME prod shape of the first deploy after GVS-89: prod is ledgered
+# 001..005 and its waiver_instances has none of 006's columns/index. apply-mode
+# must EXECUTE 006 for real (per-statement ledger rows), add all three columns
+# + the index, keep existing rows non-public, and pass the schema assertion.
+ensure_db; reset_db; apply_init
+q "ALTER TABLE waiver_instances DROP INDEX idx_public_expires, DROP COLUMN locale, DROP COLUMN expires_at, DROP COLUMN is_public" >/dev/null
+q "INSERT INTO waiver_instances (template_version_id, link_token, status, created_at, updated_at) VALUES (1, 'pre006-existing-row-token-000001', 'pending', UTC_TIMESTAMP(), UTC_TIMESTAMP())" >/dev/null
+run_runner --baseline --through=005_evidence_fields >/dev/null
+[ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_instances' AND COLUMN_NAME IN ('is_public','expires_at','locale')")" = 0 ] && ok "(b2) sanity: pre-006 shape (no public columns)" || bad "(b2) could not build the pre-006 shape"
+run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
+[ "$rc" = 0 ] && ok "(b2) exit 0 (006 applied on an existing DB)" || bad "(b2) exit $rc (want 0)"
+[ "$(q "SELECT COUNT(*) FROM schema_migration_statements WHERE version='006_public_instances'")" -ge 1 ] 2>/dev/null && ok "(b2) 006 EXECUTED (per-statement ledger rows)" || bad "(b2) 006 not executed"
+[ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_instances' AND COLUMN_NAME IN ('is_public','expires_at','locale')")" = 3 ] && ok "(b2) all three 006 columns added" || bad "(b2) 006 columns missing after apply"
+[ "$(q "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_instances' AND INDEX_NAME='idx_public_expires'")" -ge 1 ] && ok "(b2) idx_public_expires added" || bad "(b2) idx_public_expires missing"
+[ "$(q "SELECT is_public FROM waiver_instances WHERE link_token='pre006-existing-row-token-000001'")" = 0 ] && ok "(b2) pre-existing row backfilled NON-public (is_public=0)" || bad "(b2) pre-existing row not is_public=0"
+echo "$LAST_OUT" | grep -q "schema assertion OK" && ok "(b2) post-migrate schema assertion passed" || bad "(b2) no schema assertion OK"
 
 echo; echo "### (c) legacy DB, tables present but partial ledger ###"
 ensure_db; reset_db; apply_init   # tables + only 001_init row; 002/003/005 NOT ledgered
@@ -153,21 +196,21 @@ echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && bad "reached DONE (should abo
 echo "$LAST_OUT" | grep -q "LIKELY CAUSE + SAFE REMEDIATION" && ok "abort names likely-cause + remediation" || bad "no self-explanatory hint"
 echo "$LAST_OUT" | grep -q "Do NOT blindly baseline" && ok "hint warns against a blind baseline" || bad "hint missing the do-not-baseline warning"
 
-echo; echo "### (d) NEW pending 006 on an existing DB ###"
-printf '%s\n' '-- 006_probe.sql (E2E fixture) — genuinely-new, NOT baked into 001_init.' \
-  'CREATE TABLE IF NOT EXISTS predeploy_probe_006 (id INT PRIMARY KEY);' > "$WORK/migrations/006_probe.sql"
-ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
+echo; echo "### (d) NEW pending $PROBE on an existing DB ###"
+printf '%s\n' "-- $PROBE.sql (E2E fixture) — genuinely-new, NOT baked into 001_init." \
+  "CREATE TABLE IF NOT EXISTS $PROBE_TABLE (id INT PRIMARY KEY);" > "$WORK/migrations/$PROBE.sql"
+ensure_db; reset_db; apply_init; run_runner --baseline --through="$MAX_BAKED" >/dev/null
 run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
 [ "$rc" = 0 ] && ok "exit 0" || bad "exit $rc (want 0)"
-[ "$(q "SHOW TABLES LIKE 'predeploy_probe_006'")" = predeploy_probe_006 ] && ok "006 DDL executed" || bad "006 table missing"
-[ "$(q "SELECT COUNT(*) FROM schema_migrations WHERE version='006_probe'")" = 1 ] && ok "006 ledgered" || bad "006 not ledgered"
+[ "$(q "SHOW TABLES LIKE '$PROBE_TABLE'")" = "$PROBE_TABLE" ] && ok "$PROBE DDL executed" || bad "$PROBE table missing"
+[ "$(q "SELECT COUNT(*) FROM schema_migrations WHERE version='$PROBE'")" = 1 ] && ok "$PROBE ledgered" || bad "$PROBE not ledgered"
 
-echo; echo "### (e) FRESH DB with an un-baked 006 present ###"
+echo; echo "### (e) FRESH DB with an un-baked $PROBE present ###"
 ensure_db; reset_db; run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
 [ "$rc" = 0 ] && ok "exit 0" || bad "exit $rc (want 0)"
-[ "$(q "SHOW TABLES LIKE 'predeploy_probe_006'")" = predeploy_probe_006 ] && ok "006 EXECUTED on fresh (not baseline-skipped)" || bad "006 missing on fresh"
-[ "$(q "SELECT COUNT(*) FROM schema_migration_statements WHERE version='006_probe'")" -ge 1 ] 2>/dev/null && ok "006 has per-statement ledger rows (really executed)" || bad "006 baselined, not executed"
-rm -f "$WORK/migrations/006_probe.sql"
+[ "$(q "SHOW TABLES LIKE '$PROBE_TABLE'")" = "$PROBE_TABLE" ] && ok "$PROBE EXECUTED on fresh (not baseline-skipped)" || bad "$PROBE missing on fresh"
+[ "$(q "SELECT COUNT(*) FROM schema_migration_statements WHERE version='$PROBE'")" -ge 1 ] 2>/dev/null && ok "$PROBE has per-statement ledger rows (really executed)" || bad "$PROBE baselined, not executed"
+rm -f "$WORK/migrations/$PROBE.sql"
 
 echo; echo "### (f) missing a required MYSQL* var ###"
 ensure_db; reset_db; run_predeploy -MYSQLPASSWORD; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
@@ -175,7 +218,7 @@ ensure_db; reset_db; run_predeploy -MYSQLPASSWORD; rc=$?; echo "$LAST_OUT" | sed
 echo "$LAST_OUT" | grep -qi MYSQLPASSWORD && ok "names the missing var" || bad "missing var not named"
 echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && bad "reached DONE (false success!)" || ok "no false success"
 
-echo; echo "### (g) HOLLOW schema: drop EACH of 005's four columns independently -> assertion FIRES ###"
+echo; echo "### (g) HOLLOW schema: drop EACH of 005's four + 006's three columns independently -> assertion FIRES ###"
 # Mutation / non-vacuity check for the post-migrate schema assertion (Grok New
 # #3; Codex re-gate P1 #2): a LYING ledger. For EACH of 005's four evidence
 # columns independently, build a prod-like DB (001..005 ledgered), DROP just
@@ -187,11 +230,16 @@ echo; echo "### (g) HOLLOW schema: drop EACH of 005's four columns independently
 # of the four proves the assertion covers the FULL 005 contract (not just one
 # representative column) and is non-vacuous for each column: if the assertion
 # checked only one column, dropping a DIFFERENT one would exit 0 here and FAIL.
-for COL in evidence_sha256 evidence_object_key evidence_blob_key evidence_blob_url; do
-  echo "  -- sub-case: drop $COL --"
-  ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
-  q "ALTER TABLE waiver_responses DROP COLUMN $COL" >/dev/null
-  [ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='waiver_responses' AND COLUMN_NAME='$COL'")" = 0 ] && ok "[$COL] column physically dropped (ledger left intact)" || bad "[$COL] could not drop column"
+# [GVS-89] The same holds for 006's three waiver_instances columns: bumping
+# MAX_BAKED_MIGRATION to 006 widened the assertion to a table => columns map,
+# and each of the seven TABLE:COLUMN pairs below must fire it on its own.
+for PAIR in waiver_responses:evidence_sha256 waiver_responses:evidence_object_key waiver_responses:evidence_blob_key waiver_responses:evidence_blob_url \
+            waiver_instances:is_public waiver_instances:expires_at waiver_instances:locale; do
+  TBL="${PAIR%%:*}"; COL="${PAIR#*:}"
+  echo "  -- sub-case: drop $TBL.$COL --"
+  ensure_db; reset_db; apply_init; run_runner --baseline --through="$MAX_BAKED" >/dev/null
+  q "ALTER TABLE $TBL DROP COLUMN $COL" >/dev/null
+  [ "$(q "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$DBNAME' AND TABLE_NAME='$TBL' AND COLUMN_NAME='$COL'")" = 0 ] && ok "[$COL] column physically dropped (ledger left intact)" || bad "[$COL] could not drop column"
   run_predeploy; rc=$?; echo "$LAST_OUT" | sed 's/^/  | /'
   [ "$rc" = 1 ] && ok "[$COL] exit 1 (schema assertion fired)" || bad "[$COL] exit $rc (want 1) — hollow schema NOT caught!"
   echo "$LAST_OUT" | grep -q "schema assertion FAILED" && ok "[$COL] names the schema-assertion failure" || bad "[$COL] assertion failure not named"
@@ -271,7 +319,7 @@ echo "$LAST_OUT" | grep -q "\[predeploy\] DONE" && ok "(h5) still reached DONE" 
 [ "$(q "SELECT COUNT(*) FROM waiver_templates")" = 0 ] && ok "(h5) wrote nothing" || bad "(h5) wrote something from a missing file"
 
 echo "  -- (h6) Lock 3: a DB holding SIGNED waivers is REFUSED --"
-ensure_db; reset_db; apply_init; run_runner --baseline --through=005_evidence_fields >/dev/null
+ensure_db; reset_db; apply_init; run_runner --baseline --through="$MAX_BAKED" >/dev/null
 # A signature, standing in for production. No FK is declared anywhere in
 # migrations/*.sql, so a bare response row is a legal way to say "this database
 # has real signatures in it".

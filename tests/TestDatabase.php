@@ -67,6 +67,34 @@ class TestDatabase {
   }
 
   /**
+   * [GVS-89] Insert a PUBLIC (reception-QR) waiver_instances row -- the shape
+   * WaiverController::createPublicInstance() writes: is_public=1, every
+   * binding id + guest_name/guest_email NULL, a locale, and an expiry.
+   * $expiresInSeconds is relative to the DB clock (UTC_TIMESTAMP()) -- the
+   * same clock renderGuestForm()'s expiry gate compares against -- so a
+   * negative value seeds an already-expired instance; null seeds a public row
+   * with NO expiry (the fail-closed case). Returns the new instance id.
+   */
+  public static function seedPublicInstance(PDO $pdo, int $templateVersionId, array $overrides = [], ?int $expiresInSeconds = 3600): int {
+    $row = array_merge([
+      'link_token' => bin2hex(random_bytes(16)),
+      'status' => 'pending',
+      'locale' => 'ro',
+      'participant_id' => null,
+      'customer_id' => null,
+      'booking_group_id' => null,
+    ], $overrides);
+    $expiresSql = $expiresInSeconds === null ? 'NULL' : 'DATE_ADD(UTC_TIMESTAMP(), INTERVAL '.(int)$expiresInSeconds.' SECOND)';
+    $stmt = $pdo->prepare('INSERT INTO waiver_instances (template_version_id, reservation_id, participant_id, customer_id, booking_group_id, guest_name, guest_email, link_token, group_token, status, is_public, expires_at, locale, created_at, updated_at) VALUES (?,NULL,?,?,?,NULL,NULL,?,NULL,?,1,'.$expiresSql.',?,UTC_TIMESTAMP(),UTC_TIMESTAMP())');
+    $stmt->execute([
+      $templateVersionId,
+      $row['participant_id'], $row['customer_id'], $row['booking_group_id'],
+      $row['link_token'], $row['status'], $row['locale'],
+    ]);
+    return (int)$pdo->lastInsertId();
+  }
+
+  /**
    * @param array{evidence_sha256?:?string,evidence_object_key?:?string,evidence_blob_key?:?string,evidence_blob_url?:?string} $evidence
    *   [T5] Optional evidence-field overrides (migrations/005_evidence_fields.sql).
    *   Default omits them entirely -> all four NULL, i.e. the "legacy row"

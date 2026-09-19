@@ -57,6 +57,24 @@ or `callback.outbound_secret` (when `callback.base_url` is configured) — see
 values after `cp config/config.php.docker config/config.php`, not just edit
 `api_hmac_secret` as the quick-start above shows.
 
+## Evidence lock wait times (`evidence_lock.*`)
+`submitGuestForm`, `resendEvidence` and `eraseWaiver` all serialize against
+each other with one MySQL named lock per waiver instance (`GET_LOCK`, so an
+evidence upload/record and a GDPR erasure of the SAME instance can never
+interleave). Each of the three actions waits a different, independently
+tunable number of whole seconds for that lock before giving up — see
+`WaiverController::evidenceLockWaitSeconds()`. All three keys are optional;
+config sample files with all of them, and what each guards, are in
+`config/config.php` and `config/config.php.docker` (commented out). Set only
+the ones you need to override under a top-level `'evidence_lock' => [...]`
+array in `config/config.php`:
+
+| Key | Default | Used by |
+| --- | --- | --- |
+| `submit_wait_seconds` | `2` | A guest's first submit. On timeout it still completes (the signature is never lost) but WITHOUT uploading evidence — the PDF/signature are retained locally for `resend_evidence`/reconcile to push later. |
+| `resend_wait_seconds` | `0` | `resend_evidence`. Never waits; a busy lock just means "nothing new to push right now" (`pushed:false`, not an error). |
+| `erase_wait_seconds` | `5` | `erase_waiver`, per matched instance (ascending id order, ALL locks taken before its transaction opens). On timeout it answers `{error:'evidence_busy'}` (503) and deletes nothing — safe for BookingV2's outbox to retry. |
+
 ## Staging repair / re-provisioning
 If the staging fork database is re-provisioned empty (0 templates, 0 admins),
 see `dev/staging-repair-runbook.md` — it covers the two operator steps (the

@@ -95,4 +95,14 @@ return [
     'signatures_path' => '/var/www/html/storage/signatures',
     'artifacts_path'  => '/var/www/html/storage/artifacts',
   ],
+  // [gate 89-M4 r3 P2-6 fix] 'evidence_lock' (submit_wait_seconds /
+  // resend_wait_seconds / erase_wait_seconds, all whole seconds) is
+  // intentionally NOT wired to an env var here -- no deploy has ever needed
+  // to override WaiverController's built-in defaults (2 / 0 / 5). It is a
+  // recognized, optional key of this SAME array shape
+  // (WaiverController::evidenceLockWaitSeconds() reads $cfg['evidence_lock'][key]
+  // and falls back to the constant when the key, or the whole array, is
+  // absent) -- see config/config.php's commented-out example for the
+  // key names and what each guards. Add it here the same way if a future
+  // deploy genuinely needs a different wait.
 ];

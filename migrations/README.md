@@ -64,10 +64,22 @@ php migrations/run.php --baseline    # 2. mark the current files applied, execut
 php migrations/run.php               # 3. no-op now; later runs apply only genuinely new files
 ```
 
-Baselining exists because **002 and 003 are already baked into `001_init.sql`**
-(both files say so in their own headers). On a database initialized from 001,
-re-running 002 dies with `Duplicate column name 'participant_id'`. Baselining
-records those files as applied so they are never executed again.
+Baselining exists because later migrations are **baked into `001_init.sql`**:
+a fresh schema built from `001_init.sql` already has their columns, so
+executing them again would be wrong (and, for the unguarded 002, fatal:
+re-running it dies with `Duplicate column name 'participant_id'`). Baselining
+records those files as applied so they are never executed.
+
+**Which migrations are baked is defined in ONE place:
+`dev/predeploy.php` → `MAX_BAKED_MIGRATION`** (today `006_public_instances`,
+i.e. everything through 006 — 002, 003, 005 and 006 carry schema; 004 is
+comment-only). Do not trust a list in prose, including an older copy of this
+paragraph that said "002 and 003": it went stale twice (005, then 006). The
+predeploy fresh-DB path baselines exactly `--through=MAX_BAKED_MIGRATION`, and
+a migration's own header says when it is baked. When you bake a new
+migration, bump that constant (and its `BAKED_ASSERT_COLUMNS` entry) in the
+same change. The guarded migrations (005, 006) also no-op when executed on an
+already-baked schema, so a baseline that stops short of them is harmless.
 
 Fresh-DB bootstrap stays compose's `initdb` (which runs `001_init.sql` only).
 The runner is *never* expected to make 001 → 002 succeed on a fresh schema.
@@ -103,6 +115,36 @@ One irreducible crash window: a statement is executed and *then* its ledger row
 is written. A process killed between the two will re-execute that one statement
 on the next run. Prefer idempotent DDL (`IF NOT EXISTS`,
 `INSERT ... ON DUPLICATE KEY UPDATE`) so a replay is harmless.
+
+**Session state is re-established on resume.** A resume runs in a new
+connection, so user variables (`SET @x`), `SET SESSION` values and `PREPARE`d
+handles created by already-recorded statements are gone. Before resuming at
+`k`, the runner re-executes the contiguous run of such session-only statements
+immediately preceding `k` (not re-recorded; they have no persistent effect).
+That is what makes the guarded `SET @ddl = …; PREPARE p FROM @ddl; EXECUTE p;`
+pattern (005, 006) resumable after a failure at its `EXECUTE` — without it the
+resume would hit `Unknown prepared statement handler` (MySQL 1243) forever.
+Only the contiguous run is replayed, so keep each guarded step's session
+statements directly before the statement that uses them. A `DEALLOCATE PREPARE`
+(or `DROP PREPARE`) in that run is walked over but never re-executed: its handle
+may not exist in the new connection, and re-running it would fail with 1243 on
+every retry.
+
+**Stale rationale in `006_public_instances.sql`'s header (gate 89-M4 r3
+P2-6, not fixed in the file itself):** that file's header comment says it
+deliberately has no trailing `DEALLOCATE PREPARE` because "it would fail on a
+resume that lands just after the EXECUTE". That was true before the replay
+fix documented in the paragraph above — a resume used to try to RE-EXECUTE
+every session-only statement in the window, including a trailing
+DEALLOCATE, which really did die with 1243. It is no longer true: the
+runner now walks over a DEALLOCATE without re-executing it, so a trailing one
+in a guarded migration would be resume-safe today. The comment is left as-is
+in `006_public_instances.sql` on purpose — editing a migration file changes
+its statement checksums, and this fork's ledger (`schema_migration_statements`)
+records those checksums per environment, including any local/CI test database
+that already applied 006, so an edit could make a `--dry-run`/resume think a
+previously-applied file changed. This paragraph is the correction; treat it as
+authoritative over that stale comment.
 
 Concurrency is blocked by a MySQL advisory lock scoped to the target schema
 (10s wait, then exit 3) — two runners interleaving statements would make the

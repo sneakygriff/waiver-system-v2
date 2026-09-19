@@ -27,6 +27,14 @@ declare(strict_types=1);
  * (A statement that FAILS is different: it is not recorded and MySQL 8 does not
  * half-apply a failed DDL, so resume is clean.)
  *
+ * A resume runs in a NEW connection, so session state built by already
+ * recorded statements (`SET @var`, `SET SESSION`, a `PREPARE`d handle) is
+ * gone. Before resuming, the runner re-executes the contiguous run of such
+ * session-only statements immediately preceding the resume index (they have
+ * no persistent effect; they are NOT re-recorded) -- see sessionReplayStart().
+ * This is what makes the guarded `SET/PREPARE/EXECUTE` DDL pattern (005, 006)
+ * resumable after a failure at its EXECUTE.
+ *
  * LEDGER — EXTENDED, NEVER RECREATED
  * ----------------------------------
  * `schema_migrations(version, applied_at)` ALREADY EXISTS on every initialized
@@ -769,6 +777,65 @@ function resumeIndex(string $version, array $statements, array $progress): int
     return $done;
 }
 
+/**
+ * SESSION-STATE REPLAY [GVS-89 / gate 89-M4, Codex P2]. The per-statement
+ * ledger makes a resume start at the first UNRECORDED statement -- in a NEW
+ * connection. Guarded-DDL migrations (005, 006) build their DDL in session
+ * state first (`SET @ddl = ...; PREPARE p FROM @ddl; EXECUTE p;`), so a
+ * failure at the EXECUTE (e.g. a metadata-lock timeout) would otherwise
+ * resume straight into `EXECUTE p` with no such handle (MySQL 1243) and wedge
+ * the file until someone edits the ledger by hand.
+ *
+ * Returns the index from which the statements before $from must be
+ * re-executed: the start of the maximal CONTIGUOUS run of session-only
+ * statements ending at $from - 1 ($from itself when there is none). A
+ * session-only statement has no effect beyond the current connection, so
+ * re-executing it is always safe -- and re-evaluating it NOW is exactly
+ * right: a replayed `SET @ddl = (SELECT ... INFORMATION_SCHEMA ...)` sees the
+ * schema as it is at resume time. Only the contiguous run is replayed: state
+ * built BEFORE an intervening persistent statement is not reconstructed
+ * (don't write migrations that depend on that).
+ *
+ * @param list<string> $statements
+ */
+function sessionReplayStart(array $statements, int $from): int
+{
+    $start = $from;
+    while ($start > 0 && isSessionOnlyStatement($statements[$start - 1])) {
+        $start--;
+    }
+    return $start;
+}
+
+/**
+ * Deliberately narrow: user-variable assignment (`SET @x`, not `SET @@x`),
+ * `SET SESSION ...`, `PREPARE`, and `DEALLOCATE|DROP PREPARE`. Statement text
+ * is the splitter's normalized form (comments stripped, leading whitespace
+ * trimmed). `SET GLOBAL` / `SET PERSIST` / `SET @@GLOBAL.` never match; a
+ * single SET that ALSO assigns a global would be replayed too (harmless --
+ * it re-assigns the value it already set) -- don't write one.
+ */
+function isSessionOnlyStatement(string $statement): bool
+{
+    return preg_match('/\A(?:SET\s+(?:@(?!@)|SESSION\s)|PREPARE\s|(?:DEALLOCATE|DROP)\s+PREPARE\s)/i', ltrim($statement)) === 1;
+}
+
+/**
+ * [gate 89-M4 r2, Fable P2-1] `DEALLOCATE|DROP PREPARE` stays session-only for
+ * the replay WINDOW (sessionReplayStart() walks over it, so session state
+ * built before it is still re-established), but is never re-EXECUTED by the
+ * replay: in the new connection its handle may not exist (it was prepared
+ * before the window, e.g. `PREPARE p; EXECUTE p; DEALLOCATE PREPARE p; <fails>`
+ * resumes with only the DEALLOCATE in the window), and running it there fails
+ * with MySQL 1243 on every re-run -- the very wedge the replay exists to
+ * remove. Skipping it is always safe: at worst the new session keeps a
+ * prepared handle the original had released, which dies with the session.
+ */
+function isDeallocateStatement(string $statement): bool
+{
+    return preg_match('/\A(?:DEALLOCATE|DROP)\s+PREPARE\s/i', ltrim($statement)) === 1;
+}
+
 // ---------------------------------------------------------------------------
 // Modes
 // ---------------------------------------------------------------------------
@@ -911,6 +978,41 @@ function runApply(PDO $pdo, string $db, array $migrations, bool $dryRun, bool $v
 
         out($version . ': ' . $total . ' statement(s)'
             . ($from > 0 ? ', resuming at index ' . $from . ' (' . $from . ' already applied)' : ''));
+
+        // SESSION-STATE REPLAY (see sessionReplayStart()): a resume lands in a
+        // NEW connection, so session state the recorded statements built
+        // (user variables, a PREPAREd handle) is gone. Re-execute the
+        // session-only statements immediately preceding the resume point --
+        // they have no persistent effect, so this is always safe -- WITHOUT
+        // re-recording them (they are already in the ledger).
+        $replayFrom = sessionReplayStart($statements, $from);
+        if ($replayFrom < $from) {
+            out('  re-establishing session state: replaying ' . $version . '#' . $replayFrom
+                . '..#' . ($from - 1) . ' (session-only, already recorded)');
+            for ($j = $replayFrom; $j < $from; $j++) {
+                if ($verbose) {
+                    out('  ' . $version . '#' . $j . ' replay sql: ' . preview($statements[$j]));
+                }
+                if (isDeallocateStatement($statements[$j])) {
+                    // Never re-run on replay -- see isDeallocateStatement().
+                    out('  ' . $version . '#' . $j . ' replay skipped (DEALLOCATE: nothing to release in a new session)');
+                    continue;
+                }
+                try {
+                    $pdo->exec($statements[$j]);
+                } catch (PDOException $e) {
+                    errln('FAILED ' . $version . '#' . $j . ' (session-state replay before resuming at #'
+                        . $from . '): ' . $e->getMessage());
+                    errln('ledger state unchanged: ' . $version . ' still has statements 0..' . ($from - 1)
+                        . ' recorded applied; the file is NOT marked applied.');
+                    errln('summary: files_applied=' . $filesApplied . ' statements_executed='
+                        . $stmtsExecuted . ' already_applied=' . $alreadyApplied);
+                    errln('FAILED (exit ' . EXIT_MIGRATION_FAILED . ')');
+                    return EXIT_MIGRATION_FAILED;
+                }
+                out('  ' . $version . '#' . $j . ' replayed');
+            }
+        }
 
         for ($i = $from; $i < $total; $i++) {
             $statement = $statements[$i];

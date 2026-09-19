@@ -45,10 +45,20 @@ CREATE TABLE IF NOT EXISTS waiver_instances (
   status ENUM('pending','completed','void') NOT NULL DEFAULT 'pending',
   created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
   completed_at DATETIME NULL,
+  -- [GVS-89] baked in from 006_public_instances.sql (same convention as the
+  -- [T5] 005 columns in waiver_responses below): a fresh install never needs
+  -- to run 006 for real (its guarded ALTERs no-op here), an EXISTING pre-006
+  -- database still applies it via migrations/run.php. Types MUST stay
+  -- identical to 006's guarded ALTER statements (pinned by
+  -- tests/MigrationRunnerTest.php).
+  is_public TINYINT(1) NOT NULL DEFAULT 0,
+  expires_at DATETIME NULL,
+  locale VARCHAR(2) NULL,
   INDEX (reservation_id), INDEX (status), INDEX (group_token),
   INDEX idx_participant (participant_id),
   INDEX idx_customer (customer_id),
-  INDEX idx_booking_group (booking_group_id)
+  INDEX idx_booking_group (booking_group_id),
+  INDEX idx_public_expires (is_public, expires_at)
 );
 CREATE TABLE IF NOT EXISTS waiver_responses (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
